@@ -1,0 +1,118 @@
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use async_trait::async_trait;
+use windmill_ai::{query_builder::StreamEventSink, types::*};
+use windmill_common::{error::Error, worker::Connection};
+use windmill_queue::MiniPulledJob;
+
+use crate::job_logger::append_result_stream;
+
+/// Processes streaming events by persisting them to the database.
+/// Implements StreamEventSink so it can be passed to QueryBuilder methods.
+pub struct StreamEventProcessor {
+    tx: Option<tokio::sync::mpsc::Sender<String>>,
+    pub handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shared by every clone, so a sink lent to a parser counts into its owner.
+    streamed: Arc<AtomicUsize>,
+}
+
+impl Clone for StreamEventProcessor {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone(), handle: None, streamed: self.streamed.clone() }
+    }
+}
+
+impl StreamEventProcessor {
+    /// Create a new StreamEventProcessor that persists events to the database, after the
+    /// `first_offset` events the job already streamed: a row written at an offset already taken
+    /// is appended to that row, out of order.
+    pub fn new(conn: &Connection, job: &MiniPulledJob, first_offset: i32) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
+        let conn = conn.clone();
+        let job_id = job.id.clone();
+        let workspace_id = job.workspace_id.clone();
+        let handle = tokio::spawn(async move {
+            let mut offset = first_offset - 1;
+            while let Some(event) = rx.recv().await {
+                offset += 1;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    append_result_stream(&conn, &workspace_id, &job_id, &event, offset),
+                )
+                .await
+                {
+                    Ok(res) => {
+                        if let Err(err) = res {
+                            tracing::error!("Failed to save stream event: {}", err);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("Did not manage to save stream event after 20 seconds, stopping stream event processor: {}", err);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self { tx: Some(tx), handle: Some(handle), streamed: Arc::default() }
+    }
+
+    /// Create a silent StreamEventProcessor that only accumulates events locally
+    /// without persisting them to the database. Used when streaming is disabled.
+    pub fn new_silent() -> Self {
+        Self { tx: None, handle: None, streamed: Arc::default() }
+    }
+
+    /// How many events have been streamed to the job's readers. A silent processor
+    /// streams none.
+    pub fn streamed_events(&self) -> usize {
+        self.streamed.load(Ordering::Relaxed)
+    }
+
+    pub fn to_handle(self) -> Option<tokio::task::JoinHandle<()>> {
+        self.handle
+    }
+
+    /// Clone this processor into a boxed StreamEventSink for passing to QueryBuilder methods.
+    pub fn boxed_sink(&self) -> Box<dyn StreamEventSink> {
+        Box::new(self.clone())
+    }
+}
+
+#[async_trait]
+impl StreamEventSink for StreamEventProcessor {
+    async fn send(&self, event: StreamingEvent, events_str: &mut String) -> Result<(), Error> {
+        // In silent mode, skip both persistence AND accumulation (no overhead)
+        let Some(ref tx) = self.tx else {
+            return Ok(());
+        };
+
+        match serde_json::to_string(&event) {
+            Ok(event_json) => {
+                let event_json = format!("{}\n", event_json);
+                events_str.push_str(&event_json);
+                self.streamed.fetch_add(1, Ordering::Relaxed);
+
+                if let Err(err) = tx
+                    .send(event_json.clone())
+                    .await
+                    .map_err(|e| Error::internal_err(format!("Failed to send event: {}", e)))
+                {
+                    tracing::error!(
+                        "Failed to send event to stream event processor, skiping event: {}",
+                        err
+                    );
+                }
+
+                Ok(())
+            }
+            Err(e) => Err(Error::internal_err(format!(
+                "Failed to serialize streaming event {:#?}, error is: {}",
+                event, e
+            ))),
+        }
+    }
+}

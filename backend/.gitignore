@@ -1,0 +1,13 @@
+target/
+.env
+oauth.json
+oauth2.json
+tracing.folded
+heaptrack*
+index/
+windmill-api/openapi-*.*
+.duckdb/*
+*ee.rs
+generate_mcp_endpoints_tools/venv
+bacon.toml
+windmill_duckdb_runner

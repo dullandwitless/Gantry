@@ -1,0 +1,1436 @@
+use std::collections::HashMap;
+
+use eventsource_stream::{EventStreamError, Eventsource};
+use indexmap::IndexMap;
+use reqwest::Response;
+use serde::Deserialize;
+use tokio_stream::StreamExt;
+use windmill_common::{error::Error, utils::rd_string};
+
+use crate::{
+    ai_google::{parse_gemini_sse_event, GeminiTurn, GeminiUsageMetadata},
+    ai_types::UrlCitation,
+    ai_types::{
+        AnthropicExtraContent, ExtraContent, GoogleExtraContent, OpenAIFunction, OpenAIToolCall,
+    },
+    query_builder::StreamEventSink,
+    retry::{transient_error, truncated_stream_error, StreamErrorBody},
+    types::{StreamingEvent, TokenUsage},
+};
+
+#[derive(Deserialize)]
+pub struct OpenAIChoiceDeltaToolCallFunction {
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct OpenAIChoiceDeltaToolCall {
+    pub index: Option<i64>,
+    pub id: Option<String>,
+    pub function: Option<OpenAIChoiceDeltaToolCallFunction>,
+}
+
+#[derive(Deserialize)]
+pub struct OpenAIChoiceDelta {
+    pub content: Option<String>,
+    /// Reasoning summary streamed by providers that expose it (e.g. DeepSeek's
+    /// `reasoning_content`). Rendered as a "thinking" affordance.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    pub tool_calls: Option<Vec<OpenAIChoiceDeltaToolCall>>,
+}
+
+#[derive(Deserialize)]
+pub struct OpenAIChoice {
+    pub delta: Option<OpenAIChoiceDelta>,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+/// Nested prompt token details returned by the Chat Completions API.
+/// `cached_tokens` is the portion of `prompt_tokens` served from cache (a subset, not additive).
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct OpenAIPromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<i32>,
+}
+
+/// OpenAI Chat Completions API usage information (from final chunk with stream_options.include_usage)
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct OpenAIChatUsage {
+    #[serde(default)]
+    pub prompt_tokens: Option<i32>,
+    #[serde(default)]
+    pub completion_tokens: Option<i32>,
+    #[serde(default)]
+    pub total_tokens: Option<i32>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+}
+
+impl OpenAIChatUsage {
+    /// cached_tokens is a subset of prompt_tokens, so input/total are reported as-is
+    /// and only recorded as cache_read for reporting.
+    pub fn to_token_usage(self) -> TokenUsage {
+        TokenUsage::new(
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.total_tokens,
+        )
+        .with_cache(
+            self.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            None,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OpenAISSEEvent {
+    pub choices: Option<Vec<OpenAIChoice>>,
+    #[serde(default)]
+    pub usage: Option<OpenAIChatUsage>,
+    #[serde(default)]
+    pub error: Option<StreamErrorBody>,
+}
+
+lazy_static::lazy_static! {
+    static ref DEBUG_SSE_STREAM: bool = std::env::var("DEBUG_SSE_STREAM")
+        .unwrap_or("false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
+}
+#[allow(async_fn_in_trait)]
+pub trait SSEParser {
+    async fn parse_event_data(&mut self, data: &str) -> Result<(), Error>;
+
+    /// Whether the stream delivered the event that ends a complete response.
+    fn is_complete(&self) -> bool;
+
+    /// Whether a stream that closed cleanly holds a complete response.
+    fn is_complete_at_close(&self) -> bool {
+        self.is_complete()
+    }
+
+    async fn parse_events(&mut self, response: Response) -> Result<(), Error> {
+        let mut stream = response.bytes_stream().eventsource();
+        let mut consecutive_errors = 0;
+
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(event) => {
+                    consecutive_errors = 0;
+                    if *DEBUG_SSE_STREAM {
+                        tracing::info!("SSE event: {:?}", event);
+                    }
+
+                    self.parse_event_data(&event.data).await?;
+                }
+                // The body ends right after a transport error, so it cannot be skipped
+                // like a malformed event. A timeout spent the caller's whole budget.
+                Err(EventStreamError::Transport(_)) if self.is_complete() => break,
+                Err(EventStreamError::Transport(e)) => {
+                    let message =
+                        format!("The connection to the AI provider broke off mid-response: {e}");
+                    return Err(if e.is_timeout() {
+                        Error::AIError(message)
+                    } else {
+                        transient_error(message, None)
+                    });
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    tracing::error!("Failed to parse SSE event: {}", e);
+                    if consecutive_errors >= 5 {
+                        tracing::error!(
+                            "Breaking SSE stream after {} consecutive parsing errors",
+                            consecutive_errors
+                        );
+                        return Err(Error::InternalErr(format!(
+                            "SSE stream terminated after {} consecutive parsing errors",
+                            consecutive_errors
+                        )));
+                    }
+                }
+            }
+        }
+
+        if !self.is_complete_at_close() {
+            return Err(truncated_stream_error());
+        }
+        Ok(())
+    }
+}
+
+pub struct OpenAISSEParser {
+    pub accumulated_content: String,
+    /// The thinking streamed before the answer, kept so it can be stored with it.
+    pub accumulated_reasoning: String,
+    // Insertion-ordered in every parser: tool calls run and are persisted in the order the
+    // stream showed them, and a chat attaches a round's thinking to its first call.
+    pub accumulated_tool_calls: IndexMap<i64, OpenAIToolCall>,
+    pub events_str: String,
+    pub stream_event_processor: Box<dyn StreamEventSink>,
+    /// Token usage from final chunk (when stream_options.include_usage is true)
+    pub usage: Option<OpenAIChatUsage>,
+    /// Set by `[DONE]` or by a choice's `finish_reason`: OpenAI-compatible gateways do not
+    /// all send `[DONE]`.
+    complete: bool,
+}
+
+impl OpenAISSEParser {
+    pub fn new(stream_event_processor: Box<dyn StreamEventSink>) -> Self {
+        Self {
+            accumulated_content: String::new(),
+            accumulated_reasoning: String::new(),
+            accumulated_tool_calls: IndexMap::new(),
+            events_str: String::new(),
+            stream_event_processor,
+            usage: None,
+            complete: false,
+        }
+    }
+}
+
+impl SSEParser for OpenAISSEParser {
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    async fn parse_event_data(&mut self, data: &str) -> Result<(), Error> {
+        if data == "[DONE]" {
+            self.complete = true;
+            return Ok(());
+        }
+
+        let event: Option<OpenAISSEEvent> = serde_json::from_str(data)
+            .inspect_err(|e| {
+                tracing::error!("Failed to parse SSE as an OpenAI event {}: {}", data, e);
+            })
+            .ok();
+
+        if let Some(event) = event {
+            if let Some(error) = event.error {
+                return Err(error.into_error("AI provider"));
+            }
+
+            // Extract usage from final chunk (when stream_options.include_usage is true)
+            if let Some(usage) = event.usage {
+                self.usage = Some(usage);
+            }
+
+            if let Some(mut choices) = event.choices.filter(|s| !s.is_empty()) {
+                let choice = choices.remove(0);
+                if choice.finish_reason.is_some() {
+                    self.complete = true;
+                }
+                if let Some(delta) = choice.delta {
+                    if let Some(reasoning) = delta.reasoning_content.filter(|s| !s.is_empty()) {
+                        self.accumulated_reasoning.push_str(&reasoning);
+                        let event = StreamingEvent::ReasoningTokenDelta { content: reasoning };
+                        self.stream_event_processor
+                            .send(event, &mut self.events_str)
+                            .await?;
+                    }
+
+                    if let Some(content) = delta.content.filter(|s| !s.is_empty()) {
+                        self.accumulated_content.push_str(&content);
+                        let event = StreamingEvent::TokenDelta { content };
+                        self.stream_event_processor
+                            .send(event, &mut self.events_str)
+                            .await?;
+                    }
+
+                    if let Some(tool_calls) = delta.tool_calls {
+                        for (idx, tool_call) in tool_calls.into_iter().enumerate() {
+                            let idx = tool_call.index.unwrap_or_else(|| idx as i64);
+
+                            if let Some(function) = tool_call.function {
+                                if let Some(existing_tool_call) =
+                                    self.accumulated_tool_calls.get_mut(&idx)
+                                {
+                                    if let Some(arguments) = function.arguments {
+                                        existing_tool_call.function.arguments += &arguments;
+                                    }
+                                } else {
+                                    let fun_name = function.name.unwrap_or_default();
+                                    let call_id = tool_call.id.unwrap_or_else(|| rd_string(24));
+                                    let event = StreamingEvent::ToolCall {
+                                        call_id: call_id.clone(),
+                                        function_name: fun_name.clone(),
+                                    };
+                                    self.stream_event_processor
+                                        .send(event, &mut self.events_str)
+                                        .await?;
+                                    self.accumulated_tool_calls.insert(
+                                        idx,
+                                        OpenAIToolCall {
+                                            id: call_id,
+                                            function: OpenAIFunction {
+                                                name: fun_name,
+                                                arguments: function.arguments.unwrap_or_default(),
+                                            },
+                                            r#type: "function".to_string(),
+                                            extra_content: None,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Anthropic SSE Parser
+// ============================================================================
+
+/// Content block start types for Anthropic streaming
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum AnthropicContentBlockStart {
+    #[serde(rename = "text")]
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse {
+        #[allow(unused)]
+        id: String,
+        name: String,
+    },
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Citation from Anthropic web search delta events
+#[derive(Deserialize, Debug)]
+pub struct AnthropicCitationDelta {
+    #[allow(dead_code)]
+    pub r#type: String,
+    pub url: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Delta types for Anthropic streaming content blocks
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum AnthropicDelta {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
+    #[serde(rename = "citations_delta")]
+    CitationsDelta { citation: AnthropicCitationDelta },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
+    #[serde(other)]
+    Unknown,
+}
+
+/// The `message` envelope of a `message_start` event. Only its usage is read: the
+/// prompt-side counts appear here and nowhere else in the stream.
+#[derive(Deserialize, Debug)]
+pub struct AnthropicStreamMessage {
+    #[serde(default)]
+    pub usage: Option<AnthropicUsage>,
+}
+
+/// Anthropic usage information, reported across `message_start` (prompt side) and
+/// `message_delta` (completion side)
+#[derive(Deserialize, Debug, Clone)]
+pub struct AnthropicUsage {
+    #[serde(default)]
+    pub input_tokens: Option<i32>,
+    #[serde(default)]
+    pub output_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<i32>,
+}
+
+/// Anthropic SSE event structure
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum AnthropicSSEEvent {
+    #[serde(rename = "message_start")]
+    MessageStart {
+        #[serde(default)]
+        message: Option<AnthropicStreamMessage>,
+    },
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart { index: usize, content_block: AnthropicContentBlockStart },
+    #[serde(rename = "content_block_delta")]
+    ContentBlockDelta { index: usize, delta: AnthropicDelta },
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop { index: usize },
+    #[serde(rename = "message_delta")]
+    MessageDelta {
+        #[serde(default)]
+        usage: Option<AnthropicUsage>,
+        #[serde(default)]
+        delta: Option<AnthropicMessageDelta>,
+    },
+    #[serde(rename = "message_stop")]
+    MessageStop {},
+    #[serde(rename = "ping")]
+    Ping {},
+    #[serde(rename = "error")]
+    Error {
+        #[serde(default)]
+        error: StreamErrorBody,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct AnthropicMessageDelta {
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+}
+
+/// Tracks state of a content block during streaming
+#[derive(Debug)]
+#[allow(dead_code)]
+enum ContentBlockState {
+    Text,
+    Thinking,
+    ToolUse { id: String, name: String },
+    Unknown,
+}
+
+/// Anthropic SSE Parser for streaming responses
+pub struct AnthropicSSEParser {
+    pub accumulated_content: String,
+    /// The thinking streamed before the answer, kept so it can be stored with it.
+    pub accumulated_reasoning: String,
+    pub accumulated_tool_calls: IndexMap<i64, OpenAIToolCall>,
+    pub events_str: String,
+    pub stream_event_processor: Box<dyn StreamEventSink>,
+    /// Track content block types by index
+    content_blocks: HashMap<usize, ContentBlockState>,
+    /// Collected URL citation annotations from web search
+    pub annotations: Vec<UrlCitation>,
+    /// Whether web search was used in this response
+    pub used_websearch: bool,
+    /// Token usage, merged from the `message_start` (prompt side) and `message_delta`
+    /// (completion side) events
+    pub usage: Option<AnthropicUsage>,
+    /// Claude thinking block accumulated from `thinking`/`signature` deltas
+    /// (or a redacted block). Attached to the first tool call of the turn so it
+    /// can be replayed before `tool_use` (required by Claude when thinking is on).
+    pending_reasoning: Option<AnthropicExtraContent>,
+    reasoning_attached: bool,
+    /// Set by `message_stop` or by the `stop_reason` of the `message_delta` sent just
+    /// before it, so a gateway that drops `message_stop` does not fail a whole answer.
+    complete: bool,
+}
+
+impl AnthropicSSEParser {
+    pub fn new(stream_event_processor: Box<dyn StreamEventSink>) -> Self {
+        Self {
+            accumulated_content: String::new(),
+            accumulated_reasoning: String::new(),
+            accumulated_tool_calls: IndexMap::new(),
+            events_str: String::new(),
+            stream_event_processor,
+            content_blocks: HashMap::new(),
+            annotations: Vec::new(),
+            used_websearch: false,
+            usage: None,
+            pending_reasoning: None,
+            reasoning_attached: false,
+            complete: false,
+        }
+    }
+}
+
+impl SSEParser for AnthropicSSEParser {
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    async fn parse_event_data(&mut self, data: &str) -> Result<(), Error> {
+        let event: Option<AnthropicSSEEvent> = serde_json::from_str(data)
+            .inspect_err(|e| {
+                tracing::error!("Failed to parse SSE as an Anthropic event {}: {}", data, e);
+            })
+            .ok();
+
+        if let Some(event) = event {
+            match event {
+                AnthropicSSEEvent::ContentBlockStart { index, content_block } => {
+                    match content_block {
+                        AnthropicContentBlockStart::Text { text } => {
+                            self.content_blocks.insert(index, ContentBlockState::Text);
+                            // Some responses include initial text in the content_block_start
+                            if !text.is_empty() {
+                                self.accumulated_content.push_str(&text);
+                                let event = StreamingEvent::TokenDelta { content: text };
+                                self.stream_event_processor
+                                    .send(event, &mut self.events_str)
+                                    .await?;
+                            }
+                        }
+                        AnthropicContentBlockStart::ToolUse { id, name } => {
+                            self.content_blocks.insert(
+                                index,
+                                ContentBlockState::ToolUse { id: id.clone(), name: name.clone() },
+                            );
+                            // Send tool call start event
+                            let event = StreamingEvent::ToolCall {
+                                call_id: id.clone(),
+                                function_name: name.clone(),
+                            };
+                            self.stream_event_processor
+                                .send(event, &mut self.events_str)
+                                .await?;
+                            // Attach the turn's thinking block to the first tool call so it
+                            // can be replayed before tool_use on the next request.
+                            let extra_content = if self.reasoning_attached {
+                                None
+                            } else {
+                                self.reasoning_attached = true;
+                                self.pending_reasoning.take().map(|anthropic| ExtraContent {
+                                    anthropic: Some(anthropic),
+                                    ..Default::default()
+                                })
+                            };
+                            // Initialize tool call accumulator
+                            self.accumulated_tool_calls.insert(
+                                index as i64,
+                                OpenAIToolCall {
+                                    id,
+                                    function: OpenAIFunction { name, arguments: String::new() },
+                                    r#type: "function".to_string(),
+                                    extra_content,
+                                },
+                            );
+                        }
+                        AnthropicContentBlockStart::Thinking { thinking } => {
+                            self.content_blocks
+                                .insert(index, ContentBlockState::Thinking);
+                            let entry = self.pending_reasoning.get_or_insert_with(Default::default);
+                            if !thinking.is_empty() {
+                                entry
+                                    .thinking
+                                    .get_or_insert_with(String::new)
+                                    .push_str(&thinking);
+                                self.accumulated_reasoning.push_str(&thinking);
+                                self.stream_event_processor
+                                    .send(
+                                        StreamingEvent::ReasoningTokenDelta { content: thinking },
+                                        &mut self.events_str,
+                                    )
+                                    .await?;
+                            }
+                        }
+                        AnthropicContentBlockStart::RedactedThinking { data } => {
+                            // Redacted blocks arrive whole (no deltas).
+                            self.content_blocks
+                                .insert(index, ContentBlockState::Unknown);
+                            self.pending_reasoning
+                                .get_or_insert_with(Default::default)
+                                .redacted_thinking = Some(data);
+                        }
+                        AnthropicContentBlockStart::ServerToolUse { name, .. } => {
+                            // Detect websearch tool usage
+                            if name == "web_search" {
+                                self.used_websearch = true;
+                            }
+                            self.content_blocks
+                                .insert(index, ContentBlockState::Unknown);
+                        }
+                        AnthropicContentBlockStart::Unknown => {
+                            self.content_blocks
+                                .insert(index, ContentBlockState::Unknown);
+                        }
+                    }
+                }
+                AnthropicSSEEvent::ContentBlockDelta { index, delta } => {
+                    match delta {
+                        AnthropicDelta::TextDelta { text } => {
+                            // Only accumulate text if this is a text block (not server_tool_use results)
+                            if let Some(ContentBlockState::Text) = self.content_blocks.get(&index) {
+                                self.accumulated_content.push_str(&text);
+                                let event = StreamingEvent::TokenDelta { content: text };
+                                self.stream_event_processor
+                                    .send(event, &mut self.events_str)
+                                    .await?;
+                            }
+                        }
+                        AnthropicDelta::InputJsonDelta { partial_json } => {
+                            // Accumulate tool call arguments
+                            if let Some(tool_call) =
+                                self.accumulated_tool_calls.get_mut(&(index as i64))
+                            {
+                                tool_call.function.arguments.push_str(&partial_json);
+                            }
+                        }
+                        AnthropicDelta::CitationsDelta { citation } => {
+                            // Collect URL citations from web search
+                            self.annotations.push(UrlCitation {
+                                start_index: 0, // Anthropic doesn't provide start/end indices
+                                end_index: 0,
+                                url: citation.url,
+                                title: citation.title,
+                            });
+                        }
+                        AnthropicDelta::ThinkingDelta { thinking } => {
+                            if let Some(ContentBlockState::Thinking) =
+                                self.content_blocks.get(&index)
+                            {
+                                self.pending_reasoning
+                                    .get_or_insert_with(Default::default)
+                                    .thinking
+                                    .get_or_insert_with(String::new)
+                                    .push_str(&thinking);
+                                self.accumulated_reasoning.push_str(&thinking);
+                                self.stream_event_processor
+                                    .send(
+                                        StreamingEvent::ReasoningTokenDelta { content: thinking },
+                                        &mut self.events_str,
+                                    )
+                                    .await?;
+                            }
+                        }
+                        AnthropicDelta::SignatureDelta { signature } => {
+                            if let Some(ContentBlockState::Thinking) =
+                                self.content_blocks.get(&index)
+                            {
+                                self.pending_reasoning
+                                    .get_or_insert_with(Default::default)
+                                    .signature
+                                    .get_or_insert_with(String::new)
+                                    .push_str(&signature);
+                            }
+                        }
+                        AnthropicDelta::Unknown => {}
+                    }
+                }
+                AnthropicSSEEvent::ContentBlockStop { index } => {
+                    // Send tool call arguments event if this was a tool use block
+                    if let Some(tool_call) = self.accumulated_tool_calls.get(&(index as i64)) {
+                        let event = StreamingEvent::ToolCallArguments {
+                            call_id: tool_call.id.clone(),
+                            function_name: tool_call.function.name.clone(),
+                            arguments: tool_call.function.arguments.clone(),
+                        };
+                        self.stream_event_processor
+                            .send(event, &mut self.events_str)
+                            .await?;
+                    }
+                }
+                AnthropicSSEEvent::Error { error } => {
+                    return Err(error.into_anthropic_error());
+                }
+                AnthropicSSEEvent::MessageStart { message } => {
+                    // The only event carrying the prompt-side counts. `message_delta`
+                    // reports the completion, so dropping this one leaves the request
+                    // with no input token count at all.
+                    if let Some(usage) = message.and_then(|message| message.usage) {
+                        self.usage = Some(usage);
+                    }
+                }
+                AnthropicSSEEvent::MessageDelta { usage, delta } => {
+                    if delta.is_some_and(|d| d.stop_reason.is_some()) {
+                        self.complete = true;
+                    }
+                    if let Some(u) = usage {
+                        match &mut self.usage {
+                            // Field by field, so the prompt counts from `message_start`
+                            // survive a delta that only reports the completion.
+                            Some(existing) => {
+                                existing.input_tokens = u.input_tokens.or(existing.input_tokens);
+                                existing.output_tokens = u.output_tokens.or(existing.output_tokens);
+                                existing.cache_read_input_tokens = u
+                                    .cache_read_input_tokens
+                                    .or(existing.cache_read_input_tokens);
+                                existing.cache_creation_input_tokens = u
+                                    .cache_creation_input_tokens
+                                    .or(existing.cache_creation_input_tokens);
+                            }
+                            None => self.usage = Some(u),
+                        }
+                    }
+                }
+                AnthropicSSEEvent::MessageStop {} => self.complete = true,
+                // Ignore other events
+                AnthropicSSEEvent::Ping {} | AnthropicSSEEvent::Unknown => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Gemini SSE Parser
+// ============================================================================
+
+/// Accumulates Gemini streaming events and converts them into the shared
+/// [`OpenAIToolCall`] / [`StreamingEvent`] representation.
+///
+/// The actual SSE parsing is delegated to [`parse_gemini_sse_event`] from
+/// `windmill_ai::ai_google` so the logic can be shared with the API proxy.
+pub struct GeminiSSEParser {
+    pub accumulated_content: String,
+    /// The thinking streamed before the answer, kept so it can be stored with it.
+    pub accumulated_reasoning: String,
+    pub accumulated_tool_calls: IndexMap<i64, OpenAIToolCall>,
+    pub events_str: String,
+    pub stream_event_processor: Box<dyn StreamEventSink>,
+    tool_call_index: i64,
+    pub annotations: Vec<UrlCitation>,
+    pub used_websearch: bool,
+    pub usage: Option<GeminiUsageMetadata>,
+    turn: GeminiTurn,
+}
+
+impl GeminiSSEParser {
+    pub fn new(stream_event_processor: Box<dyn StreamEventSink>) -> Self {
+        Self {
+            accumulated_content: String::new(),
+            accumulated_reasoning: String::new(),
+            accumulated_tool_calls: IndexMap::new(),
+            events_str: String::new(),
+            stream_event_processor,
+            tool_call_index: 0,
+            annotations: Vec::new(),
+            used_websearch: false,
+            usage: None,
+            turn: GeminiTurn::default(),
+        }
+    }
+}
+
+impl SSEParser for GeminiSSEParser {
+    fn is_complete(&self) -> bool {
+        self.turn.ended()
+    }
+
+    fn is_complete_at_close(&self) -> bool {
+        self.turn.complete_at_close()
+    }
+
+    async fn parse_event_data(&mut self, data: &str) -> Result<(), Error> {
+        let Some(parsed) = parse_gemini_sse_event(data)? else {
+            return Ok(());
+        };
+        self.turn.observe(&parsed);
+
+        if let Some(reasoning) = parsed.reasoning.filter(|s| !s.is_empty()) {
+            self.accumulated_reasoning.push_str(&reasoning);
+            self.stream_event_processor
+                .send(
+                    StreamingEvent::ReasoningTokenDelta { content: reasoning },
+                    &mut self.events_str,
+                )
+                .await?;
+        }
+
+        if let Some(text) = parsed.text {
+            self.accumulated_content.push_str(&text);
+            self.stream_event_processor
+                .send(
+                    StreamingEvent::TokenDelta { content: text },
+                    &mut self.events_str,
+                )
+                .await?;
+        }
+
+        for tool_call in parsed.tool_calls {
+            let call_id = format!("call_{}", rd_string(24));
+            let idx = self.tool_call_index;
+            self.tool_call_index += 1;
+
+            self.stream_event_processor
+                .send(
+                    StreamingEvent::ToolCall {
+                        call_id: call_id.clone(),
+                        function_name: tool_call.name.clone(),
+                    },
+                    &mut self.events_str,
+                )
+                .await?;
+
+            let extra_content = tool_call.thought_signature.map(|sig| ExtraContent {
+                google: Some(GoogleExtraContent { thought_signature: Some(sig) }),
+                ..Default::default()
+            });
+
+            self.accumulated_tool_calls.insert(
+                idx,
+                OpenAIToolCall {
+                    id: call_id,
+                    function: OpenAIFunction {
+                        name: tool_call.name,
+                        arguments: serde_json::to_string(&tool_call.args)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                    r#type: "function".to_string(),
+                    extra_content,
+                },
+            );
+        }
+
+        self.annotations.extend(parsed.annotations);
+        if parsed.used_websearch {
+            self.used_websearch = true;
+        }
+        if let Some(usage) = parsed.usage {
+            self.usage = Some(usage);
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// OpenAI Responses API SSE Parser
+// ============================================================================
+
+/// Output item structure for OpenAI Responses API streaming
+#[derive(Deserialize, Debug)]
+pub struct ResponsesOutputItem {
+    pub id: Option<String>,
+    pub r#type: Option<String>,
+    pub name: Option<String>,
+    pub call_id: Option<String>,
+}
+
+/// URL citation annotation from OpenAI Responses API SSE events
+#[derive(Deserialize, Debug)]
+pub struct OpenAIUrlCitationEvent {
+    #[allow(dead_code)]
+    pub r#type: String,
+    pub start_index: usize,
+    pub end_index: usize,
+    pub url: String,
+    pub title: Option<String>,
+}
+
+/// Nested input token details returned by the Responses API.
+/// `cached_tokens` is the portion of `input_tokens` served from cache (a subset, not additive).
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct OpenAIInputTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<i32>,
+}
+
+/// OpenAI Responses API usage information
+#[derive(Deserialize, Debug, Clone)]
+pub struct OpenAIResponsesUsage {
+    #[serde(default)]
+    pub input_tokens: Option<i32>,
+    #[serde(default)]
+    pub output_tokens: Option<i32>,
+    #[serde(default)]
+    pub total_tokens: Option<i32>,
+    #[serde(default)]
+    pub input_tokens_details: Option<OpenAIInputTokensDetails>,
+}
+
+impl OpenAIResponsesUsage {
+    /// cached_tokens is a subset of input_tokens, so input/total are reported as-is
+    /// and only recorded as cache_read for reporting.
+    pub fn to_token_usage(self) -> TokenUsage {
+        TokenUsage::new(self.input_tokens, self.output_tokens, self.total_tokens).with_cache(
+            self.input_tokens_details.and_then(|d| d.cached_tokens),
+            None,
+        )
+    }
+}
+
+/// OpenAI Responses API response object (from response.completed event)
+#[derive(Deserialize, Debug)]
+pub struct OpenAIResponsesResponse {
+    #[serde(default)]
+    pub usage: Option<OpenAIResponsesUsage>,
+    #[serde(default)]
+    pub error: Option<StreamErrorBody>,
+}
+
+/// SSE event types for OpenAI Responses API streaming
+/// Based on frontend implementation: openai-responses.ts:220-302
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum OpenAIResponsesSSEEvent {
+    /// Text content delta
+    #[serde(rename = "response.output_text.delta")]
+    OutputTextDelta { delta: String },
+
+    /// New output item added (e.g., function_call start)
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded { item: ResponsesOutputItem },
+
+    /// Function call arguments delta (streaming arguments)
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta { item_id: String, delta: String },
+
+    /// Function call arguments complete
+    #[serde(rename = "response.function_call_arguments.done")]
+    FunctionCallArgumentsDone { item_id: String, arguments: String },
+
+    /// Response complete
+    #[serde(rename = "response.done")]
+    Done {},
+
+    /// Response completed with full response object (contains usage)
+    #[serde(rename = "response.completed")]
+    Completed { response: OpenAIResponsesResponse },
+
+    /// Response ended by `max_output_tokens` or a filter: the same object, with the
+    /// tokens spent so far, so it is billed the same
+    #[serde(rename = "response.incomplete")]
+    Incomplete { response: OpenAIResponsesResponse },
+
+    #[serde(rename = "response.failed")]
+    Failed { response: OpenAIResponsesResponse },
+
+    /// Flat (`code`, `message`) from OpenAI, nested under `error` from some compatible servers.
+    #[serde(rename = "error")]
+    Error {
+        #[serde(default)]
+        code: Option<serde_json::Value>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        error: Option<StreamErrorBody>,
+    },
+
+    /// Response created
+    #[serde(rename = "response.created")]
+    Created {},
+
+    /// Response in progress
+    #[serde(rename = "response.in_progress")]
+    InProgress {},
+
+    /// Output item done
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone {},
+
+    /// Content part added
+    #[serde(rename = "response.content_part.added")]
+    ContentPartAdded {},
+
+    /// Content part done
+    #[serde(rename = "response.content_part.done")]
+    ContentPartDone {},
+
+    /// Annotation added (e.g., URL citation from web search)
+    #[serde(rename = "response.output_text.annotation.added")]
+    AnnotationAdded { annotation: OpenAIUrlCitationEvent },
+
+    /// A new reasoning summary part starts (only sent when `reasoning.summary` was requested)
+    #[serde(rename = "response.reasoning_summary_part.added")]
+    ReasoningSummaryPartAdded {},
+
+    /// Reasoning summary text delta
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryTextDelta { delta: String },
+
+    /// Catch-all for unknown event types
+    #[serde(other)]
+    Other,
+}
+
+/// OpenAI Responses API SSE Parser for streaming responses
+pub struct OpenAIResponsesSSEParser {
+    pub accumulated_content: String,
+    /// The reasoning summary streamed before the answer, kept so it can be stored with it.
+    pub accumulated_reasoning: String,
+    pub accumulated_tool_calls: IndexMap<String, OpenAIToolCall>,
+    /// Maps item_id -> (name, call_id) for function calls
+    tool_call_metadata: HashMap<String, (String, String)>,
+    /// Maps item_id -> accumulated arguments
+    tool_call_arguments: HashMap<String, String>,
+    pub events_str: String,
+    pub stream_event_processor: Box<dyn StreamEventSink>,
+    /// Collected URL citation annotations from web search
+    pub annotations: Vec<UrlCitation>,
+    /// Whether web search was used in this response
+    pub used_websearch: bool,
+    /// Token usage from response.completed event
+    pub usage: Option<OpenAIResponsesUsage>,
+    /// Reasoning summary parts seen so far, to separate them as paragraphs
+    reasoning_summary_parts: usize,
+    response_ended: bool,
+}
+
+impl OpenAIResponsesSSEParser {
+    pub fn new(stream_event_processor: Box<dyn StreamEventSink>) -> Self {
+        Self {
+            accumulated_content: String::new(),
+            accumulated_reasoning: String::new(),
+            accumulated_tool_calls: IndexMap::new(),
+            tool_call_metadata: HashMap::new(),
+            tool_call_arguments: HashMap::new(),
+            events_str: String::new(),
+            stream_event_processor,
+            annotations: Vec::new(),
+            used_websearch: false,
+            usage: None,
+            reasoning_summary_parts: 0,
+            response_ended: false,
+        }
+    }
+}
+
+impl SSEParser for OpenAIResponsesSSEParser {
+    fn is_complete(&self) -> bool {
+        self.response_ended
+    }
+
+    async fn parse_event_data(&mut self, data: &str) -> Result<(), Error> {
+        let event: Option<OpenAIResponsesSSEEvent> = serde_json::from_str(data)
+            .inspect_err(|e| {
+                tracing::error!(
+                    "Failed to parse SSE as an OpenAI Responses event {}: {}",
+                    data,
+                    e
+                );
+            })
+            .ok();
+
+        if let Some(event) = event {
+            match event {
+                OpenAIResponsesSSEEvent::OutputTextDelta { delta } => {
+                    if !delta.is_empty() {
+                        self.accumulated_content.push_str(&delta);
+                        let event = StreamingEvent::TokenDelta { content: delta };
+                        self.stream_event_processor
+                            .send(event, &mut self.events_str)
+                            .await?;
+                    }
+                }
+
+                OpenAIResponsesSSEEvent::OutputItemAdded { item } => {
+                    match item.r#type.as_deref() {
+                        // Handle function_call type items
+                        Some("function_call") => {
+                            if let (Some(item_id), Some(name), Some(call_id)) =
+                                (item.id, item.name, item.call_id)
+                            {
+                                // Store metadata for this function call
+                                self.tool_call_metadata
+                                    .insert(item_id.clone(), (name.clone(), call_id.clone()));
+                                self.tool_call_arguments
+                                    .insert(item_id.clone(), String::new());
+
+                                // Send tool call start event
+                                let event = StreamingEvent::ToolCall {
+                                    call_id: call_id.clone(),
+                                    function_name: name.clone(),
+                                };
+                                self.stream_event_processor
+                                    .send(event, &mut self.events_str)
+                                    .await?;
+                            }
+                        }
+                        // Handle web_search_call type items
+                        Some("web_search_call") => {
+                            self.used_websearch = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                OpenAIResponsesSSEEvent::FunctionCallArgumentsDelta { item_id, delta } => {
+                    // Accumulate arguments for this function call
+                    if let Some(args) = self.tool_call_arguments.get_mut(&item_id) {
+                        args.push_str(&delta);
+                    }
+                }
+
+                OpenAIResponsesSSEEvent::FunctionCallArgumentsDone { item_id, arguments } => {
+                    // Function call is complete - create the tool call
+                    if let Some((name, call_id)) = self.tool_call_metadata.get(&item_id) {
+                        // Send tool call arguments event
+                        let event = StreamingEvent::ToolCallArguments {
+                            call_id: call_id.clone(),
+                            function_name: name.clone(),
+                            arguments: arguments.clone(),
+                        };
+                        self.stream_event_processor
+                            .send(event, &mut self.events_str)
+                            .await?;
+
+                        // Store the complete tool call
+                        self.accumulated_tool_calls.insert(
+                            item_id.clone(),
+                            OpenAIToolCall {
+                                id: call_id.clone(),
+                                function: OpenAIFunction { name: name.clone(), arguments },
+                                r#type: "function".to_string(),
+                                extra_content: None,
+                            },
+                        );
+                    }
+                }
+
+                OpenAIResponsesSSEEvent::AnnotationAdded { annotation } => {
+                    // Collect URL citation annotations from web search
+                    self.annotations.push(UrlCitation {
+                        start_index: annotation.start_index,
+                        end_index: annotation.end_index,
+                        url: annotation.url,
+                        title: annotation.title,
+                    });
+                }
+
+                OpenAIResponsesSSEEvent::Completed { response }
+                | OpenAIResponsesSSEEvent::Incomplete { response } => {
+                    self.response_ended = true;
+                    if let Some(usage) = response.usage {
+                        self.usage = Some(usage);
+                    }
+                }
+
+                OpenAIResponsesSSEEvent::Failed { response } => {
+                    return Err(response.error.unwrap_or_default().into_error("OpenAI"));
+                }
+
+                OpenAIResponsesSSEEvent::Error { code, message, error } => {
+                    return Err(error
+                        .unwrap_or(StreamErrorBody { code, message, ..Default::default() })
+                        .into_error("OpenAI"));
+                }
+
+                OpenAIResponsesSSEEvent::ReasoningSummaryPartAdded {} => {
+                    self.reasoning_summary_parts += 1;
+                    if self.reasoning_summary_parts > 1 {
+                        self.accumulated_reasoning.push_str("\n\n");
+                        let event =
+                            StreamingEvent::ReasoningTokenDelta { content: "\n\n".to_string() };
+                        self.stream_event_processor
+                            .send(event, &mut self.events_str)
+                            .await?;
+                    }
+                }
+
+                OpenAIResponsesSSEEvent::ReasoningSummaryTextDelta { delta } => {
+                    if !delta.is_empty() {
+                        self.accumulated_reasoning.push_str(&delta);
+                        let event = StreamingEvent::ReasoningTokenDelta { content: delta };
+                        self.stream_event_processor
+                            .send(event, &mut self.events_str)
+                            .await?;
+                    }
+                }
+
+                OpenAIResponsesSSEEvent::Done {} => self.response_ended = true,
+
+                // Ignore other event types
+                OpenAIResponsesSSEEvent::Created {}
+                | OpenAIResponsesSSEEvent::InProgress {}
+                | OpenAIResponsesSSEEvent::OutputItemDone {}
+                | OpenAIResponsesSSEEvent::ContentPartAdded {}
+                | OpenAIResponsesSSEEvent::ContentPartDone {}
+                | OpenAIResponsesSSEEvent::Other => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_token_delta_serializes_with_snake_case_tag() {
+        let event = StreamingEvent::ReasoningTokenDelta { content: "hmm".to_string() };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(json["type"], "reasoning_token_delta");
+        assert_eq!(json["content"], "hmm");
+    }
+
+    #[test]
+    fn openai_chat_usage_maps_cached_prompt_tokens() {
+        // Payload shape returned by OpenAI and Azure OpenAI Chat Completions.
+        // cached_tokens lives under prompt_tokens_details and is a subset of prompt_tokens,
+        // so it must land in cache_read while input/total stay as the provider reported them.
+        let usage: OpenAIChatUsage = serde_json::from_str(
+            r#"{"prompt_tokens":4819,"completion_tokens":1,"total_tokens":4820,"prompt_tokens_details":{"cached_tokens":4736,"audio_tokens":0}}"#,
+        )
+        .unwrap();
+        let token_usage = usage.to_token_usage();
+        assert_eq!(token_usage.cache_read_input_tokens, Some(4736));
+        assert_eq!(token_usage.input_tokens, Some(4819));
+        assert_eq!(token_usage.total_tokens, Some(4820));
+    }
+
+    struct NoopSink;
+
+    #[async_trait::async_trait]
+    impl StreamEventSink for NoopSink {
+        async fn send(
+            &self,
+            _event: StreamingEvent,
+            _events_str: &mut String,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn sse_response(chunks: Vec<Result<&'static str, std::io::Error>>) -> Response {
+        let body = reqwest::Body::wrap_stream(futures::stream::iter(chunks));
+        Response::from(http::Response::new(body))
+    }
+
+    /// A stream that breaks off, or reports a failure inside its 200, must fail the call
+    /// rather than hand back what arrived as if it were the whole answer.
+    #[tokio::test]
+    async fn stream_failures_are_errors_not_partial_answers() {
+        use crate::retry::as_transient;
+
+        const STARTED: &str = concat!(
+            "data: {\"type\":\"message_start\"}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n",
+        );
+        let anthropic = |chunks| async move {
+            AnthropicSSEParser::new(Box::new(NoopSink))
+                .parse_events(sse_response(chunks))
+                .await
+        };
+
+        let overloaded = anthropic(vec![
+            Ok(STARTED),
+            Ok("data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"),
+        ])
+        .await
+        .unwrap_err();
+        assert!(as_transient(&overloaded).is_some(), "{overloaded}");
+
+        let refused = anthropic(vec![
+            Ok(STARTED),
+            Ok("data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n"),
+        ])
+        .await
+        .unwrap_err();
+        assert!(as_transient(&refused).is_none(), "{refused}");
+
+        let truncated = anthropic(vec![Ok(STARTED)]).await.unwrap_err();
+        assert!(as_transient(&truncated).is_some(), "{truncated}");
+
+        let dropped = anthropic(vec![
+            Ok(STARTED),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+        ])
+        .await
+        .unwrap_err();
+        assert!(as_transient(&dropped).is_some(), "{dropped}");
+
+        anthropic(vec![
+            Ok(STARTED),
+            Ok("data: {\"type\":\"message_stop\"}\n\n"),
+        ])
+        .await
+        .unwrap();
+
+        anthropic(vec![
+            Ok(STARTED),
+            Ok("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"),
+        ])
+        .await
+        .unwrap();
+
+        let truncated = OpenAISSEParser::new(Box::new(NoopSink))
+            .parse_events(sse_response(vec![Ok(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            )]))
+            .await
+            .unwrap_err();
+        assert!(as_transient(&truncated).is_some(), "{truncated}");
+
+        let quota = OpenAIResponsesSSEParser::new(Box::new(NoopSink))
+            .parse_events(sse_response(vec![Ok(
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\",\"message\":\"m\"}}\n\n",
+            )]))
+            .await
+            .unwrap_err();
+        assert!(as_transient(&quota).is_none(), "{quota}");
+
+        GeminiSSEParser::new(Box::new(NoopSink))
+            .parse_events(sse_response(vec![Ok(
+                "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{}}}]}}]}\n\n",
+            )]))
+            .await
+            .unwrap();
+
+        let gemini = |chunks| async move {
+            GeminiSSEParser::new(Box::new(NoopSink))
+                .parse_events(sse_response(chunks))
+                .await
+        };
+        // Thinking spent the whole `maxOutputTokens`: a clean close with no event.
+        gemini(vec![]).await.unwrap();
+        let dropped = gemini(vec![Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ))])
+        .await
+        .unwrap_err();
+        assert!(as_transient(&dropped).is_some(), "{dropped}");
+        let truncated = gemini(vec![Ok(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        )])
+        .await
+        .unwrap_err();
+        assert!(as_transient(&truncated).is_some(), "{truncated}");
+    }
+
+    /// The prompt-side counts arrive only on `message_start` and the completion total
+    /// only on `message_delta`; a parser that keeps just the last one reports a request
+    /// with no input tokens at all.
+    #[tokio::test]
+    async fn anthropic_usage_merges_message_start_and_message_delta() {
+        let mut parser = AnthropicSSEParser::new(Box::new(NoopSink));
+        parser
+            .parse_event_data(
+                r#"{"type":"message_start","message":{"id":"msg_1","role":"assistant","usage":{"input_tokens":4821,"output_tokens":1,"cache_read_input_tokens":4096,"cache_creation_input_tokens":128}}}"#,
+            )
+            .await
+            .unwrap();
+        parser
+            .parse_event_data(r#"{"type":"message_delta","usage":{"output_tokens":312}}"#)
+            .await
+            .unwrap();
+
+        let usage = parser.usage.expect("usage");
+        assert_eq!(usage.input_tokens, Some(4821));
+        assert_eq!(usage.output_tokens, Some(312));
+        assert_eq!(usage.cache_read_input_tokens, Some(4096));
+        assert_eq!(usage.cache_creation_input_tokens, Some(128));
+    }
+
+    #[test]
+    fn openai_responses_usage_maps_cached_input_tokens() {
+        // Payload shape returned by the OpenAI Responses API.
+        let usage: OpenAIResponsesUsage = serde_json::from_str(
+            r#"{"input_tokens":4819,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":4736},"output_tokens":2,"total_tokens":4821}"#,
+        )
+        .unwrap();
+        let token_usage = usage.to_token_usage();
+        assert_eq!(token_usage.cache_read_input_tokens, Some(4736));
+        assert_eq!(token_usage.input_tokens, Some(4819));
+        assert_eq!(token_usage.total_tokens, Some(4821));
+    }
+
+    struct ReasoningSink;
+
+    #[async_trait::async_trait]
+    impl StreamEventSink for ReasoningSink {
+        async fn send(&self, event: StreamingEvent, events_str: &mut String) -> Result<(), Error> {
+            if let StreamingEvent::ReasoningTokenDelta { content } = event {
+                events_str.push_str(&content);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_openai_responses_reasoning_summary_parts_as_paragraphs() {
+        let mut parser = OpenAIResponsesSSEParser::new(Box::new(ReasoningSink));
+        for data in [
+            r#"{"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"**Planning**"}"#,
+            r#"{"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":1,"delta":"Then answer"}"#,
+        ] {
+            parser.parse_event_data(data).await.unwrap();
+        }
+        assert_eq!(parser.events_str, "**Planning**\n\nThen answer");
+        assert_eq!(parser.accumulated_reasoning, "**Planning**\n\nThen answer");
+    }
+
+    #[test]
+    fn openai_delta_parses_reasoning_content() {
+        // DeepSeek and similar stream reasoning under `reasoning_content`.
+        let delta: OpenAIChoiceDelta =
+            serde_json::from_str(r#"{"reasoning_content":"let me think"}"#).unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("let me think"));
+    }
+
+    #[test]
+    fn parses_anthropic_thinking_events() {
+        let start: AnthropicSSEEvent = serde_json::from_str(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"x"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            start,
+            AnthropicSSEEvent::ContentBlockStart {
+                content_block: AnthropicContentBlockStart::Thinking { .. },
+                ..
+            }
+        ));
+
+        let thinking_delta: AnthropicSSEEvent = serde_json::from_str(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"more"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            thinking_delta,
+            AnthropicSSEEvent::ContentBlockDelta {
+                delta: AnthropicDelta::ThinkingDelta { .. },
+                ..
+            }
+        ));
+
+        let signature_delta: AnthropicSSEEvent = serde_json::from_str(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            signature_delta,
+            AnthropicSSEEvent::ContentBlockDelta {
+                delta: AnthropicDelta::SignatureDelta { .. },
+                ..
+            }
+        ));
+
+        let redacted: AnthropicSSEEvent = serde_json::from_str(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"abc"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            redacted,
+            AnthropicSSEEvent::ContentBlockStart {
+                content_block: AnthropicContentBlockStart::RedactedThinking { .. },
+                ..
+            }
+        ));
+    }
+}

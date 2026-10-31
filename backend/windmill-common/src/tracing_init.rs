@@ -1,0 +1,279 @@
+/*
+ * Author: Ruben Fiszel
+ * Copyright: Windmill Labs, Inc 2022
+ * This file and its contents are licensed under the AGPLv3 License.
+ * Please see the included NOTICE for copyright information and
+ * LICENSE-AGPL for a copy of the license.
+ */
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+use tracing::{level_filters::LevelFilter, Event};
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::{
+    filter::Targets,
+    fmt::{format, Layer},
+    prelude::*,
+    EnvFilter,
+};
+
+use crate::utils::Mode;
+
+fn json_layer<S>() -> Layer<S, format::JsonFields, format::Format<format::Json>> {
+    tracing_subscriber::fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_span_list(false)
+        .with_current_span(true)
+}
+
+fn compact_layer<S>() -> Layer<S, format::DefaultFields, format::Format<format::Compact>> {
+    tracing_subscriber::fmt::layer().compact()
+}
+
+lazy_static::lazy_static! {
+    pub static ref JSON_FMT: bool = std::env::var("JSON_FMT").map(|x| x == "true").unwrap_or(false);
+    pub static ref QUIET_MODE: bool = std::env::var("QUIET").map(|x| x == "true" || x == "1").unwrap_or(false);
+    pub static ref OTEL_JOB_LOGS: bool = std::env::var("OTEL_JOB_LOGS").ok().is_some_and(|x| x == "1" || x == "true");
+}
+
+/// Target name for verbose logs that should be filtered in quiet mode.
+/// Use `tracing::info!(target: windmill_common::tracing_init::VERBOSE_TARGET, ...)` for logs that should be suppressed in quiet mode.
+pub const VERBOSE_TARGET: &str = "windmill_verbose";
+
+/// Target of audit events, so a log pipeline can route them without matching on content.
+/// It keeps the `windmill` prefix because that is what a `RUST_LOG` of `info` or `debug`
+/// is rewritten to filter on.
+pub const AUDIT_TARGET: &str = "windmill:audit";
+
+/// Prefix used by user scripts to emit a log line as an OTEL tracing event
+/// when `OTEL_JOB_LOGS=true`. Stripped before forwarding to the tracing layer.
+pub const OTEL_PREFIX: &str = "OTEL: ";
+
+/// Creates a Targets filter that optionally filters out verbose logs when quiet mode is enabled.
+fn create_targets_filter(default_env_filter: LevelFilter) -> Targets {
+    let targets =
+        Targets::new().with_target("windmill:job_log", tracing::level_filters::LevelFilter::OFF);
+
+    if *QUIET_MODE {
+        targets
+            .with_target(VERBOSE_TARGET, tracing::level_filters::LevelFilter::OFF)
+            .with_default(default_env_filter)
+    } else {
+        targets.with_default(default_env_filter)
+    }
+}
+
+pub const LOGS_SERVICE: &str = "logs/services/";
+pub const LOGS_AUDIT: &str = "logs/audit/";
+
+lazy_static::lazy_static! {
+    pub static ref TMP_WINDMILL_LOGS_SERVICE: String = format!("{}/{}", *crate::worker::WINDMILL_DIR, LOGS_SERVICE);
+}
+
+pub fn initialize_tracing(
+    hostname: &str,
+    mode: &Mode,
+    environment: &str,
+) -> (WorkerGuard, crate::otel_oss::OtelProvider) {
+    let style = if std::env::var("NO_COLOR").is_ok() {
+        "never".into()
+    } else {
+        std::env::var("RUST_LOG_STYLE").unwrap_or_else(|_| "auto".into())
+    };
+
+    let rust_log_env = std::env::var("RUST_LOG");
+    let rust_log_stdout_env = std::env::var("RUST_LOG_STDOUT");
+
+    if rust_log_env
+        .as_ref()
+        .is_ok_and(|x| x == "debug" || x == "info")
+    {
+        unsafe {
+            std::env::set_var(
+                "RUST_LOG",
+                &format!("windmill={}", rust_log_env.as_ref().unwrap()),
+            )
+        }
+    } else if rust_log_env.as_ref().is_ok_and(|x| x == "sqlxdebug") {
+        unsafe {
+            std::env::set_var("RUST_LOG", "windmill=debug,sqlx=debug");
+        }
+    };
+
+    let default_env_filter = if rust_log_env.is_ok_and(|x| x == "debug" || x == "sqlxdebug") {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::INFO
+    };
+
+    let meter_provider = crate::otel_oss::init_meter_provider(mode, hostname, environment);
+
+    let opentelemetry: Option<EnvFilter> = None;
+
+    let logs_bridge = crate::otel_oss::init_logs_bridge(&mode, hostname, environment);
+
+    use tracing_appender::rolling::{RollingFileAppender, Rotation};
+
+    let log_dir = format!("{}/{}/", *TMP_WINDMILL_LOGS_SERVICE, hostname);
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let file_appender = RollingFileAppender::builder()
+        .rotation(Rotation::MINUTELY)
+        .filename_prefix(format!("{}.log", hostname))
+        .max_log_files(20)
+        .build(log_dir)
+        .expect("Can build tracing file appender");
+
+    let (log_file_writer, _guard) = NonBlockingBuilder::default()
+        .lossy(false)
+        .finish(file_appender);
+
+    // let job_logs_filter = tracing_subscriber::filter::Targets::new()
+    //     .with_target("windmill:job_log", tracing::Level::TRACE);
+
+    // Create the base filter for file writer (always uses RUST_LOG)
+    let file_env_filter = EnvFilter::builder()
+        .with_default_directive(tracing::level_filters::LevelFilter::ERROR.into())
+        .from_env_lossy();
+
+    // Create the filter for stdout (uses RUST_LOG_STDOUT if available, otherwise RUST_LOG)
+    let stdout_env_filter = if rust_log_stdout_env.is_ok() {
+        // Temporarily set RUST_LOG to RUST_LOG_STDOUT value to parse it
+        let original_rust_log = std::env::var("RUST_LOG").ok();
+        unsafe {
+            std::env::set_var("RUST_LOG", rust_log_stdout_env.unwrap());
+        }
+        let filter = EnvFilter::builder()
+            .with_default_directive(tracing::level_filters::LevelFilter::ERROR.into())
+            .from_env_lossy();
+        unsafe {
+            // Restore original RUST_LOG
+            match original_rust_log {
+                Some(val) => std::env::set_var("RUST_LOG", val),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+        filter
+    } else {
+        file_env_filter.clone()
+    };
+
+    // Create a common filter for OTEL logs bridge and tracing layer to respect RUST_LOG
+    let otel_logs_filter = file_env_filter.clone();
+
+    let opentelemetry_filtered = opentelemetry;
+
+    let base_layer = tracing_subscriber::registry()
+        .with(logs_bridge.with_filter(otel_logs_filter))
+        .with(opentelemetry_filtered);
+
+    // The service log files are written to be indexed, not tailed, so they always carry the
+    // JSON format: it is what preserves level, target and the current span as fields rather
+    // than as text the index would have to recover by regex. JSON_FMT governs stdout only.
+    let file_layer = json_layer()
+        .with_writer(log_file_writer)
+        .flatten_event(true)
+        .with_filter(file_env_filter)
+        .with_filter(create_targets_filter(default_env_filter));
+
+    // Boxed so both arms have one type: the file layer is a single value and could not
+    // otherwise be typed against two different subscriber stacks.
+    let stdout_layer = match *JSON_FMT {
+        true => json_layer()
+            .with_writer(std::io::stdout)
+            .flatten_event(true)
+            .with_filter(stdout_env_filter)
+            .with_filter(create_targets_filter(default_env_filter))
+            .boxed(),
+        false => compact_layer()
+            .with_writer(std::io::stdout)
+            .with_ansi(style.to_lowercase() != "never")
+            .with_file(true)
+            .with_line_number(true)
+            .with_target(false)
+            .with_filter(stdout_env_filter)
+            .with_filter(create_targets_filter(default_env_filter))
+            .boxed(),
+    };
+
+    base_layer
+        .with(stdout_layer)
+        .with(file_layer)
+        .with(CountingLayer::new())
+        .init();
+    (_guard, meter_provider)
+}
+
+/// Tracing for a subcommand that writes to the instance without running a server
+/// (`sync-config`, the operator): stdout, plus the OTel logs bridge when OTel logs are
+/// enabled, which is how the audit events of its writes reach a collector. It writes no
+/// service log files, as nothing lists such a process to read them back.
+///
+/// Only audit events are exported. These processes log each setting they write with its
+/// value, masked by a list of known secret fields rather than by shape, and that is fit
+/// for the operator's own stdout but not for a collector.
+pub fn initialize_subcommand_tracing(service: &str, hostname: &str, environment: &str) {
+    let logs_bridge = crate::otel_oss::init_logs_bridge_for_service(service, hostname, environment);
+    tracing_subscriber::registry()
+        .with(logs_bridge.with_filter(Targets::new().with_target(AUDIT_TARGET, LevelFilter::INFO)))
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                EnvFilter::builder()
+                    .with_default_directive(LevelFilter::INFO.into())
+                    .from_env_lossy(),
+            ),
+        )
+        .init();
+}
+
+lazy_static::lazy_static! {
+    pub static ref LOG_COUNTING_BY_MIN: Arc<RwLock<HashMap<String, LogCounter>>> = Arc::new(RwLock::new(HashMap::new()));
+}
+
+#[derive(Debug)]
+pub struct LogCounter {
+    pub non_error_count: usize,
+    pub error_count: usize,
+}
+
+impl LogCounter {
+    fn new() -> Self {
+        LogCounter { non_error_count: 0, error_count: 0 }
+    }
+}
+
+#[derive(Debug)]
+struct CountingLayer {}
+
+impl CountingLayer {
+    pub fn new() -> Self {
+        CountingLayer {}
+    }
+}
+
+pub const LOG_TIMESTAMP_FMT: &str = "%Y-%m-%d-%H-%M";
+
+impl<S> tracing_subscriber::Layer<S> for CountingLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let level = *event.metadata().level();
+
+        let date_str = chrono::Utc::now().format(LOG_TIMESTAMP_FMT).to_string();
+        let counters = LOG_COUNTING_BY_MIN.write();
+        if let Ok(mut counters) = counters {
+            let counter = counters.entry(date_str).or_insert(LogCounter::new());
+            if level == tracing::Level::ERROR {
+                counter.error_count += 1;
+            } else {
+                counter.non_error_count += 1;
+            }
+        } else {
+            println!("Error getting lock for log counting");
+        }
+    }
+}

@@ -1,0 +1,2954 @@
+use async_recursion::async_recursion;
+
+use itertools::Itertools;
+use lazy_static::lazy_static;
+use process_wrap::tokio::TokioChildWrapper;
+use regex::Regex;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use serde_json::{json, Value};
+use sha2::Digest;
+use sqlx::types::Json;
+use sqlx::{Pool, Postgres};
+use tokio::process::Command;
+use tokio::{fs::File, io::AsyncReadExt};
+use windmill_common::variables::arg_needs_interpolation;
+
+use windmill_common::flows::Step;
+use windmill_common::global_settings::NSJAIL_TMP_BACKING_DISK;
+use windmill_common::variables::{build_crypt_with_key_suffix, decrypt};
+use windmill_common::worker::{
+    max_job_duration_secs, to_raw_value, update_ping_for_failed_init_script_query, write_file,
+    Connection, Ping, PingType, CLOUD_HOSTED, ROOT_CACHE_DIR, WORKER_CONFIG,
+};
+use windmill_common::workspace_dependencies::WorkspaceDependenciesPrefetched;
+use windmill_common::{
+    cache::{Cache, RawData},
+    error::{self, Error},
+    scripts::ScriptHash,
+    utils::configure_client,
+    variables::ContextualVariable,
+};
+#[cfg(feature = "parquet")]
+use windmill_object_store::get_etag_or_empty;
+#[cfg(feature = "parquet")]
+use windmill_types::s3::{LargeFileStorage, ObjectStoreResource, S3Object};
+
+use anyhow::{anyhow, Result};
+use windmill_parser_sql::{s3_mode_extension, S3ModeArgs, S3ModeFormat};
+use windmill_queue::{MiniCompletedJob, MiniPulledJob};
+
+use std::collections::HashSet;
+use std::path::Path;
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use uuid::Uuid;
+use windmill_common::{variables, DB};
+
+use tokio::{io::AsyncWriteExt, time::Instant};
+
+use crate::agent_workers::UPDATE_PING_URL;
+use crate::{
+    JOB_DEFAULT_TIMEOUT, MAX_RESULT_SIZE, NSJAIL_TMPFS_SIZE_MB, NSJAIL_TMP_BACKING, PATH_ENV,
+};
+use windmill_common::client::AuthedClient;
+
+/// Additional nsjail config for development. Currently used for nix flake.
+#[cfg(debug_assertions)]
+pub const DEV_CONF_NSJAIL: &str = r#"
+mount {
+    src: "/nix/store"
+    dst: "/nix/store"
+    is_bind: true
+    mandatory: false
+}
+"#;
+
+#[cfg(not(debug_assertions))]
+pub const DEV_CONF_NSJAIL: &str = "";
+
+/// Tells a `spawn_blocking` task to stop when the future awaiting it goes away.
+///
+/// Dropping a `JoinHandle` detaches the task rather than cancelling it, so a
+/// cancelled or timed-out phase otherwise leaves the blocking pool working on an
+/// answer nobody will read. Hold one of these beside the handle and have the
+/// blocking loop check the flag.
+pub(crate) struct AbortOnDrop(pub(crate) std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Turn a JSON value into the string a shell/CLI arg should receive: a JSON string
+/// becomes its inner value, anything else is re-serialized compactly.
+pub(crate) fn raw_to_string(x: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(x) {
+        Ok(serde_json::Value::String(x)) => x,
+        Ok(x) => serde_json::to_string(&x).unwrap_or_else(|_| String::new()),
+        _ => String::new(),
+    }
+}
+
+/// Narrow a JSON integer to the Rust type bound for a SQL argument, erroring the way the
+/// database would rather than letting an `as` cast wrap it into a different value.
+pub(crate) fn narrow_sql_int<T, N>(n: N, sql_type: &str) -> anyhow::Result<T>
+where
+    T: TryFrom<N>,
+    N: std::fmt::Display + Copy,
+{
+    T::try_from(n).map_err(|_| anyhow!("value \"{n}\" is out of range for type {sql_type}"))
+}
+
+pub async fn build_args_map<'a>(
+    job: &'a MiniPulledJob,
+    client: &AuthedClient,
+    conn: &Connection,
+) -> error::Result<Option<HashMap<String, Box<RawValue>>>> {
+    if let Some(args) = &job.args {
+        return transform_json(client, &job.workspace_id, &args.0, &job, conn).await;
+    }
+    return Ok(None);
+}
+
+pub fn check_executor_binary_exists(
+    executor: &str,
+    executor_path: &str,
+    language: &str,
+) -> Result<(), Error> {
+    if !Path::new(executor_path).exists() {
+        let msg = format!("Couldn't find {executor} at {}. This probably means that you are not using the windmill-full image. Please use the image `ghcr.io/windmill-labs/windmill-full` for your instance in order to run {language} jobs.", executor_path);
+        return Err(Error::NotFound(msg));
+    }
+
+    Ok(())
+}
+
+pub async fn build_args_values(
+    job: &MiniPulledJob,
+    client: &AuthedClient,
+    conn: &Connection,
+) -> error::Result<HashMap<String, serde_json::Value>> {
+    if let Some(args) = &job.args {
+        transform_json_as_values(client, &job.workspace_id, &args.0, job, conn).await
+    } else {
+        Ok(HashMap::new())
+    }
+}
+
+#[tracing::instrument(level = "trace", skip_all)]
+pub async fn create_args_and_out_file(
+    client: &AuthedClient,
+    job: &MiniPulledJob,
+    job_dir: &str,
+    conn: &Connection,
+) -> Result<(), Error> {
+    if let Some(args) = job.args.as_ref() {
+        if let Some(mut x) = transform_json(client, &job.workspace_id, &args.0, job, conn).await? {
+            x.remove("_MODULES");
+            x.remove("_TEMP_SCRIPT_REFS");
+            write_file(
+                job_dir,
+                "args.json",
+                &serde_json::to_string(&x).unwrap_or_else(|_| "{}".to_string()),
+            )?;
+        } else {
+            let mut filtered = args.0.clone();
+            filtered.remove("_MODULES");
+            filtered.remove("_TEMP_SCRIPT_REFS");
+            write_file(
+                job_dir,
+                "args.json",
+                &serde_json::to_string(&filtered).unwrap_or_else(|_| "{}".to_string()),
+            )?;
+        }
+    } else {
+        write_file(job_dir, "args.json", "{}")?;
+    };
+
+    write_file(job_dir, "result.json", "")?;
+    Ok(())
+}
+
+pub async fn write_file_binary(dir: &str, path: &str, content: &[u8]) -> error::Result<File> {
+    let path = format!("{}/{}", dir, path);
+    let mut file = File::create(&path).await?;
+    file.write_all(content).await?;
+    file.flush().await?;
+    Ok(file)
+}
+
+/// Returns true if any value in `vs` contains a `$var:`/`$jsonvar:`/`$res:`/`$encrypted:`
+/// reference that would need interpolation by `transform_json`. Cheap pre-check that
+/// callers can use to skip the DB roundtrip + clone path when nothing requires resolution.
+pub(crate) fn map_needs_resolution(vs: &HashMap<String, Box<RawValue>>) -> bool {
+    vs.values().any(|v| arg_needs_interpolation(v.get()))
+}
+
+pub async fn transform_json<'a>(
+    client: &AuthedClient,
+    workspace: &str,
+    vs: &'a HashMap<String, Box<RawValue>>,
+    job: &MiniPulledJob,
+    db: &Connection,
+) -> error::Result<Option<HashMap<String, Box<RawValue>>>> {
+    let mut has_match = false;
+    for (_, v) in vs {
+        let inner_vs = v.get();
+        if arg_needs_interpolation(inner_vs) {
+            has_match = true;
+            break;
+        }
+    }
+    if !has_match {
+        return Ok(None);
+    }
+    let mut r = HashMap::new();
+    for (k, v) in vs {
+        let inner_vs = v.get();
+        if arg_needs_interpolation(inner_vs) {
+            let value = serde_json::from_str(inner_vs).map_err(|e| {
+                error::Error::internal_err(format!("Error while parsing inner arg: {e:#}"))
+            })?;
+            let transformed =
+                transform_json_value(&k, &client, workspace, value, job, db, 0).await?;
+            let as_raw = serde_json::from_value(transformed).map_err(|e| {
+                error::Error::internal_err(format!("Error while parsing inner arg: {e:#}"))
+            })?;
+            r.insert(k.to_string(), as_raw);
+        } else {
+            r.insert(k.to_string(), v.to_owned());
+        }
+    }
+    Ok(Some(r))
+}
+
+pub async fn transform_json_as_values<'a>(
+    client: &AuthedClient,
+    workspace: &str,
+    vs: &'a HashMap<String, Box<RawValue>>,
+    job: &MiniPulledJob,
+    db: &Connection,
+) -> error::Result<HashMap<String, serde_json::Value>> {
+    let mut r: HashMap<String, serde_json::Value> = HashMap::new();
+    for (k, v) in vs {
+        let inner_vs = v.get();
+        if arg_needs_interpolation(inner_vs) {
+            let value = serde_json::from_str(inner_vs).map_err(|e| {
+                error::Error::internal_err(format!("Error while parsing inner arg: {e:#}"))
+            })?;
+            let transformed =
+                transform_json_value(&k, &client, workspace, value, job, db, 0).await?;
+            let as_raw = serde_json::from_value(transformed).map_err(|e| {
+                error::Error::internal_err(format!("Error while parsing inner arg: {e:#}"))
+            })?;
+            r.insert(k.to_string(), as_raw);
+        } else {
+            r.insert(
+                k.to_string(),
+                serde_json::from_str(v.get()).unwrap_or_else(|_| serde_json::Value::Null),
+            );
+        }
+    }
+    Ok(r)
+}
+
+pub fn parse_npm_config(s: &str) -> (String, Option<String>) {
+    let (url, token_opt) = if s.contains(":_authToken=") {
+        let split_url = s.split(":_authToken=").collect::<Vec<&str>>();
+        let url = split_url
+            .get(0)
+            .map(|u| u.to_string())
+            .unwrap_or("".to_string());
+        let token = split_url
+            .get(1)
+            .map(|t| t.to_string())
+            .unwrap_or("".to_string());
+        (url, Some(token))
+    } else {
+        (s.to_owned(), None)
+    };
+    return (url, token_opt);
+}
+
+// Defense-in-depth bound on worker-side interpolation recursion. `$res:`
+// resolution is delegated to the API (which enforces its own
+// MAX_RESOURCE_INTERPOLATION_DEPTH), so this only bounds nested
+// object/array structure here, but a finite cap guards against pathological
+// inputs regardless of the API-side guard.
+const MAX_INTERPOLATION_DEPTH: u8 = 50;
+
+#[async_recursion]
+pub async fn transform_json_value(
+    name: &str,
+    client: &AuthedClient,
+    workspace: &str,
+    v: Value,
+    job: &MiniPulledJob,
+    conn: &Connection,
+    depth: u8,
+) -> error::Result<Value> {
+    if depth >= MAX_INTERPOLATION_DEPTH {
+        return Err(Error::internal_err(format!(
+            "Maximum resource/variable interpolation depth ({MAX_INTERPOLATION_DEPTH}) exceeded for `{name}`; this usually indicates a circular `$res:` or `$var:` reference"
+        )));
+    }
+    match v {
+        Value::String(y) if y.starts_with("$var:") => {
+            let path = y.strip_prefix("$var:").unwrap();
+            client
+                .get_variable_value(path)
+                .await
+                .map(|x| json!(x))
+                .map_err(|e| {
+                    Error::NotFound(format!("Variable {path} not found for `{name}`: {e:#}"))
+                })
+        }
+        Value::String(y) if y.starts_with("$jsonvar:") => {
+            let path = y.strip_prefix("$jsonvar:").unwrap();
+            let v = client.get_variable_value(path).await.map_err(|e| {
+                Error::NotFound(format!("Variable {path} not found for `{name}`: {e:#}"))
+            })?;
+            serde_json::from_str::<serde_json::Value>(&v).map_err(|e| {
+                Error::internal_err(format!("Failed to parse $jsonvar value as JSON: {e}"))
+            })
+        }
+        Value::String(y) if y.starts_with("$res:") => {
+            let path = y.strip_prefix("$res:").unwrap();
+
+            if path.split("/").count() < 2 && !path.starts_with("CUSTOM_INSTANCE_DB/") {
+                return Err(Error::internal_err(format!(
+                    "Argument `{name}` is an invalid resource path: {path}",
+                )));
+            }
+            client
+                .get_resource_value_interpolated::<serde_json::Value>(
+                    path,
+                    Some(job.id.to_string()),
+                )
+                .await
+                .map_err(|e| {
+                    Error::NotFound(format!("Resource {path} not found for `{name}`: {e:#}"))
+                })
+        }
+        Value::String(y) if y.starts_with("$encrypted:") => {
+            match conn {
+                Connection::Sql(db) => {
+                    let encrypted = y.strip_prefix("$encrypted:").unwrap();
+
+                    let root_job_id = get_root_job_id(&job);
+                    let mc = build_crypt_with_key_suffix(
+                        &db,
+                        &job.workspace_id,
+                        &root_job_id.to_string(),
+                    )
+                    .await?;
+                    decrypt(&mc, encrypted.to_string()).and_then(|x| {
+                        // Register the raw decrypted string for log masking.
+                        // This covers both string values and their JSON representations
+                        // (numbers, objects, etc.) that could appear in logs.
+                        windmill_common::sensitive_log_masks::register_secret_for_job(job.id, &x);
+                        if let serde_json::Value::String(ref s) =
+                            serde_json::from_str::<serde_json::Value>(&x).unwrap_or_default()
+                        {
+                            // Also register the inner string value (without JSON quotes)
+                            windmill_common::sensitive_log_masks::register_secret_for_job(
+                                job.id, s,
+                            );
+                        }
+                        serde_json::from_str(&x).map_err(|e| {
+                            Error::internal_err(format!(
+                                "Failed to decrypt '$encrypted:' value: {e}"
+                            ))
+                        })
+                    })
+                }
+                Connection::Http(_) => Err(Error::ExecutionErr(format!(
+                    "`{name}` is an `$encrypted:` value, which an agent worker cannot decrypt: \
+                     pass the secret as a `$var:` reference (in a flow, a static input or an \
+                     exact `flow_env.<key>` read) and build the value inside the script"
+                ))),
+            }
+
+            // let path = y.strip_prefix("$res:").unwrap();
+        }
+        Value::String(y) if y.starts_with("$") => {
+            let variables = get_reserved_variables(job, &client.token, conn, None).await?;
+
+            let name = y.strip_prefix("$").unwrap();
+
+            let value = variables
+                .iter()
+                .find(|x| x.0 == name)
+                .map(|x| x.1.clone())
+                .unwrap_or_else(|| y);
+            Ok(json!(value))
+        }
+        Value::Array(mut arr) if depth <= 2 && arr.len() <= 1000 => {
+            for i in 0..arr.len() {
+                let val = std::mem::take(&mut arr[i]);
+                arr[i] = transform_json_value(name, client, workspace, val, job, conn, depth + 1)
+                    .await?;
+            }
+            Ok(Value::Array(arr))
+        }
+        Value::Array(arr) => {
+            if arr.len() > 1000 {
+                tracing::warn!(
+                    "Array with {} items exceeds 1000 item limit for variable/resource resolution, skipping",
+                    arr.len()
+                );
+            }
+            Ok(Value::Array(arr))
+        }
+        Value::Object(mut m) => {
+            for (a, b) in m.clone().into_iter() {
+                m.insert(
+                    a.clone(),
+                    transform_json_value(&a, client, workspace, b, job, conn, depth + 1).await?,
+                );
+            }
+            Ok(Value::Object(m))
+        }
+        a @ _ => Ok(a),
+    }
+}
+
+pub async fn read_file_content(path: &str) -> error::Result<String> {
+    let mut file = File::open(path).await?;
+    let mut content = "".to_string();
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
+pub async fn read_file_bytes(path: &str) -> error::Result<Vec<u8>> {
+    let mut file = File::open(path).await?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).await?;
+    Ok(content)
+}
+
+pub use windmill_common::utils::unsafe_raw;
+
+fn check_result_too_big(size: usize) -> error::Result<()> {
+    if *CLOUD_HOSTED && size > MAX_RESULT_SIZE {
+        return Err(error::Error::ExecutionErr("Result is too large for the cloud app (limit 2MB).
+We highly recommend using object to store and pass heavy data (https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill#read-a-file-from-s3-within-a-script)
+Alternatively, if using this script as part of a flow, activate shared folder and use the shared folder to pass heavy data between steps.".to_owned()));
+    };
+    Ok(())
+}
+
+/// This function assumes that the file contains valid json and will result in UB if it isn't. If
+/// the file is user generated or otherwise not guaranteed to be valid used the
+/// `read_and_check_file` instead
+pub async fn read_file(path: &str) -> error::Result<Box<RawValue>> {
+    let content = read_file_content(path).await?;
+
+    check_result_too_big(content.len())?;
+
+    let r = unsafe_raw(content);
+    return Ok(r);
+}
+
+pub async fn merge_result_stream(
+    result: error::Result<Box<RawValue>>,
+    result_stream: Option<String>,
+) -> error::Result<Box<RawValue>> {
+    if let Some(result_stream) = result_stream {
+        result.and_then(|x| {
+            let mut value: Value = serde_json::from_str(x.get())?;
+
+            // Insert the string at the "wm_stream" field
+            if let Value::Object(ref mut map) = value {
+                map.insert("wm_stream".to_string(), Value::String(result_stream));
+            } else if value.is_null() {
+                // return Ok(unsafe_raw(json))
+                return Ok(to_raw_value(&json!(result_stream)));
+            } else {
+                return Ok(x);
+            }
+
+            // Convert back to RawValue
+            let json_string = serde_json::to_string(&value)?;
+            Ok(RawValue::from_string(json_string)?)
+        })
+    } else {
+        result
+    }
+}
+/// Read the `result.json` file. This function assumes that the file contains valid json and will
+/// result in undefined behaviour if it isn't. If the result.json is user generated or otherwise
+/// not guaranteed to be valid, use `read_and_check_result`
+pub async fn read_result(
+    job_dir: &str,
+    result_stream: Option<String>,
+) -> error::Result<Box<RawValue>> {
+    let rf = read_file(&format!("{job_dir}/result.json")).await;
+    merge_result_stream(rf, result_stream).await
+}
+
+pub async fn read_and_check_file(path: &str) -> error::Result<Box<RawValue>> {
+    let content = read_file_content(path).await?;
+
+    check_result_too_big(content.len())?;
+
+    let raw_value: Box<RawValue> =
+        serde_json::from_str(&content).map_err(|e| anyhow!("{} is not valid json: {}", path, e))?;
+    Ok(raw_value)
+}
+
+/// Use this to read `result.json` that were user-generated
+pub async fn read_and_check_result(job_dir: &str) -> error::Result<Box<RawValue>> {
+    let result_path = format!("{job_dir}/result.json");
+
+    if let Ok(metadata) = tokio::fs::metadata(&result_path).await {
+        if metadata.len() > 0 {
+            return read_and_check_file(&result_path)
+                .await
+                .map_err(|e| anyhow!("Failed to read result: {}", e).into());
+        }
+    }
+    Ok(to_raw_value(&json!("null")))
+}
+
+pub fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+#[tracing::instrument(level = "trace", skip_all)]
+pub async fn get_reserved_variables(
+    job: &MiniPulledJob,
+    token: &str,
+    db: &Connection,
+    parent_runnable_path: Option<String>,
+) -> Result<HashMap<String, String>, Error> {
+    let flow_path = if parent_runnable_path.is_some() {
+        parent_runnable_path
+    } else if let Some(uuid) = job.parent_job {
+        match db {
+            Connection::Sql(db) => {
+                sqlx::query_scalar!("SELECT runnable_path FROM v2_job WHERE id = $1", uuid)
+                    .fetch_optional(db)
+                    .await?
+                    .flatten()
+            }
+            Connection::Http(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let tested_runnable = match (&job.trigger_kind, &job.trigger) {
+        (Some(k), Some(t)) if k.is(windmill_common::jobs::JobTriggerKind::CiTest) => {
+            Some(t.clone())
+        }
+        _ => None,
+    };
+
+    let variables = variables::get_reserved_variables(
+        db,
+        &job.workspace_id,
+        token,
+        &job.permissioned_as_email,
+        &job.created_by,
+        &job.id.to_string(),
+        &job.permissioned_as,
+        job.runnable_path.clone(),
+        job.parent_job.map(|x| x.to_string()),
+        flow_path,
+        job.schedule_path(),
+        job.flow_step_id.clone(),
+        job.flow_innermost_root_job.clone().map(|x| x.to_string()),
+        Some(get_root_job_id(job).to_string()),
+        Some(job.scheduled_for.clone()),
+        job.runnable_id,
+        job.permissioned_as_end_user_email.clone(),
+        tested_runnable,
+    )
+    .await
+    .to_vec();
+    let mut variables = variables;
+    if let Some(client) = &job.mcp_client {
+        variables.push(variables::ContextualVariable {
+            name: "WM_MCP_CLIENT".to_string(),
+            value: client.clone(),
+            description: "OAuth client of the external identity provider the run was started \
+                          through on the user's behalf, propagated to flow steps"
+                .to_string(),
+            is_custom: false,
+        });
+    }
+
+    Ok(build_envs_map(variables).await)
+}
+
+pub async fn build_envs_map(context: Vec<ContextualVariable>) -> HashMap<String, String> {
+    let mut r: HashMap<String, String> =
+        context.into_iter().map(|rv| (rv.name, rv.value)).collect();
+
+    let envs = (**WORKER_CONFIG.load()).clone().env_vars;
+    for env in envs {
+        r.insert(env.0.clone(), env.1.clone());
+    }
+
+    r
+}
+
+pub fn sizeof_val(v: &serde_json::Value) -> usize {
+    std::mem::size_of::<serde_json::Value>()
+        + match v {
+            serde_json::Value::Null => 0,
+            serde_json::Value::Bool(_) => 0,
+            serde_json::Value::Number(_) => 4, // Incorrect if arbitrary_precision is enabled. oh well
+            serde_json::Value::String(s) => s.capacity(),
+            serde_json::Value::Array(a) => a.iter().map(sizeof_val).sum(),
+            serde_json::Value::Object(o) => o
+                .iter()
+                .map(|(k, v)| {
+                    std::mem::size_of::<String>()
+                        + k.capacity()
+                        + sizeof_val(v)
+                        + std::mem::size_of::<usize>() * 3
+                })
+                .sum(),
+        }
+}
+
+pub async fn update_worker_ping_for_failed_init_script(
+    conn: &Connection,
+    worker_name: &str,
+    last_job_id: Uuid,
+) {
+    match conn {
+        Connection::Sql(db) => {
+            if let Err(e) =
+                update_ping_for_failed_init_script_query(worker_name, last_job_id, db).await
+            {
+                tracing::error!("Error updating worker ping for failed init script: {e:?}");
+            }
+        }
+        Connection::Http(client) => {
+            if let Err(e) = client
+                .post::<_, ()>(
+                    UPDATE_PING_URL,
+                    None,
+                    &Ping {
+                        last_job_executed: Some(last_job_id),
+                        last_job_workspace_id: None,
+                        worker_instance: None,
+                        ip: None,
+                        tags: None,
+                        dw: None,
+                        dws: None,
+                        jobs_executed: None,
+                        occupancy_rate: None,
+                        occupancy_rate_15s: None,
+                        occupancy_rate_5m: None,
+                        occupancy_rate_30m: None,
+                        version: None,
+                        vcpus: None,
+                        memory: None,
+                        memory_usage: None,
+                        wm_memory_usage: None,
+                        job_isolation: None,
+                        native_mode: None,
+                        draining: None,
+                        ping_type: PingType::InitScript,
+                    },
+                )
+                .await
+            {
+                tracing::error!("Error updating worker ping for failed init script: {e:?}");
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct OccupancyMetrics {
+    pub running_job_started_at: Option<Instant>,
+    pub total_duration_of_running_jobs: f32,
+    pub worker_occupancy_rate_history: Vec<(f32, f32)>,
+    pub start_time: Instant,
+}
+
+pub struct OccupancyResult {
+    pub occupancy_rate: f32,
+    pub occupancy_rate_15s: Option<f32>,
+    pub occupancy_rate_5m: Option<f32>,
+    pub occupancy_rate_30m: Option<f32>,
+}
+
+impl OccupancyMetrics {
+    pub fn new(start_time: Instant) -> Self {
+        OccupancyMetrics {
+            running_job_started_at: None,
+            total_duration_of_running_jobs: 0.0,
+            worker_occupancy_rate_history: Vec::new(),
+            start_time,
+        }
+    }
+
+    pub fn update_occupancy_metrics(&mut self) -> OccupancyResult {
+        let metrics = self;
+        let current_occupied_duration = metrics
+            .running_job_started_at
+            .map(|started_at| started_at.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+        let total_occupation = metrics.total_duration_of_running_jobs + current_occupied_duration;
+
+        let elapsed = metrics.start_time.elapsed().as_secs_f32();
+
+        let (occupancy_rate_15s, occupancy_rate_5m, occupancy_rate_30m) =
+            if !metrics.worker_occupancy_rate_history.is_empty() {
+                let mut total_occupation_15s = 0.0;
+                let mut total_occupation_5m = 0.0;
+                let mut total_occupation_30m = 0.0;
+                let mut index30m = 0;
+                for (i, (past_total_occupation, time)) in
+                    metrics.worker_occupancy_rate_history.iter().enumerate()
+                {
+                    let diff = elapsed - time;
+                    if diff < 1800.0 && total_occupation_30m == 0.0 {
+                        total_occupation_30m = (total_occupation - past_total_occupation) / diff;
+                        index30m = i;
+                    }
+                    if diff < 300.0 && total_occupation_5m == 0.0 {
+                        total_occupation_5m = (total_occupation - past_total_occupation) / diff;
+                    }
+                    if diff < 15.0 {
+                        total_occupation_15s = (total_occupation - past_total_occupation) / diff;
+                        break;
+                    }
+                }
+
+                //drop all elements before the oldest one in 30m windows
+                metrics.worker_occupancy_rate_history.drain(..index30m);
+
+                // Only report occupancy for a window if the worker has been running
+                // long enough to have meaningful data for that window. Otherwise,
+                // short-lived workers would report misleadingly high occupancy rates.
+                (
+                    if elapsed >= 15.0 {
+                        Some(total_occupation_15s)
+                    } else {
+                        None
+                    },
+                    if elapsed >= 300.0 {
+                        Some(total_occupation_5m)
+                    } else {
+                        None
+                    },
+                    if elapsed >= 1800.0 {
+                        Some(total_occupation_30m)
+                    } else {
+                        None
+                    },
+                )
+            } else {
+                (None, None, None)
+            };
+        let occupancy_rate = total_occupation / elapsed;
+
+        //push the current occupancy rate and the timestamp
+        metrics
+            .worker_occupancy_rate_history
+            .push((total_occupation, elapsed));
+
+        OccupancyResult {
+            occupancy_rate,
+            occupancy_rate_15s,
+            occupancy_rate_5m,
+            occupancy_rate_30m,
+        }
+    }
+}
+
+lazy_static! {
+    static ref DISABLE_PROCESS_GROUP: bool = std::env::var("DISABLE_PROCESS_GROUP").is_ok();
+}
+
+/// 2 GB memory limit in bytes for LIMIT_WINDOWS_TO_1CU
+#[cfg(windows)]
+const MEMORY_LIMIT_1CU: usize = 2 * 1024 * 1024 * 1024;
+
+/// Wrapper that holds a Windows Job Object handle alongside the child process.
+/// The job object carries KILL_ON_JOB_CLOSE and/or a memory limit. With
+/// KILL_ON_JOB_CLOSE, the worker process dying closes the handle and the OS reaps the
+/// whole child tree — preventing orphans when the worker is force-killed (e.g. a second
+/// CTRL_BREAK_EVENT or Nomad's kill_timeout) before a job has drained.
+#[cfg(windows)]
+struct WindowsJobChild {
+    inner: Box<dyn TokioChildWrapper>,
+    _job_handle: Win32JobHandle,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for WindowsJobChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsJobChild").finish()
+    }
+}
+
+/// RAII wrapper for a raw Win32 HANDLE that closes it on drop.
+#[cfg(windows)]
+struct Win32JobHandle(windows::Win32::Foundation::HANDLE);
+
+// SAFETY: Win32 HANDLEs are plain pointer-sized values with no thread affinity;
+// the kernel ref-counts the underlying object, so sending/sharing the handle is safe.
+#[cfg(windows)]
+unsafe impl Send for Win32JobHandle {}
+#[cfg(windows)]
+unsafe impl Sync for Win32JobHandle {}
+
+#[cfg(windows)]
+impl Drop for Win32JobHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+impl process_wrap::tokio::TokioChildWrapper for WindowsJobChild {
+    fn inner(&self) -> &tokio::process::Child {
+        self.inner.inner()
+    }
+    fn inner_mut(&mut self) -> &mut tokio::process::Child {
+        self.inner.inner_mut()
+    }
+    fn into_inner(self: Box<Self>) -> tokio::process::Child {
+        // Leak the job handle: with KILL_ON_JOB_CLOSE, closing the last handle reaps
+        // the (still-running) child, so extracting the inner Child must not close it.
+        let WindowsJobChild { inner, _job_handle } = *self;
+        std::mem::forget(_job_handle);
+        inner.into_inner()
+    }
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        self.inner.start_kill()
+    }
+    fn wait(
+        &mut self,
+    ) -> Box<dyn std::future::Future<Output = std::io::Result<std::process::ExitStatus>> + Send + '_>
+    {
+        self.inner.wait()
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.inner.try_wait()
+    }
+}
+
+/// Resume all threads of a process created with CREATE_SUSPENDED. We create the child
+/// suspended so it can be assigned to its job object before running any code; otherwise
+/// a child that forks a helper at startup could create it before the assignment and
+/// leave it outside the job (escaping KILL_ON_JOB_CLOSE reaping / the memory cap).
+/// (Ported from process-wrap's resume_threads.)
+#[cfg(windows)]
+fn resume_process(pid: u32) -> Result<(), std::io::Error> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("CreateToolhelp32Snapshot: {e}"),
+            )
+        })?;
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            cntUsage: 0,
+            th32ThreadID: 0,
+            th32OwnerProcessID: 0,
+            tpBasePri: 0,
+            tpDeltaPri: 0,
+            dwFlags: 0,
+        };
+        let mut res = Thread32First(snapshot, &mut entry);
+        while res.is_ok() {
+            if entry.th32OwnerProcessID == pid {
+                if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
+                    ResumeThread(thread);
+                    let _ = windows::Win32::Foundation::CloseHandle(thread);
+                }
+            }
+            res = Thread32Next(snapshot, &mut entry);
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+    }
+    Ok(())
+}
+
+/// Create a Windows Job Object and assign the process to it, optionally with
+/// KILL_ON_JOB_CLOSE (so the child tree is reaped when the worker drops the handle /
+/// dies) and/or a memory limit. Assigning post-spawn (rather than via process-wrap's
+/// suspend/resume JobObject wrap) keeps the dotnet-safe behavior that csharp relies on.
+#[cfg(windows)]
+fn assign_job_object(
+    pid: u32,
+    memory_limit: Option<usize>,
+    kill_on_close: bool,
+) -> Result<Win32JobHandle, std::io::Error> {
+    use windows::Win32::System::JobObjects::*;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+
+    unsafe {
+        let job = CreateJobObjectW(None, None).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("CreateJobObjectW: {e}"))
+        })?;
+
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        if kill_on_close {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        }
+        if let Some(memory_limit) = memory_limit {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.JobMemoryLimit = memory_limit;
+        }
+
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .map_err(|e| {
+            let _ = windows::Win32::Foundation::CloseHandle(job);
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("SetInformationJobObject: {e}"),
+            )
+        })?;
+
+        let process_handle = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
+            .map_err(|e| {
+                let _ = windows::Win32::Foundation::CloseHandle(job);
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("OpenProcess({pid}): {e}"),
+                )
+            })?;
+
+        let assign_result = AssignProcessToJobObject(job, process_handle);
+        let _ = windows::Win32::Foundation::CloseHandle(process_handle);
+        assign_result.map_err(|e| {
+            let _ = windows::Win32::Foundation::CloseHandle(job);
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("AssignProcessToJobObject: {e}"),
+            )
+        })?;
+
+        Ok(Win32JobHandle(job))
+    }
+}
+
+pub fn build_command_with_isolation(program: &str, args: &[&str]) -> Command {
+    use tokio::process::Command;
+
+    if crate::is_unshare_enabled() {
+        if let Some(unshare_path) = crate::UNSHARE_PATH.as_ref() {
+            let mut cmd = Command::new(unshare_path);
+
+            let flags = crate::UNSHARE_ISOLATION_FLAGS.as_str();
+            for flag in flags.split_whitespace() {
+                cmd.arg(flag);
+            }
+
+            // If tini is available, use it for proper PID 1 signal handling
+            // (especially OOM exit codes which return 137 instead of sigprocmask errors).
+            // Note: --fork should already be in the flags for proper namespace setup.
+            if let Some(tini_path) = crate::TINI_AVAILABLE.as_ref() {
+                cmd.arg("--");
+                cmd.arg(tini_path);
+                cmd.arg("-s");
+                cmd.arg("--");
+            } else {
+                // Without tini, just run the command directly (--fork is in flags)
+                cmd.arg("--");
+            }
+
+            cmd.arg(program);
+            cmd.args(args);
+            cmd
+        } else {
+            tracing::error!(
+                "unshare isolation is enabled but UNSHARE_PATH is not available. \
+                Running job without isolation. Check Instance Settings > Job Isolation."
+            );
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            cmd
+        }
+    } else {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        cmd
+    }
+}
+
+/// Under `NSJAIL_GVISOR_COMPAT`, rewrites the config of an nsjail `cmd` for gVisor. A spawn of
+/// nsjail that bypasses `start_child_process` must call this itself.
+pub fn apply_nsjail_gvisor_compat(cmd: &Command) -> Result<(), Error> {
+    if *crate::NSJAIL_GVISOR_COMPAT && cmd.as_std().get_program() == crate::NSJAIL_PATH.as_str() {
+        crate::nsjail_compat::apply(cmd.as_std()).map_err(|e| {
+            Error::ExecutionErr(format!(
+                "NSJAIL_GVISOR_COMPAT could not prepare nsjail: {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+pub async fn start_child_process(
+    cmd: Command,
+    executable: &str,
+    disable_process_group: bool,
+) -> Result<Box<dyn TokioChildWrapper>, Error> {
+    use process_wrap::tokio::*;
+    apply_nsjail_gvisor_compat(&cmd)?;
+    let mut cmd = TokioCommandWrap::from(cmd);
+
+    // On Windows, put the child in its own console process group so a CTRL_BREAK_EVENT
+    // sent to the worker's group (e.g. by Nomad on scale-in) is not delivered to it.
+    // Otherwise the whole child tree dies instantly with STATUS_CONTROL_C_EXIT
+    // (0xC000013A) before the worker can drain running jobs.
+    //
+    // This deliberately does NOT use process-wrap's JobObject wrap: its pre_spawn calls
+    // command.creation_flags(CREATE_SUSPENDED | get_wrap::<CreationFlags>()), but
+    // get_wrap returns None mid-spawn (process-wrap 8.2.1 takes the wrappers out of
+    // `self` before running pre_spawn), so it silently overwrites and drops
+    // CREATE_NEW_PROCESS_GROUP. Job-object grouping is done post-spawn below instead,
+    // which also matches the dotnet-safe assignment csharp already relies on.
+    #[cfg(windows)]
+    if !*DISABLE_PROCESS_GROUP {
+        use process_wrap::tokio::CreationFlags;
+        use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
+        // Also create the child suspended so it can be placed in its job object (below)
+        // before it runs any code; otherwise a child that forks a helper at startup could
+        // create it before the assignment and leave it outside the job. Resumed right
+        // after the job assignment.
+        cmd.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED));
+    }
+
+    if !*DISABLE_PROCESS_GROUP && !disable_process_group {
+        #[cfg(unix)]
+        {
+            use process_wrap::tokio::ProcessGroup;
+
+            cmd.wrap(ProcessGroup::leader());
+        }
+    }
+
+    let child: Box<dyn TokioChildWrapper> = cmd
+        .spawn()
+        .map_err(|err| tentatively_improve_error(err.into(), executable))?;
+
+    // On Windows, assign the child to a job object. KILL_ON_JOB_CLOSE makes the OS reap
+    // the whole child tree when the worker drops the handle or dies, so jobs aren't
+    // orphaned if the worker is force-killed (second CTRL_BREAK_EVENT, or Nomad exceeding
+    // kill_timeout) before they drain; it is gated on the DISABLE_PROCESS_GROUP escape
+    // hatch alongside CREATE_NEW_PROCESS_GROUP above. The LIMIT_WINDOWS_TO_1CU memory cap
+    // is independent of that hatch (it's its own opt-in), so it's applied whenever set.
+    // Assigning post-spawn does not touch the creation flags (so it composes with
+    // CREATE_NEW_PROCESS_GROUP) and is the dotnet-safe path csharp already uses.
+    #[cfg(windows)]
+    {
+        let kill_on_close = !*DISABLE_PROCESS_GROUP;
+        let memory_limit =
+            (*windmill_common::worker::LIMIT_WINDOWS_TO_1CU).then_some(MEMORY_LIMIT_1CU);
+        if kill_on_close || memory_limit.is_some() {
+            if let Some(pid) = child.inner().id() {
+                let assigned = assign_job_object(pid, memory_limit, kill_on_close);
+                // When kill_on_close, the child was created suspended (CREATE_SUSPENDED
+                // above) so it could be placed in the job before running. Resume it now —
+                // unconditionally of assign success, so a failed assign never leaves it hung.
+                if kill_on_close {
+                    if let Err(e) = resume_process(pid) {
+                        tracing::error!("Failed to resume child process {pid}: {e}");
+                    }
+                }
+                match assigned {
+                    Ok(job_handle) => {
+                        if memory_limit.is_some() {
+                            tracing::info!(
+                                "Applied 2GB memory limit (LIMIT_WINDOWS_TO_1CU) to child process {pid}"
+                            );
+                        }
+                        return Ok(Box::new(WindowsJobChild {
+                            inner: child,
+                            _job_handle: job_handle,
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to assign child process {pid} to job object: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(child)
+}
+
+/// Which limit a resolved job timeout comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutSource {
+    /// The timeout set on the script or the flow step.
+    Custom,
+    /// What is left of a wall clock that the phases of one job spend down together.
+    RemainingBudget,
+    /// The instance `job_default_timeout` setting.
+    InstanceDefault,
+    /// The instance ceiling (`TIMEOUT`), which no other timeout can exceed.
+    InstanceMax,
+}
+
+impl TimeoutSource {
+    /// How to name a limit of `secs` seconds in a message shown to the job's author.
+    pub fn describe(&self, secs: u64) -> String {
+        match self {
+            TimeoutSource::Custom => {
+                format!("the {secs}s custom timeout set on the script or flow step")
+            }
+            TimeoutSource::RemainingBudget => format!(
+                "the {secs}s left of the job's timeout, which its phases share"
+            ),
+            TimeoutSource::InstanceDefault => format!(
+                "the {secs}s instance default timeout (instance setting 'Default timeout'); set a longer custom timeout on the script or flow step to raise it"
+            ),
+            TimeoutSource::InstanceMax => format!(
+                "the {secs}s instance maximum job duration (TIMEOUT env variable of the worker), which no custom or default timeout can exceed"
+            ),
+        }
+    }
+}
+
+lazy_static! {
+    static ref RUNNING_JOB_CUSTOM_TIMEOUTS: std::sync::Mutex<HashMap<Uuid, Option<i32>>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+/// Makes a running job's custom timeout visible to the phases that are not handed it (dependency
+/// resolution, install, build), for as long as the guard lives.
+pub struct RunningJobCustomTimeout(Uuid);
+
+impl RunningJobCustomTimeout {
+    pub fn register(job_id: Uuid, custom_timeout_secs: Option<i32>) -> Self {
+        if let Ok(mut m) = RUNNING_JOB_CUSTOM_TIMEOUTS.lock() {
+            m.insert(
+                job_id,
+                windmill_common::runnable_settings::none_if_non_positive(custom_timeout_secs),
+            );
+        }
+        Self(job_id)
+    }
+}
+
+impl Drop for RunningJobCustomTimeout {
+    fn drop(&mut self) {
+        if let Ok(mut m) = RUNNING_JOB_CUSTOM_TIMEOUTS.lock() {
+            m.remove(&self.0);
+        }
+    }
+}
+
+/// `None` when the job is not registered, `Some(None)` when it runs without a custom timeout.
+fn registered_custom_timeout(job_id: Uuid) -> Option<Option<i32>> {
+    RUNNING_JOB_CUSTOM_TIMEOUTS
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&job_id).copied())
+}
+
+/// Resolves the time limit of one phase of a job and where that limit comes from.
+///
+/// A phase called without a custom timeout runs under the instance default. A job's custom
+/// timeout may only lengthen such a phase, never shorten it: a short run timeout must not kill
+/// a dependency install that the instance default allows.
+pub async fn resolve_job_timeout(
+    _conn: &Connection,
+    _w_id: &str,
+    job_id: Uuid,
+    custom_timeout_secs: Option<i32>,
+) -> (Duration, Option<String>, TimeoutSource) {
+    let mut warn_msg: Option<String> = None;
+    #[cfg(feature = "cloud")]
+    let cloud_premium_workspace =
+        *CLOUD_HOSTED
+        && windmill_common::workspaces::get_team_plan_status(
+            _conn.as_sql().expect("cloud cannot use http connection"),
+            _w_id,
+        )
+        .await
+        .inspect_err(|err| tracing::error!("Failed to get team plan status to resolve job timeout for workspace {_w_id}: {err:#}"))
+        .map(|s| s.premium)
+        .unwrap_or(true);
+    #[cfg(not(feature = "cloud"))]
+    let cloud_premium_workspace = false;
+
+    let global_max_timeout_duration =
+        Duration::from_secs(max_job_duration_secs(cloud_premium_workspace));
+    let max_secs = global_max_timeout_duration.as_secs();
+
+    // A `custom_timeout_secs <= 0` is not a 0-second limit but "unset": fall through to the
+    // default/global-max timeout instead of killing the job immediately.
+    match windmill_common::runnable_settings::none_if_non_positive(custom_timeout_secs) {
+        Some(timeout_secs)
+            if Duration::from_secs(timeout_secs as u64) < global_max_timeout_duration =>
+        {
+            // A phase handed anything but the job's own custom timeout was handed the rest of a
+            // shared wall clock, whatever limit that clock was started from.
+            let source =
+                if registered_custom_timeout(job_id).is_none_or(|t| t == Some(timeout_secs)) {
+                    TimeoutSource::Custom
+                } else {
+                    TimeoutSource::RemainingBudget
+                };
+            (Duration::from_secs(timeout_secs as u64), warn_msg, source)
+        }
+        Some(timeout_secs) => {
+            warn_msg = Some(format!("WARNING: Custom job timeout of {timeout_secs} seconds was greater than the instance maximum job duration of {max_secs} seconds (TIMEOUT env variable of the worker). It will be ignored and the max timeout will be used instead"));
+            tracing::warn!(warn_msg);
+            (
+                global_max_timeout_duration,
+                warn_msg,
+                TimeoutSource::InstanceMax,
+            )
+        }
+        None => {
+            // fallback to default timeout or max if not set
+            let (default_timeout, source) = match JOB_DEFAULT_TIMEOUT.read().await.clone() {
+                None => (global_max_timeout_duration, TimeoutSource::InstanceMax),
+                Some(default_timeout_secs)
+                    if Duration::from_secs(default_timeout_secs as u64)
+                        < global_max_timeout_duration =>
+                {
+                    (
+                        Duration::from_secs(default_timeout_secs as u64),
+                        TimeoutSource::InstanceDefault,
+                    )
+                }
+                Some(default_timeout_secs) => {
+                    warn_msg = Some(format!("WARNING: Default job timeout of {default_timeout_secs} seconds was greater than the instance maximum job duration of {max_secs} seconds (TIMEOUT env variable of the worker). It will be ignored and the max timeout will be used instead"));
+                    tracing::warn!(warn_msg);
+                    (global_max_timeout_duration, TimeoutSource::InstanceMax)
+                }
+            };
+            let job_custom_timeout = registered_custom_timeout(job_id)
+                .flatten()
+                .map(|secs| Duration::from_secs(secs as u64));
+            let (timeout, source) = lengthen_with_job_custom_timeout(
+                default_timeout,
+                source,
+                job_custom_timeout,
+                global_max_timeout_duration,
+            );
+            (timeout, warn_msg, source)
+        }
+    }
+}
+
+fn lengthen_with_job_custom_timeout(
+    phase_timeout: Duration,
+    phase_source: TimeoutSource,
+    job_custom_timeout: Option<Duration>,
+    max_timeout: Duration,
+) -> (Duration, TimeoutSource) {
+    match job_custom_timeout {
+        Some(custom) if custom > phase_timeout && custom < max_timeout => {
+            (custom, TimeoutSource::Custom)
+        }
+        Some(custom) if custom > phase_timeout => (max_timeout, TimeoutSource::InstanceMax),
+        _ => (phase_timeout, phase_source),
+    }
+}
+
+#[cfg(test)]
+mod job_timeout_tests {
+    use super::{lengthen_with_job_custom_timeout, TimeoutSource};
+    use std::time::Duration;
+
+    // A phase that is not handed the job's custom timeout (dependency install, build) runs under
+    // the instance default. The custom timeout may extend it up to the instance max, but a
+    // shorter one must leave it alone.
+    #[test]
+    fn job_custom_timeout_only_lengthens_a_setup_phase() {
+        let s = Duration::from_secs;
+        let default = (s(120), TimeoutSource::InstanceDefault);
+        let resolve = |custom: Option<u64>| {
+            lengthen_with_job_custom_timeout(default.0, default.1, custom.map(s), s(600))
+        };
+        assert_eq!(resolve(None), default);
+        assert_eq!(resolve(Some(240)), (s(240), TimeoutSource::Custom));
+        assert_eq!(resolve(Some(30)), default);
+        assert_eq!(resolve(Some(900)), (s(600), TimeoutSource::InstanceMax));
+    }
+}
+
+/// Compute the nsjail timeout (in seconds) with a 15s buffer so handle_child fires first.
+pub async fn resolve_nsjail_timeout(
+    conn: &Connection,
+    w_id: &str,
+    job_id: Uuid,
+    custom_timeout: Option<i32>,
+) -> String {
+    let (duration, _, _) = resolve_job_timeout(conn, w_id, job_id, custom_timeout).await;
+    (duration.as_secs() + 15).to_string()
+}
+
+/// Render the `rlimit_as` line for an nsjail run config, honoring a per-language
+/// env-var override.
+///
+/// nsjail caps a jailed job's virtual address space at `rlimit_as` MiB. JIT
+/// runtimes (Bun/JavaScriptCore, the JVM) reserve large virtual ranges up front,
+/// so a subprocess spawned from a jailed Python/Ansible job can crash against this
+/// cap even when its physical memory use is modest. Lifting it lets operators run
+/// such workloads on a dedicated worker pool (set the env var only there) without
+/// giving up the mount/PID/user-namespace isolation that provides the real
+/// security boundary. Only the address-space limit is affected; the other rlimits
+/// (cpu/fsize/nofile) in the proto are untouched.
+///
+/// `env_override` is the raw value of the language's `NSJAIL_*_RLIMIT_AS_MB` env var:
+/// - unset/empty -> historical default (`rlimit_as: {default_mb}`)
+/// - `unlimited`/`none`/`inf`/`0` -> `rlimit_as_type: INF` (address space uncapped)
+/// - a positive integer (MiB) -> `rlimit_as: {n}`
+pub fn render_nsjail_rlimit_as(env_override: Option<&str>, default_mb: u32) -> String {
+    match env_override.map(str::trim) {
+        None | Some("") => format!("rlimit_as: {default_mb}"),
+        Some(v)
+            if v.eq_ignore_ascii_case("unlimited")
+                || v.eq_ignore_ascii_case("none")
+                || v.eq_ignore_ascii_case("inf")
+                || v == "0" =>
+        {
+            "rlimit_as_type: INF".to_string()
+        }
+        Some(v) => match v.parse::<u32>() {
+            Ok(mb) => format!("rlimit_as: {mb}"),
+            Err(_) => {
+                tracing::warn!(
+                    "Invalid nsjail rlimit_as override {v:?}, using default {default_mb}MiB"
+                );
+                format!("rlimit_as: {default_mb}")
+            }
+        },
+    }
+}
+
+/// Quote a string as a protobuf-text-format string literal for safe inclusion in
+/// an nsjail config. Every byte is emitted as a printable ASCII char or a valid
+/// protobuf escape (`\"`, `\\`, `\n`/`\r`/`\t`, or 3-digit octal `\NNN` for
+/// control/non-ASCII bytes), so a hostile value can neither break the literal nor
+/// inject further directives.
+///
+/// `{` and `}` are escaped too: profiles are rendered by substituting `{PLACEHOLDER}`
+/// tokens one after another, so a value that still contained braces could smuggle in a
+/// later placeholder's expansion — and `{ENVARS}` expands to unquoted directives.
+pub(crate) fn proto_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for &b in s.as_bytes() {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'{' | b'}' => out.push_str(&format!("\\{b:03o}")),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\{b:03o}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Render env vars as nsjail `envar:` directives (one per line), the only way
+/// caller-controlled env may reach a jailed child. Set on the process that execs
+/// nsjail instead, `LD_PRELOAD`/`LD_LIBRARY_PATH`/`LD_AUDIT` would be honoured by
+/// the loader for nsjail itself, before any namespace or chroot exists.
+pub(crate) fn render_envars<'a>(env: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    env.into_iter()
+        .map(|(k, v)| format!("envar: {}", proto_str(&format!("{k}={v}"))))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The script's env vars as `envar:` directives for its nsjail run profile.
+///
+/// The profile sets `keep_env`, so the child also inherits the launcher's env, and
+/// an `envar:` overrides an inherited key. A key the launcher sets therefore keeps
+/// the launcher's value, as it did when both were set on the launcher with the
+/// script's env first, unless it is listed in `script_overrides` (see
+/// [`script_overrides`]).
+pub(crate) fn script_envars(
+    envs: &HashMap<String, String>,
+    launcher: &Command,
+    script_overrides: &[&str],
+) -> String {
+    let launcher_keys: HashSet<&std::ffi::OsStr> =
+        launcher.as_std().get_envs().map(|(k, _)| k).collect();
+    render_envars(
+        envs.iter()
+            .filter(|(k, _)| {
+                script_overrides.contains(&k.as_str())
+                    || !launcher_keys.contains(std::ffi::OsStr::new(k.as_str()))
+            })
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    )
+}
+
+/// The keys an executor sets on its nsjail launcher before the script's env, so the
+/// script's value wins, less those `reserved_variables` (applied after the script's env,
+/// and carrying worker-group env vars) sets again, so the worker's value wins.
+#[cfg(any(feature = "nu", feature = "java", feature = "ruby", feature = "rlang"))]
+pub(crate) fn script_overrides<'a>(
+    set_before: &[&'a str],
+    reserved_variables: &HashMap<String, String>,
+) -> Vec<&'a str> {
+    set_before
+        .iter()
+        .copied()
+        .filter(|k| !reserved_variables.contains_key(*k))
+        .collect()
+}
+
+/// Default size (in bytes) of the `/tmp` tmpfs mount inside nsjail sandboxes,
+/// used when the `nsjail_tmpfs_size_mb` instance setting is unset.
+pub const DEFAULT_NSJAIL_TMPFS_SIZE_BYTES: u64 = 800_000_000;
+
+/// Resolve the tmpfs `size=` value (in bytes, formatted for the nsjail proto)
+/// for the `/tmp` tmpfs mount. When the `nsjail_tmpfs_size_mb` instance setting
+/// is `None`, `Some(0)`, or negative, falls back to
+/// [`DEFAULT_NSJAIL_TMPFS_SIZE_BYTES`].
+pub async fn resolve_nsjail_tmpfs_size_bytes() -> String {
+    match *NSJAIL_TMPFS_SIZE_MB.read().await {
+        Some(mb) if mb > 0 => ((mb as u64).saturating_mul(1_000_000)).to_string(),
+        _ => DEFAULT_NSJAIL_TMPFS_SIZE_BYTES.to_string(),
+    }
+}
+
+/// Sub-directory inside each job dir used as the disk-backed `/tmp` when
+/// `nsjail_tmp_disk_backed` is enabled. Kept under `{JOB_DIR}` so existing
+/// job-dir cleanup removes it for free.
+const NSJAIL_TMP_BIND_SUBDIR: &str = "jail_tmp";
+
+fn tmpfs_mount_block(size_bytes: &str) -> String {
+    format!(
+        "mount {{\n    dst: \"/tmp\"\n    fstype: \"tmpfs\"\n    rw: true\n    options: \"size={size_bytes}\"\n}}"
+    )
+}
+
+fn bind_mount_block(jail_tmp: &str) -> String {
+    format!(
+        "mount {{\n    src: \"{jail_tmp}\"\n    dst: \"/tmp\"\n    is_bind: true\n    rw: true\n}}"
+    )
+}
+
+/// Build the nsjail `mount { ... }` block that backs `/tmp` inside the
+/// sandbox.
+///
+/// **Caller contract**: `job_dir` must be a trusted, worker-allocated job
+/// directory (typically `{worker_dir}/{job_id}`). In disk-backed mode this
+/// function creates `{job_dir}/jail_tmp` and bind-mounts it as `/tmp` with
+/// `rw: true`. Callers must not pass user-controlled paths.
+///
+/// Some executors (e.g. the bun codebase path) extract user-supplied archives
+/// into `job_dir` before this resolver runs, so the resolver actively refuses
+/// any pre-existing entry at `{job_dir}/jail_tmp` (including symlinks) to
+/// avoid bind-mounting an attacker-controlled host directory as `/tmp`.
+///
+/// When the `nsjail_tmp_backing` instance setting is `"disk"`, returns a
+/// disk-backed bind mount of `{job_dir}/jail_tmp` after creating the
+/// directory. If creation or the pre-existence check fails, logs an error and
+/// falls back to the historical tmpfs block so the job can still start. For
+/// any other value (including unset, `"tmpfs"`, or unrecognized), returns the
+/// historical RAM-backed tmpfs mount sized via `nsjail_tmpfs_size_mb`.
+pub(crate) async fn resolve_nsjail_tmp_mount_block(job_dir: &str) -> String {
+    let disk_backed = NSJAIL_TMP_BACKING
+        .read()
+        .await
+        .as_deref()
+        .map(|v| v.eq_ignore_ascii_case(NSJAIL_TMP_BACKING_DISK))
+        .unwrap_or(false);
+    let size_bytes = resolve_nsjail_tmpfs_size_bytes().await;
+    if !disk_backed {
+        return tmpfs_mount_block(&size_bytes);
+    }
+    let jail_tmp = format!("{job_dir}/{NSJAIL_TMP_BIND_SUBDIR}");
+
+    // SECURITY: never bind-mount a symlinked (or otherwise non-directory)
+    // entry at jail_tmp. `symlink_metadata` returns the link's own metadata
+    // without following it, so `is_dir()` is true only for a real directory.
+    // User-controlled archives extracted into job_dir could otherwise plant
+    // `jail_tmp` as a symlink to an arbitrary host directory, which nsjail
+    // would then expose as a writable /tmp.
+    //
+    // A pre-existing real directory at this path is legitimate: several
+    // executors (python_executor, ruby_executor, rust_executor) invoke nsjail
+    // more than once per job_dir (e.g. dep install, then run), and the first
+    // invocation will have created it via the `create_dir` below.
+    match tokio::fs::symlink_metadata(&jail_tmp).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(e) = tokio::fs::create_dir(&jail_tmp).await {
+                tracing::error!(
+                    "Failed to create nsjail disk-backed /tmp at {jail_tmp}: {e:?}; \
+                     falling back to tmpfs for this job."
+                );
+                return tmpfs_mount_block(&size_bytes);
+            }
+        }
+        Ok(meta) if meta.is_dir() => {
+            // Real directory left over from an earlier nsjail invocation in
+            // this same job_dir — safe to reuse.
+        }
+        Ok(_) => {
+            tracing::error!(
+                "Refusing to bind-mount nsjail disk-backed /tmp: {jail_tmp} \
+                 exists but is not a regular directory (possibly a symlink \
+                 planted by a user-controlled archive). Falling back to \
+                 RAM-backed tmpfs for this job."
+            );
+            return tmpfs_mount_block(&size_bytes);
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to stat nsjail disk-backed /tmp at {jail_tmp}: {e:?}; \
+                 falling back to tmpfs for this job."
+            );
+            return tmpfs_mount_block(&size_bytes);
+        }
+    }
+    bind_mount_block(&jail_tmp)
+}
+
+#[cfg(test)]
+mod nsjail_rlimit_as_tests {
+    use super::render_nsjail_rlimit_as;
+
+    #[test]
+    fn unset_uses_default() {
+        assert_eq!(render_nsjail_rlimit_as(None, 4096), "rlimit_as: 4096");
+        assert_eq!(render_nsjail_rlimit_as(Some("  "), 4096), "rlimit_as: 4096");
+    }
+
+    #[test]
+    fn numeric_override_is_used() {
+        assert_eq!(
+            render_nsjail_rlimit_as(Some("16384"), 4096),
+            "rlimit_as: 16384"
+        );
+        assert_eq!(
+            render_nsjail_rlimit_as(Some("  8192 "), 4096),
+            "rlimit_as: 8192"
+        );
+    }
+
+    #[test]
+    fn unlimited_keywords_emit_inf() {
+        for v in ["unlimited", "UNLIMITED", "none", "inf", "0"] {
+            assert_eq!(
+                render_nsjail_rlimit_as(Some(v), 4096),
+                "rlimit_as_type: INF",
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_falls_back_to_default() {
+        assert_eq!(
+            render_nsjail_rlimit_as(Some("abc"), 4096),
+            "rlimit_as: 4096"
+        );
+        assert_eq!(render_nsjail_rlimit_as(Some("-1"), 4096), "rlimit_as: 4096");
+    }
+}
+
+#[cfg(test)]
+mod nsjail_tmp_mount_tests {
+    use super::*;
+
+    #[test]
+    fn tmpfs_block_renders_size() {
+        let block = tmpfs_mount_block("800000000");
+        assert!(block.contains("dst: \"/tmp\""));
+        assert!(block.contains("fstype: \"tmpfs\""));
+        assert!(block.contains("options: \"size=800000000\""));
+        assert!(!block.contains("is_bind"));
+    }
+
+    #[test]
+    fn bind_block_renders_source_path() {
+        let block = bind_mount_block("/var/lib/windmill/jobs/abc/jail_tmp");
+        assert!(block.contains("src: \"/var/lib/windmill/jobs/abc/jail_tmp\""));
+        assert!(block.contains("dst: \"/tmp\""));
+        assert!(block.contains("is_bind: true"));
+        assert!(block.contains("rw: true"));
+        assert!(!block.contains("fstype"));
+    }
+
+    /// Serializes tests that mutate the process-global `NSJAIL_TMP_BACKING`
+    /// so they don't race when cargo runs them in parallel.
+    static SETTING_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn with_tmp_backing<F, Fut, T>(value: Option<String>, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _serial = SETTING_GUARD.lock().await;
+        let prev = NSJAIL_TMP_BACKING.read().await.clone();
+        *NSJAIL_TMP_BACKING.write().await = value;
+        let res = f().await;
+        *NSJAIL_TMP_BACKING.write().await = prev;
+        res
+    }
+
+    #[tokio::test]
+    async fn tmpfs_mode_returns_tmpfs_block_for_any_job_dir() {
+        let block = with_tmp_backing(Some("tmpfs".to_string()), || async {
+            resolve_nsjail_tmp_mount_block("/anything").await
+        })
+        .await;
+        assert!(block.contains("fstype: \"tmpfs\""));
+        assert!(block.contains("options: \"size="));
+        assert!(!block.contains("is_bind"));
+    }
+
+    #[tokio::test]
+    async fn unset_defaults_to_tmpfs() {
+        let block = with_tmp_backing(None, || async {
+            resolve_nsjail_tmp_mount_block("/anything").await
+        })
+        .await;
+        assert!(block.contains("fstype: \"tmpfs\""));
+        assert!(!block.contains("is_bind"));
+    }
+
+    /// Disk-backed branch: the resolver must create `{job_dir}/jail_tmp` and
+    /// emit a bind block pointing at it.
+    #[tokio::test]
+    async fn disk_backed_creates_jail_tmp_and_returns_bind_block() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let job_dir = tmp.path().to_str().expect("utf8 path").to_string();
+
+        let block = with_tmp_backing(Some("disk".to_string()), || async {
+            resolve_nsjail_tmp_mount_block(&job_dir).await
+        })
+        .await;
+
+        let expected_dir = format!("{job_dir}/{NSJAIL_TMP_BIND_SUBDIR}");
+        assert!(
+            std::path::Path::new(&expected_dir).is_dir(),
+            "jail_tmp dir should have been created at {expected_dir}"
+        );
+        assert!(block.contains("is_bind: true"));
+        assert!(block.contains(&format!("src: \"{expected_dir}\"")));
+    }
+
+    /// Disk-backed branch fallback: if `create_dir_all` fails, we must emit
+    /// the tmpfs block instead of returning an invalid bind config.
+    #[tokio::test]
+    async fn disk_backed_falls_back_to_tmpfs_on_mkdir_error() {
+        // /proc is a kernel filesystem that disallows directory creation,
+        // so create_dir_all on a subpath returns EPERM/EACCES.
+        let job_dir = "/proc/win1967_should_not_exist";
+
+        let block = with_tmp_backing(Some("disk".to_string()), || async {
+            resolve_nsjail_tmp_mount_block(job_dir).await
+        })
+        .await;
+
+        assert!(block.contains("fstype: \"tmpfs\""));
+        assert!(!block.contains("is_bind"));
+    }
+
+    /// Unknown values fall through to the tmpfs branch instead of crashing.
+    #[tokio::test]
+    async fn unknown_value_defaults_to_tmpfs() {
+        let block = with_tmp_backing(Some("bogus".to_string()), || async {
+            resolve_nsjail_tmp_mount_block("/anything").await
+        })
+        .await;
+        assert!(block.contains("fstype: \"tmpfs\""));
+        assert!(!block.contains("is_bind"));
+    }
+
+    /// Security regression: if a pre-existing symlink sits at the jail_tmp
+    /// path (e.g. planted by a user-controlled tarball extracted into
+    /// `job_dir` before the resolver runs), the resolver must refuse the
+    /// bind mount and fall back to tmpfs — never bind-mount the symlink
+    /// target into the sandbox as /tmp.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_backed_refuses_preexisting_symlink_at_jail_tmp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let job_dir = tmp.path().to_str().expect("utf8 path").to_string();
+
+        // Plant a symlink at {job_dir}/jail_tmp pointing at an arbitrary host
+        // path. Target doesn't have to exist — what matters is that the
+        // resolver doesn't follow it.
+        let jail_tmp_path = format!("{job_dir}/{NSJAIL_TMP_BIND_SUBDIR}");
+        std::os::unix::fs::symlink("/etc", &jail_tmp_path).expect("plant symlink");
+        assert!(std::path::Path::new(&jail_tmp_path).is_symlink());
+
+        let block = with_tmp_backing(Some("disk".to_string()), || async {
+            resolve_nsjail_tmp_mount_block(&job_dir).await
+        })
+        .await;
+
+        // Fell back to tmpfs — no bind-mount of the attacker-controlled path.
+        assert!(
+            block.contains("fstype: \"tmpfs\""),
+            "expected tmpfs fallback, got: {block}"
+        );
+        assert!(
+            !block.contains("is_bind"),
+            "must not emit bind block, got: {block}"
+        );
+        assert!(
+            !block.contains("/etc"),
+            "must not leak the symlink target into the proto, got: {block}"
+        );
+    }
+
+    /// Sequential resolver calls in the same `job_dir` (e.g. Python uv install
+    /// → Python run, Ruby install → run, Rust build → run) must keep using
+    /// the bind mount instead of silently falling back to tmpfs on the
+    /// second call. The first call creates `jail_tmp`; subsequent calls see
+    /// it as a pre-existing real directory and must accept it.
+    #[tokio::test]
+    async fn disk_backed_reuses_jail_tmp_across_sequential_calls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let job_dir = tmp.path().to_str().expect("utf8 path").to_string();
+        let expected_dir = format!("{job_dir}/{NSJAIL_TMP_BIND_SUBDIR}");
+
+        let (first, second) = with_tmp_backing(Some("disk".to_string()), || async {
+            let first = resolve_nsjail_tmp_mount_block(&job_dir).await;
+            // Simulate an executor that completes its first nsjail invocation
+            // (e.g. uv install) leaving jail_tmp on disk, then invokes nsjail
+            // again for the main run.
+            assert!(std::path::Path::new(&expected_dir).is_dir());
+            let second = resolve_nsjail_tmp_mount_block(&job_dir).await;
+            (first, second)
+        })
+        .await;
+
+        assert!(first.contains("is_bind: true"), "first call: {first}");
+        assert!(
+            second.contains("is_bind: true"),
+            "second call regressed to tmpfs: {second}"
+        );
+        assert!(second.contains(&format!("src: \"{expected_dir}\"")));
+    }
+}
+
+async fn hash_args(
+    #[allow(unused)] db: &DB,
+    #[allow(unused)] client: &AuthedClient,
+    #[allow(unused)] workspace_id: &str,
+    v: &Option<Json<HashMap<String, Box<RawValue>>>>,
+    hasher: &mut sha2::Sha256,
+    #[allow(unused)] job_id: &Uuid,
+    #[allow(unused)] ignore_s3_path: bool,
+) {
+    if let Some(Json(hm)) = v {
+        // Resolving an AWS OIDC storage mints a token for the job, so each storage is
+        // resolved once however many arguments point into it.
+        #[cfg(feature = "parquet")]
+        let mut storages: HashMap<Option<String>, Option<ObjectStoreResource>> = HashMap::new();
+        for k in hm.keys().sorted() {
+            hasher.update(k.as_bytes());
+            let arg_value = hm.get(k).unwrap();
+
+            #[cfg(feature = "parquet")]
+            let etag = match serde_json::from_str::<S3Object>(arg_value.get()).ok() {
+                Some(s3_object) => {
+                    if !storages.contains_key(&s3_object.storage) {
+                        let s3_resource = get_workspace_s3_resource_path(
+                            db,
+                            client,
+                            workspace_id,
+                            s3_object.storage.as_ref(),
+                            job_id,
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                        storages.insert(s3_object.storage.clone(), s3_resource);
+                    }
+                    match storages.get(&s3_object.storage).and_then(Option::as_ref) {
+                        Some(s3_resource) => get_etag_or_empty(s3_resource, s3_object).await,
+                        None => None,
+                    }
+                }
+                None => None,
+            };
+
+            #[cfg(feature = "parquet")]
+            if let Some(etag) = etag {
+                hasher.update(etag.as_bytes());
+                if ignore_s3_path {
+                    continue;
+                }
+            }
+            hasher.update(arg_value.get().as_bytes());
+        }
+    }
+}
+
+pub async fn cached_result_path(
+    db: &DB,
+    client: &AuthedClient,
+    job: &MiniPulledJob,
+    raw_data: Option<&RawData>,
+) -> windmill_common::error::Result<String> {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&[job.kind as u8]);
+    if let Some(ScriptHash(hash)) = job.runnable_id {
+        hasher.update(&hash.to_le_bytes())
+    } else {
+        job.runnable_path
+            .as_ref()
+            .inspect(|x| hasher.update(x.as_bytes()));
+        match raw_data {
+            Some(RawData::Flow(data)) => hasher.update(data.raw_flow.get()),
+            Some(RawData::Script(data)) => hasher.update(&data.code),
+            _ => {}
+        }
+    }
+    // A workflow-as-code task child runs its parent's code with the parent's
+    // arguments; the step it executes is what tells its result from the parent's
+    // and from its siblings'.
+    if let Some(step_key) = wac_executing_key(db, job).await? {
+        hasher.update(b"wac_step:");
+        hasher.update(step_key.as_bytes());
+    }
+    // What a run returns depends on whose roles its data table connections hold, its own
+    // identity's or its viewer's, and `WM_END_USER_EMAIL` names the viewer: a result cached for
+    // one of either, or in one of the two modes, is never served to another. The arguments follow
+    // undelimited, so every field here is fixed-width or length-prefixed and always present: an
+    // optional marker would read the same as an argument whose name starts with it.
+    hasher.update(b"permissioned_as:");
+    hasher.update((job.permissioned_as.len() as u64).to_le_bytes());
+    hasher.update(job.permissioned_as.as_bytes());
+    // Read from `job_perms`: a flow job re-fetched between steps does not carry them.
+    let perms: Option<(Option<String>, bool)> = sqlx::query_as(
+        "SELECT end_user_email, viewer_data_access FROM job_perms
+         WHERE job_id = $1 AND workspace_id = $2",
+    )
+    .bind(job.id)
+    .bind(&job.workspace_id)
+    .fetch_optional(db)
+    .await?;
+    let (end_user, as_viewer) = perms.unwrap_or_default();
+    hasher.update([as_viewer as u8, end_user.is_some() as u8]);
+    if let Some(end_user) = end_user {
+        hasher.update((end_user.len() as u64).to_le_bytes());
+        hasher.update(end_user.as_bytes());
+    }
+    hash_args(
+        db,
+        client,
+        &job.workspace_id,
+        &job.args,
+        &mut hasher,
+        &job.id,
+        job.cache_ignore_s3_path.unwrap_or(false),
+    )
+    .await;
+    Ok(format!("g/results/{:064x}", hasher.finalize()))
+}
+
+/// The checkpoint step key a workflow-as-code parent seeded for this child at push
+/// time; `None` for any job that is not such a child.
+async fn wac_executing_key(
+    db: &DB,
+    job: &MiniPulledJob,
+) -> windmill_common::error::Result<Option<String>> {
+    if job.parent_job.is_none() || job.flow_step_id.is_some() {
+        return Ok(None);
+    }
+    let key: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT workflow_as_code_status->'_checkpoint'->>'_executing_key' \
+         FROM v2_job_status WHERE id = $1",
+    )
+    .bind(job.id)
+    .fetch_optional(db)
+    .await?;
+    Ok(key.flatten())
+}
+
+#[cfg(feature = "parquet")]
+pub(crate) async fn get_workspace_s3_resource_path(
+    db: &DB,
+    client: &AuthedClient,
+    workspace_id: &str,
+    storage: Option<&String>,
+    job_id: &Uuid,
+) -> windmill_common::error::Result<Option<ObjectStoreResource>> {
+    use windmill_object_store::job_s3_helpers_oss::get_s3_resource_internal;
+    use windmill_types::s3::StorageResourceType;
+
+    // `_default_` names the primary storage, never a secondary one (see `DEFAULT_STORAGE`), so
+    // it resolves below rather than being looked up among storages that cannot carry the name.
+    let raw_lfs_opt = if let Some(storage) =
+        storage.filter(|s| s.as_str() != windmill_types::s3::DEFAULT_STORAGE)
+    {
+        sqlx::query_scalar!(
+            "SELECT large_file_storage->'secondary_storage'->$2 FROM workspace_settings WHERE workspace_id = $1",
+            workspace_id,
+            storage
+        )
+        .fetch_optional(db)
+        .await?
+        .flatten()
+    } else {
+        sqlx::query_scalar!(
+            "SELECT large_file_storage FROM workspace_settings WHERE workspace_id = $1",
+            workspace_id
+        )
+        .fetch_optional(db)
+        .await?
+        .flatten()
+    };
+    let raw_lfs_opt = raw_lfs_opt
+        .map(|val| serde_json::from_value::<LargeFileStorage>(val).ok())
+        .flatten();
+
+    let (rt, path) = match raw_lfs_opt {
+        Some(LargeFileStorage::S3Storage(s3_storage)) => {
+            let resource_path = s3_storage.s3_resource_path.trim_start_matches("$res:");
+            (StorageResourceType::S3, resource_path.to_string())
+        }
+        Some(LargeFileStorage::AzureBlobStorage(azure_blob_storage)) => {
+            let resource_path = azure_blob_storage
+                .azure_blob_resource_path
+                .trim_start_matches("$res:");
+            (StorageResourceType::AzureBlob, resource_path.to_string())
+        }
+        Some(LargeFileStorage::S3AwsOidc(s3_aws_oidc)) => {
+            let resource_path = s3_aws_oidc.s3_resource_path.trim_start_matches("$res:");
+            (StorageResourceType::S3AwsOidc, resource_path.to_string())
+        }
+        Some(LargeFileStorage::AzureWorkloadIdentity(azure)) => {
+            let resource_path = azure.azure_blob_resource_path.trim_start_matches("$res:");
+            (
+                StorageResourceType::AzureWorkloadIdentity,
+                resource_path.to_string(),
+            )
+        }
+        Some(LargeFileStorage::GoogleCloudStorage(gcs)) => {
+            let resource_path = gcs.gcs_resource_path.trim_start_matches("$res:");
+            (
+                StorageResourceType::GoogleCloudStorage,
+                resource_path.to_string(),
+            )
+        }
+        Some(LargeFileStorage::FilesystemStorage(fs)) => {
+            windmill_common::workspaces::ensure_filesystem_storage_allowed()?;
+            return Ok(Some(
+                windmill_object_store::ObjectStoreResource::Filesystem(
+                    windmill_object_store::FilesystemSettings { root_path: fs.root_path.clone() },
+                ),
+            ));
+        }
+        None => {
+            return Ok(None);
+        }
+    };
+
+    let s3_resource_value_raw = client
+        .get_resource_value_interpolated::<serde_json::Value>(
+            path.as_str(),
+            Some(job_id.to_string()),
+        )
+        .await?;
+    let object_store_resource = get_s3_resource_internal(
+        rt,
+        s3_resource_value_raw,
+        windmill_object_store::job_s3_helpers_oss::TokenGenerator::AsClient(client),
+        db,
+    )
+    .await?;
+
+    // Check bucket workspace restrictions
+    use windmill_object_store::ObjectStoreResource;
+    let bucket_name = match &object_store_resource {
+        ObjectStoreResource::S3(s3_resource) => Some(&s3_resource.bucket),
+        ObjectStoreResource::Azure(azure_resource) => Some(&azure_resource.container_name),
+        ObjectStoreResource::Gcs(gcs_resource) => Some(&gcs_resource.bucket),
+        ObjectStoreResource::Filesystem(_) => None,
+    };
+
+    if let Some(bucket) = bucket_name {
+        windmill_object_store::check_bucket_workspace_restriction(bucket, workspace_id)?;
+    }
+
+    // Check Azure account name workspace restrictions
+    if let ObjectStoreResource::Azure(azure_resource) = &object_store_resource {
+        windmill_object_store::check_az_account_name_workspace_restriction(
+            &azure_resource.account_name,
+            workspace_id,
+        )?;
+    }
+
+    Ok(Some(object_store_resource))
+}
+
+#[derive(Deserialize, Serialize)]
+struct CachedResource {
+    expire: i64,
+    value: Arc<Box<RawValue>>,
+}
+
+impl CachedResource {
+    fn expired(&self) -> bool {
+        self.expire <= chrono::Utc::now().timestamp()
+    }
+}
+
+lazy_static! {
+    /// In-memory cache for resources.
+    static ref CACHED_RESULTS: Cache<String, Arc<CachedResource>> = Cache::new(1000);
+}
+
+pub async fn get_cached_resource_value_if_valid(
+    _db: &DB,
+    client: &AuthedClient,
+    _workspace_id: &str,
+    cached_res_path: &str,
+) -> Option<Arc<Box<RawValue>>> {
+    let resource = match CACHED_RESULTS
+        .get_value_or_guard_async(cached_res_path)
+        .await
+    {
+        // check for cache expiration.
+        Ok(resource) if resource.expired() => {
+            let _ = CACHED_RESULTS.remove(cached_res_path);
+            return None;
+        }
+        // resource is in cache and not expired, return it.
+        Ok(resource) => resource,
+        // resource is not in cache, fetch it from the database.
+        Err(entry) => match client
+            .get_resource_value::<CachedResource>(cached_res_path)
+            .await
+            .ok()
+        {
+            None => return None,
+            // check for cache expiration.
+            Some(resource) if resource.expired() => return None,
+            Some(resource) => {
+                let resource = Arc::new(resource);
+                let _ = entry.insert(resource.clone());
+                resource
+            }
+        },
+    };
+
+    Some(resource.value.clone())
+}
+
+pub async fn save_in_cache(
+    db: &Pool<Postgres>,
+    _client: &AuthedClient,
+    job: &MiniCompletedJob,
+    cached_path: String,
+    r: Arc<Box<RawValue>>,
+) {
+    let expire = chrono::Utc::now().timestamp() + job.cache_ttl.unwrap() as i64;
+
+    let store_cache_resource = CachedResource { expire, value: r };
+    let raw_json = Json(&store_cache_resource);
+
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO resource
+        (workspace_id, path, value, resource_type, created_by, edited_at)
+        VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT (workspace_id, path)
+        DO UPDATE SET value = EXCLUDED.value, edited_at = now()",
+        job.workspace_id,
+        &cached_path,
+        raw_json as Json<&CachedResource>,
+        "cache",
+        job.created_by
+    )
+    .execute(db)
+    .await
+    {
+        tracing::error!("Error creating cache resource {e:#}")
+    }
+
+    // Cache result in-memory.
+    CACHED_RESULTS.insert(cached_path, Arc::new(store_cache_resource));
+}
+
+pub(crate) fn deno_not_installed_error() -> Error {
+    Error::ExecutionErr(format!(
+        "Deno is not installed on this worker (looked for it at {}). The standard Windmill images \
+         no longer ship Deno: official support for it on those images was discontinued after Deno \
+         announced the end of development of the Deno runtime (https://deno.com/blog/cloudflare). \
+         We recommend migrating this script to Bun. To keep running Deno scripts, use the \
+         windmill-full or windmill-ee-full image on every worker that accepts the deno tag, or \
+         install Deno on them and point DENO_PATH at it.",
+        crate::DENO_PATH.as_str()
+    ))
+}
+
+fn tentatively_improve_error(err: Error, executable: &str) -> Error {
+    #[cfg(unix)]
+    let err_msgs = vec!["os error 2", "os error 3", "No such file or directory"];
+
+    #[cfg(windows)]
+    let err_msgs = vec!["program not found", "os error 2", "os error 3"];
+
+    if err_msgs.iter().any(|msg| err.to_string().contains(msg)) {
+        // An absolute DENO_PATH is checked before spawning, where a missing job dir
+        // cannot be mistaken for a missing binary.
+        if executable == crate::DENO_PATH.as_str() && !Path::new(executable).is_absolute() {
+            return deno_not_installed_error();
+        }
+        return Error::internal_err(format!(
+            "Executable {executable} not found on worker. PATH: {}",
+            *PATH_ENV
+        ));
+    }
+    return Error::ExecutionErr(format!("Error executing {executable}: {err:#}"));
+}
+
+pub async fn clean_cache() -> error::Result<()> {
+    tracing::info!("Started cleaning cache");
+    tokio::fs::remove_dir_all(&*ROOT_CACHE_DIR).await?;
+    tracing::info!("Finished cleaning cache");
+    Ok(())
+}
+
+lazy_static::lazy_static! {
+    static ref RE_FLOW_ROOT: Regex = Regex::new(r"(?i)(.*?)(?:/branchone-\d+/|/branchall-\d+/|/loop-\d+|/forloop-\d+/)").unwrap();
+
+}
+
+pub fn use_flow_root_path(flow_path: &str) -> String {
+    if let Some(captures) = RE_FLOW_ROOT.captures(flow_path) {
+        return captures
+            .get(1)
+            .map(|m| format!("{}/flow", m.as_str()))
+            .unwrap_or_else(|| flow_path.to_string());
+    } else {
+        return flow_path.to_string();
+    }
+}
+
+/// Extract the flow root path by stripping /branchone-N/, /branchall-N/, /forloop-N/, /loop-N/
+/// and everything after. Returns None if no nesting segments are found.
+pub fn extract_flow_root(runnable_path: &str) -> Option<&str> {
+    RE_FLOW_ROOT
+        .captures(runnable_path)
+        .and_then(|c| c.get(1).map(|m| m.as_str()))
+}
+
+pub fn build_http_client(timeout_duration: std::time::Duration) -> error::Result<Client> {
+    configure_client(
+        reqwest::ClientBuilder::new()
+            .user_agent("windmill/beta")
+            .timeout(timeout_duration)
+            .connect_timeout(std::time::Duration::from_secs(10)),
+    )
+    .build()
+    .map_err(|e| Error::internal_err(format!("Error building http client: {e:#}")))
+}
+
+pub fn get_root_job_id(job: &MiniPulledJob) -> uuid::Uuid {
+    job.root_job
+        .or(job.flow_innermost_root_job)
+        .or(job.parent_job)
+        .unwrap_or(job.id)
+}
+
+#[derive(Clone)]
+pub struct StreamNotifier {
+    db: DB,
+    job_id: uuid::Uuid,
+    parent_job: uuid::Uuid,
+    root_job: uuid::Uuid,
+    flow_step_id: Option<String>,
+    flow_scope: Option<uuid::Uuid>,
+}
+
+// Helper struct to hold parent job information
+#[derive(Debug)]
+struct JobInfo {
+    flow_step_id: Option<String>,
+    flow_scope: Option<Uuid>,
+    step: Option<i32>,
+    len: Option<i32>,
+    is_branch_one: Option<bool>,
+    is_branch: Option<bool>,
+    next_parent: Option<Uuid>,
+}
+
+// Shared helper function to fetch parent job info with flow status
+async fn get_job_info(db: &DB, job_id: Uuid) -> error::Result<JobInfo> {
+    sqlx::query_as!(
+        JobInfo,
+        r#"SELECT
+            flow_step_id,
+            flow_innermost_root_job as flow_scope,
+            (flow_status->'step')::integer as step,
+            jsonb_array_length(flow_status->'modules') as len,
+            runnable_path ~ '/branchone-\d+$' as is_branch_one,
+            runnable_path ~ '/branch(one|all)-\d+$' as is_branch,
+            parent_job as next_parent
+        FROM v2_job
+            LEFT JOIN v2_job_status USING (id)
+        WHERE v2_job.id = $1"#,
+        job_id
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| Error::internal_err(format!("fetching parent job info: {e:#}")))
+}
+
+async fn check_if_last_step(
+    db: &DB,
+    mut next_parent: Option<Uuid>,
+    root_job: Uuid,
+) -> error::Result<bool> {
+    let mut visited = HashSet::new();
+    loop {
+        // Get parent of current job
+        let Some(parent_job) = next_parent else {
+            return Ok(false);
+        };
+
+        // Check for cycles
+        if !visited.insert(parent_job) {
+            return Ok(false);
+        }
+
+        let parent_info = get_job_info(db, parent_job).await?;
+
+        if let Some(step) = parent_info.step {
+            let step = Step::from_i32_and_len(step, parent_info.len.unwrap_or(0) as usize);
+            if step.is_last_step() {
+                if parent_job == root_job {
+                    return Ok(true);
+                } else if parent_info.is_branch_one.unwrap_or(false) {
+                    next_parent = parent_info.next_parent;
+                    continue;
+                }
+            }
+        }
+
+        return Ok(false);
+    }
+}
+
+// Iterative implementation to avoid stack overflow from async_recursion
+// True when the job is the early-return step, or the last step of branches to one that end in it.
+// Step ids are only unique within one flow, so an id match counts when the job's innermost root
+// is the root flow: a step of a subflow reusing the id has the subflow as its innermost root.
+async fn check_if_early_return_or_last_in_early_return_parent(
+    db: &DB,
+    mut next_parent: Option<Uuid>,
+    mut step_id: Option<String>,
+    mut flow_scope: Option<Uuid>,
+    early_return_id: &str,
+    root_job: Uuid,
+) -> error::Result<bool> {
+    let mut visited = HashSet::new();
+    loop {
+        let (Some(step), Some(parent_job)) = (step_id.as_deref(), next_parent) else {
+            return Ok(false);
+        };
+
+        // Check for cycles
+        if !visited.insert(parent_job) {
+            return Ok(false);
+        }
+
+        if step == early_return_id && flow_scope == Some(root_job) {
+            return only_branches_up_to_root(db, parent_job, root_job).await;
+        }
+        if parent_job == root_job {
+            return Ok(false);
+        }
+
+        let parent_info = get_job_info(db, parent_job).await?;
+        if let Some(parent_step) = parent_info.step {
+            let parent_step =
+                Step::from_i32_and_len(parent_step, parent_info.len.unwrap_or(0) as usize);
+            // we only continue if we are at the last step and the parent is a branch one
+            if parent_step.is_last_step() && parent_info.is_branch_one.unwrap_or(false) {
+                next_parent = parent_info.next_parent;
+                step_id = parent_info.flow_step_id;
+                flow_scope = parent_info.flow_scope;
+                continue;
+            }
+        }
+        return Ok(false);
+    }
+}
+
+// A step in a loop shares the root flow's scope but runs once per iteration, so no single run
+// holds the flow's early-return result: every container between it and the root must be a branch.
+async fn only_branches_up_to_root(db: &DB, mut job: Uuid, root_job: Uuid) -> error::Result<bool> {
+    let mut visited = HashSet::new();
+    while job != root_job {
+        if !visited.insert(job) {
+            return Ok(false);
+        }
+        let info = get_job_info(db, job).await?;
+        if !info.is_branch.unwrap_or(false) {
+            return Ok(false);
+        }
+        let Some(parent) = info.next_parent else {
+            return Ok(false);
+        };
+        job = parent;
+    }
+    Ok(true)
+}
+
+impl StreamNotifier {
+    pub fn new(conn: &Connection, job: &MiniPulledJob) -> Option<Self> {
+        let root_job = get_root_job_id(job);
+        if job.is_flow_step() && job.parent_job.is_some() {
+            match conn {
+                Connection::Sql(db) => Some(Self {
+                    db: db.clone(),
+                    parent_job: job.parent_job.unwrap(),
+                    job_id: job.id,
+                    root_job,
+                    flow_step_id: job.flow_step_id.clone(),
+                    flow_scope: job.flow_innermost_root_job,
+                }),
+                Connection::Http(_) => {
+                    tracing::warn!(
+                        "Flow job streaming is only supported for workers connected to a database"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    async fn update_flow_status_with_stream_job_inner(
+        db: DB,
+        parent_job: Uuid,
+        job_id: Uuid,
+        root_job: Uuid,
+        flow_step_id: Option<String>,
+        flow_scope: Option<Uuid>,
+    ) -> Result<(), Error> {
+        // Check if early_return is set at the flow level
+        let early_return_node_id = sqlx::query_scalar!(
+            r#"
+            SELECT fv.value->>'early_return' as "early_return"
+            FROM v2_job j
+            INNER JOIN flow_version fv ON fv.id = j.runnable_id
+            WHERE j.id = $1
+            "#,
+            root_job
+        )
+        .fetch_optional(&db)
+        .await?
+        .flatten();
+
+        let is_early_return = if let Some(ref early_return_id) = early_return_node_id {
+            check_if_early_return_or_last_in_early_return_parent(
+                &db,
+                Some(parent_job),
+                flow_step_id,
+                flow_scope,
+                early_return_id,
+                root_job,
+            )
+            .await?
+        } else {
+            false
+        };
+
+        // An early-return step inside a branch that is not taken never runs, so the flow's last
+        // step streams in its place. One that did run has a leaf job on the root, streamed or not,
+        // and the last step must not take the stream from it.
+        let unless_ran = early_return_node_id.filter(|_| !is_early_return);
+
+        if is_early_return || check_if_last_step(&db, Some(parent_job), root_job).await? {
+            sqlx::query!(r#"
+                    UPDATE v2_job_status
+                    SET flow_status = jsonb_set(flow_status, array['stream_job'], to_jsonb($1::UUID::TEXT))
+                    WHERE id = $2 AND NOT COALESCE(flow_leaf_jobs ? $3, false)"#,
+                    job_id,
+                    root_job,
+                    unless_ran
+                )
+                .execute(&db)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub fn update_flow_status_with_stream_job(&self) -> () {
+        let db = self.db.clone();
+        let parent_job = self.parent_job;
+        let job_id = self.job_id;
+        let root_job = self.root_job;
+        let flow_step_id = self.flow_step_id.clone();
+        let flow_scope = self.flow_scope;
+        tokio::spawn(async move {
+            if let Err(err) = Self::update_flow_status_with_stream_job_inner(
+                db,
+                parent_job,
+                job_id,
+                root_job,
+                flow_step_id,
+                flow_scope,
+            )
+            .await
+            {
+                tracing::error!("Could not notify about stream job {}: {err:#?}", parent_job);
+            }
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct S3ModeWorkerData {
+    pub client: AuthedClient,
+    pub object_key: String,
+    pub format: S3ModeFormat,
+    pub storage: Option<String>,
+    pub workspace_id: String,
+}
+
+impl S3ModeWorkerData {
+    pub async fn upload<S>(&self, stream: S) -> anyhow::Result<()>
+    where
+        S: futures::stream::TryStream + Send + 'static,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        bytes::Bytes: From<S::Ok>,
+    {
+        self.client
+            .upload_s3_file(
+                self.workspace_id.as_str(),
+                self.object_key.clone(),
+                self.storage.clone(),
+                stream,
+            )
+            .await
+    }
+
+    pub fn to_return_s3_obj(&self) -> windmill_types::s3::S3Object {
+        windmill_types::s3::S3Object {
+            s3: self.object_key.clone(),
+            storage: self.storage.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Stream rows to S3 (via `convert_json_line_stream` + `s3.upload`) while appending
+/// periodic progress, ingest-done, and upload-done logs to the job output.
+///
+/// `db_name` is a human-readable prefix for the log lines (e.g. "MSSQL", "PostgreSQL").
+pub async fn s3_stream_and_upload_with_logs<S, V, E>(
+    db_name: &str,
+    rows_stream: S,
+    s3: &S3ModeWorkerData,
+    job_id: Uuid,
+    workspace_id: &str,
+    conn: &Connection,
+) -> anyhow::Result<()>
+where
+    S: futures::TryStreamExt<Item = Result<V, E>> + Unpin,
+    V: serde::Serialize,
+    E: Into<anyhow::Error>,
+{
+    let s3_format = s3.format;
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<windmill_object_store::IngestStats>(8);
+    let progress_conn = conn.clone();
+    let progress_workspace = workspace_id.to_string();
+    let progress_db_name = db_name.to_string();
+    let progress_task = tokio::spawn(async move {
+        while let Some(stats) = progress_rx.recv().await {
+            let logs = format!(
+                "\n{} s3 stream progress: {} rows, {:.1} MB | elapsed {:.1}s (db-fetch {:.1}s, write {:.1}s)",
+                progress_db_name,
+                stats.rows,
+                stats.bytes as f64 / 1_048_576.0,
+                stats.elapsed.as_secs_f64(),
+                stats.fetch_wait.as_secs_f64(),
+                stats.write_time.as_secs_f64(),
+            );
+            windmill_queue::append_logs(&job_id, &progress_workspace, logs, &progress_conn).await;
+        }
+    });
+
+    let (stream, ingest_stats) =
+        windmill_object_store::convert_json_line_stream(rows_stream, s3_format, Some(progress_tx))
+            .await?;
+    let _ = progress_task.await;
+
+    let ingest_log = format!(
+        "\n{} s3 stream ingest done ({:?}): {} rows, {:.1} MB in {:.2}s (db-fetch {:.2}s, write {:.2}s, first row after {:.2}s)",
+        db_name,
+        s3_format,
+        ingest_stats.rows,
+        ingest_stats.bytes as f64 / 1_048_576.0,
+        ingest_stats.elapsed.as_secs_f64(),
+        ingest_stats.fetch_wait.as_secs_f64(),
+        ingest_stats.write_time.as_secs_f64(),
+        ingest_stats.first_row_latency.unwrap_or_default().as_secs_f64(),
+    );
+    windmill_queue::append_logs(&job_id, workspace_id, ingest_log, conn).await;
+
+    let upload_start = std::time::Instant::now();
+    s3.upload(stream).await?;
+    let upload_elapsed = upload_start.elapsed();
+
+    let final_log = format!(
+        "\n{} s3 stream upload+transcode done: {:.2}s | total {:.2}s",
+        db_name,
+        upload_elapsed.as_secs_f64(),
+        (ingest_stats.elapsed + upload_elapsed).as_secs_f64(),
+    );
+    windmill_queue::append_logs(&job_id, workspace_id, final_log, conn).await;
+
+    Ok(())
+}
+
+pub fn s3_mode_args_to_worker_data(
+    s3: S3ModeArgs,
+    client: AuthedClient,
+    job: &MiniPulledJob,
+) -> S3ModeWorkerData {
+    S3ModeWorkerData {
+        client,
+        storage: s3.storage,
+        format: s3.format,
+        object_key: format!(
+            "{}/{}.{}",
+            s3.prefix.unwrap_or_else(|| format!(
+                "wmill_datalake/{}",
+                job.runnable_path
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown_script")
+            )),
+            job.id,
+            s3_mode_extension(s3.format)
+        ),
+        workspace_id: job.workspace_id.clone(),
+    }
+}
+
+#[derive(Debug)]
+pub enum MaybeLock {
+    /// Deployed Scripts
+    Resolved { lock: String },
+    /// Previews
+    Unresolved { workspace_dependencies: WorkspaceDependenciesPrefetched },
+}
+
+impl MaybeLock {
+    pub fn map_unresolved<B, F>(&self, mut f: F) -> Option<B>
+    where
+        Self: Sized,
+        F: FnMut(&WorkspaceDependenciesPrefetched) -> B,
+    {
+        self.get_workspace_dependencies().map(|wd| f(wd))
+    }
+
+    pub fn get_workspace_dependencies(&self) -> Option<&WorkspaceDependenciesPrefetched> {
+        match self {
+            MaybeLock::Resolved { .. } => None,
+            MaybeLock::Unresolved { ref workspace_dependencies } => Some(workspace_dependencies),
+        }
+    }
+
+    pub fn get_lock(&self) -> Option<&String> {
+        match self {
+            MaybeLock::Resolved { ref lock } => Some(lock),
+            MaybeLock::Unresolved { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use windmill_common::client::AuthedClient;
+
+    fn test_client() -> AuthedClient {
+        AuthedClient::new(
+            "http://localhost:0".to_string(),
+            "test".to_string(),
+            "test-token".to_string(),
+            None,
+        )
+    }
+
+    fn test_job() -> MiniPulledJob {
+        MiniPulledJob {
+            workspace_id: "test".to_string(),
+            id: uuid::Uuid::nil(),
+            args: None,
+            parent_job: None,
+            created_by: "test".to_string(),
+            scheduled_for: chrono::Utc::now(),
+            started_at: None,
+            runnable_path: None,
+            kind: windmill_common::jobs::JobKind::Noop,
+            runnable_id: None,
+            canceled_reason: None,
+            canceled_by: None,
+            permissioned_as: "test".to_string(),
+            permissioned_as_email: "test@test.com".to_string(),
+            flow_status: None,
+            tag: "test".to_string(),
+            script_lang: None,
+            same_worker: false,
+            pre_run_error: None,
+            concurrent_limit: None,
+            concurrency_time_window_s: None,
+            flow_innermost_root_job: None,
+            root_job: None,
+            timeout: None,
+            flow_step_id: None,
+            cache_ttl: None,
+            cache_ignore_s3_path: None,
+            priority: None,
+            preprocessed: None,
+            script_entrypoint_override: None,
+            trigger: None,
+            trigger_kind: None,
+            visible_to_owner: false,
+            permissioned_as_end_user_email: None,
+            viewer_data_access: None,
+            runnable_settings_handle: None,
+            job_token_scopes: None,
+            mcp_client: None,
+        }
+    }
+
+    // A cache hit returns before the job runs, so the key is all that keeps a result computed
+    // for one identity or viewer (whose data table roles it read with, `WM_END_USER_EMAIL`)
+    // from another.
+    #[sqlx::test(migrations = "../migrations")]
+    async fn a_cached_result_is_keyed_by_the_identity_and_the_recorded_viewer(pool: sqlx::PgPool) {
+        let client = test_client();
+
+        // The last two differ only in where the viewer's address ends and the first argument
+        // name starts.
+        let mut paths = vec![];
+        for (owner, viewer, as_viewer, arg) in [
+            ("u/publisher", Some("a@windmill.dev"), false, "mode"),
+            ("u/publisher", Some("a@windmill.dev"), false, "mode"),
+            ("u/publisher", Some("b@windmill.dev"), false, "mode"),
+            ("u/publisher", None, false, "mode"),
+            ("u/publisher", Some("a@windmill.co"), false, "mode"),
+            ("u/publisher", Some("a@windmill.com"), false, "ode"),
+            ("u/other", None, false, "mode"),
+            ("u/publisher", Some("a@windmill.dev"), true, "mode"),
+            ("u/publisher", None, false, "viewer_data_access;mode"),
+            ("u/publisher", None, true, "mode"),
+        ] {
+            let args = HashMap::from([(arg.to_string(), to_raw_value(&"all"))]);
+            let job = MiniPulledJob {
+                id: uuid::Uuid::new_v4(),
+                args: Some(sqlx::types::Json(args)),
+                permissioned_as: owner.to_string(),
+                ..test_job()
+            };
+            sqlx::query(
+                "INSERT INTO job_perms (job_id, email, username, is_admin, is_operator,
+                     workspace_id, groups, folders, end_user_email, viewer_data_access)
+                 VALUES ($1, 'publisher@windmill.dev', 'publisher', false, false, 'test', '{}',
+                     '{}', $2, $3)",
+            )
+            .bind(job.id)
+            .bind(viewer)
+            .bind(as_viewer)
+            .execute(&pool)
+            .await
+            .unwrap();
+            paths.push(
+                cached_result_path(&pool, &client, &job, None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            paths[0], paths[1],
+            "one viewer shares their own cached result"
+        );
+        assert_ne!(paths[0], paths[2], "two viewers share a cached result");
+        assert_ne!(paths[0], paths[3]);
+        assert_ne!(paths[2], paths[3]);
+        assert_ne!(
+            paths[4], paths[5],
+            "an address runs into the argument names"
+        );
+        assert_ne!(paths[3], paths[6], "two owners share a cached result");
+        assert_ne!(
+            paths[0], paths[7],
+            "a result read with the app's roles is served once the runnable connects as its viewer"
+        );
+        assert_ne!(
+            paths[8], paths[9],
+            "an argument name reads as the mode of another run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transform_array_over_1000_passthrough() {
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or("postgres://postgres:changeme@localhost:5432/windmill".to_string());
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let conn = Connection::Sql(pool);
+        let client = test_client();
+        let job = test_job();
+
+        let arr: Vec<Value> = (0..1001).map(|i| json!(format!("$var:x/{i}"))).collect();
+        let input = Value::Array(arr.clone());
+
+        let result = transform_json_value("test", &client, "test", input, &job, &conn, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Value::Array(arr));
+    }
+
+    #[tokio::test]
+    async fn test_transform_array_non_matching_strings_passthrough() {
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or("postgres://postgres:changeme@localhost:5432/windmill".to_string());
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let conn = Connection::Sql(pool);
+        let client = test_client();
+        let job = test_job();
+
+        let input = json!(["hello", "world", 42, true, null, {"key": "val"}]);
+
+        let result = transform_json_value("test", &client, "test", input.clone(), &job, &conn, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(result, input);
+    }
+
+    #[tokio::test]
+    async fn test_transform_array_resolved_inside_object() {
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or("postgres://postgres:changeme@localhost:5432/windmill".to_string());
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let conn = Connection::Sql(pool);
+        let client = test_client();
+        let job = test_job();
+
+        let input = json!({"urls": ["$var:u/test/nonexistent", "plain"]});
+
+        let result = transform_json_value("test", &client, "test", input, &job, &conn, 0).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_transform_array_attempts_matching_items() {
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or("postgres://postgres:changeme@localhost:5432/windmill".to_string());
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let conn = Connection::Sql(pool);
+        let client = test_client();
+        let job = test_job();
+
+        let input = json!(["$var:u/test/nonexistent", "plain"]);
+
+        let result = transform_json_value("test", &client, "test", input, &job, &conn, 0).await;
+
+        assert!(result.is_err());
+    }
+
+    // A profile that loses `{ENVARS}` silently drops the script's env, since a
+    // `replace` on a missing token does nothing. It must also precede every fixed
+    // `envar:`, which overrides it the way it overrode the launcher's env.
+    #[test]
+    fn script_profiles_take_envars_before_their_fixed_ones() {
+        for (name, profile) in [
+            ("go", include_str!("../nsjail/run.go.config.proto")),
+            ("rust", include_str!("../nsjail/run.rust.config.proto")),
+            ("bun", include_str!("../nsjail/run.bun.config.proto")),
+            ("nu", include_str!("../nsjail/run.nu.config.proto")),
+            ("php", include_str!("../nsjail/run.php.config.proto")),
+            ("csharp", include_str!("../nsjail/run.csharp.config.proto")),
+            ("java", include_str!("../nsjail/run.java.config.proto")),
+            ("ruby", include_str!("../nsjail/run.ruby.config.proto")),
+            ("r", include_str!("../nsjail/run.r.config.proto")),
+            (
+                "gem install",
+                include_str!("../nsjail/download.ruby.config.proto"),
+            ),
+        ] {
+            // Line by line: a Windows checkout gives the profiles CRLF endings.
+            let lines = profile.lines().collect::<Vec<_>>();
+            let at = lines
+                .iter()
+                .position(|l| *l == "{ENVARS}")
+                .unwrap_or_else(|| panic!("{name}: no {{ENVARS}}"));
+            assert!(
+                !lines[..at].iter().any(|l| l.starts_with("envar:")),
+                "{name}: a fixed envar precedes {{ENVARS}}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_envars_reach_the_jail_not_the_launcher() {
+        let envs = HashMap::from([
+            ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
+            ("WM_TOKEN".to_string(), "forged".to_string()),
+            ("PATH".to_string(), "/custom/bin".to_string()),
+        ]);
+        let mut launcher = Command::new("nsjail");
+        launcher
+            .env_clear()
+            .env("PATH", "/usr/bin")
+            .env("WM_TOKEN", "real");
+
+        let out = script_envars(&envs, &launcher, &["PATH"]);
+        let mut lines = out.lines().collect::<Vec<_>>();
+        lines.sort();
+        // A launcher key keeps the launcher's value unless the executor lets the
+        // script override it.
+        assert_eq!(
+            lines,
+            vec![
+                "envar: \"LD_PRELOAD=/tmp/evil.so\"",
+                "envar: \"PATH=/custom/bin\"",
+            ]
+        );
+        assert!(launcher
+            .as_std()
+            .get_envs()
+            .all(|(k, _)| k != std::ffi::OsStr::new("LD_PRELOAD")));
+
+        let hostile = HashMap::from([(
+            "X".to_string(),
+            "v\"\nclone_newuser: false {JOB_DIR}".to_string(),
+        )]);
+        let line = script_envars(&hostile, &launcher, &[]);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            !line.contains('{') && !line.contains("\nclone_newuser"),
+            "{line}"
+        );
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref TEMPLATE_RE: regex::Regex =
+        regex::Regex::new(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}").unwrap();
+}
+
+/// Substitute `{{ arg_name }}` placeholders with values from `args`.
+/// Strings are used raw; numbers/bools are stringified. Other types are rejected.
+pub(crate) fn interpolate_template(
+    template: &str,
+    args: Option<&HashMap<String, Box<RawValue>>>,
+    field_name: &str,
+) -> error::Result<String> {
+    let mut last_err: Option<error::Error> = None;
+    let result = TEMPLATE_RE.replace_all(template, |caps: &regex::Captures| {
+        let name = &caps[1];
+        let raw = args.and_then(|a| a.get(name));
+        let Some(raw) = raw else {
+            last_err = Some(error::Error::BadRequest(format!(
+                "`{}` references `{{{{ {} }}}}` but no such argument was provided",
+                field_name, name
+            )));
+            return String::new();
+        };
+        let json: serde_json::Value = match serde_json::from_str(raw.get()) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(error::Error::BadRequest(format!(
+                    "`{}` could not parse argument `{}` as JSON: {e}",
+                    field_name, name
+                )));
+                return String::new();
+            }
+        };
+        match json {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Null => {
+                last_err = Some(error::Error::BadRequest(format!(
+                    "`{}` references `{{{{ {} }}}}` but the argument is null",
+                    field_name, name
+                )));
+                String::new()
+            }
+            _ => {
+                last_err = Some(error::Error::BadRequest(format!(
+                    "`{}` references `{{{{ {} }}}}` but the argument is not a primitive (string/number/bool)",
+                    field_name, name
+                )));
+                String::new()
+            }
+        }
+    });
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+    Ok(result.into_owned())
+}
+
+/// Reject absolute paths and `..` segments to prevent escaping the cloned repo directory.
+pub(crate) fn validate_relative_path(path: &str, field_name: &str) -> error::Result<()> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(error::Error::BadRequest(format!(
+            "`{}` resolved to an empty path",
+            field_name
+        )));
+    }
+    let p = std::path::Path::new(trimmed);
+    for component in p.components() {
+        match component {
+            // RootDir catches leading `/` or `\`; Prefix catches Windows drive
+            // letters and UNC paths. `Path::is_absolute()` alone misses
+            // RootDir-only paths on Windows (e.g. `/etc/passwd`).
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(error::Error::BadRequest(format!(
+                    "`{}` must be a relative path inside the cloned repo, got: {}",
+                    field_name, trimmed
+                )));
+            }
+            std::path::Component::ParentDir => {
+                return Err(error::Error::BadRequest(format!(
+                    "`{}` must not contain `..` segments, got: {}",
+                    field_name, trimmed
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}

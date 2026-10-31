@@ -1,0 +1,1324 @@
+use futures::Future;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nix::sys::signal::{self, Signal};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nix::unistd::Pid;
+use process_wrap::tokio::TokioChildWrapper;
+use windmill_common::agent_workers::PingJobStatusResponse;
+use windmill_common::jobs::LARGE_LOG_THRESHOLD_SIZE;
+use windmill_common::result_stream::extract_stream_from_logs;
+
+#[cfg(windows)]
+use std::process::Stdio;
+use tokio::fs::File;
+#[cfg(windows)]
+use tokio::process::Command;
+use windmill_common::error::to_anyhow;
+
+use windmill_common::error::{self, Error};
+
+use windmill_common::worker::{
+    get_windmill_memory_usage, get_worker_memory_usage, set_job_cancelled_query, Connection,
+    JobCancelled, CLOUD_HOSTED,
+};
+
+use windmill_queue::{append_logs, CanceledBy};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::process::ExitStatusExt;
+
+use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::{io, panic, time::Duration};
+
+use tracing::{trace_span, Instrument};
+use uuid::Uuid;
+
+use windmill_common::job_metrics;
+
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    sync::{broadcast, watch},
+    time::{interval_at, sleep, Instant, MissedTickBehavior},
+};
+
+use futures::{
+    future::{self, ready, FutureExt},
+    stream, StreamExt,
+};
+
+use crate::common::{resolve_job_timeout, OccupancyMetrics, StreamNotifier, TimeoutSource};
+use crate::job_logger::{append_job_logs, append_result_stream, append_with_limit, strip_nul};
+use crate::job_logger_oss::process_streaming_log_lines;
+use crate::worker_utils::{ping_job_status, update_worker_ping_from_job};
+use crate::{MAX_RESULT_SIZE, MAX_WAIT_FOR_SIGINT, MAX_WAIT_FOR_SIGTERM};
+
+use windmill_common::tracing_init::{OTEL_JOB_LOGS, OTEL_PREFIX, QUIET_MODE, VERBOSE_TARGET};
+
+lazy_static::lazy_static! {
+    pub static ref SLOW_LOGS: bool = std::env::var("SLOW_LOGS").ok().is_some_and(|x| x == "1" || x == "true");
+    // A job runs several children in turn (install, build, run): their CPU time adds up
+    // here until the job completes.
+    static ref JOB_CPU_TIME_MS: std::sync::Mutex<std::collections::HashMap<Uuid, i64>> = Default::default();
+}
+
+/// CPU time of the children run so far for the job, which stops being tracked.
+pub(crate) fn take_job_cpu_time_ms(job_id: &Uuid) -> Option<i64> {
+    JOB_CPU_TIME_MS.lock().unwrap().remove(job_id)
+}
+
+/// CPU time in ms from the content of `/proc/<pid>/stat`: the process's own user and
+/// system time plus that of the children it waited for, which is where the time of a
+/// job run under a wrapper (nsjail, unshare) ends up.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_stat_cpu_ms(stat: &str) -> Option<i64> {
+    // The values are in USER_HZ ticks, which Linux fixes at 100 per second.
+    const MS_PER_TICK: i64 = 10;
+    // `comm` is free text in parentheses: the numbered fields resume after its last `)`,
+    // with the state as field 3 and utime, stime, cutime, cstime as fields 14 to 17.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_ascii_whitespace().collect();
+    let ticks = fields
+        .get(11..15)?
+        .iter()
+        .map(|f| f.parse::<i64>().ok())
+        .sum::<Option<i64>>()?;
+    Some(ticks * MS_PER_TICK)
+}
+
+/// Resolves once the child has exited, to its CPU time. The child is left un-reaped:
+/// `/proc/<pid>/stat` is only readable until then, so the caller reaps afterwards.
+#[cfg(target_os = "linux")]
+async fn wait_for_exit_cpu_time_ms(pid: u32) -> Option<i64> {
+    use nix::sys::wait::{waitid, Id, WaitPidFlag};
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // A plain thread rather than `spawn_blocking`: the wait cannot be cancelled, and a
+    // blocking task still parked on a live child would hold up the runtime's shutdown.
+    std::thread::Builder::new()
+        .name("job-cpu-time".to_string())
+        .spawn(move || {
+            let cpu = waitid(
+                Id::Pid(Pid::from_raw(pid as i32)),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+            )
+            .ok()
+            .and_then(|_| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+            .and_then(|stat| parse_proc_stat_cpu_ms(&stat));
+            let _ = tx.send(cpu);
+        })
+        .ok()?;
+    rx.await.ok().flatten()
+}
+
+//  - kill windows process along with all child processes
+#[cfg(windows)]
+async fn kill_process_tree(pid: Option<u32>) -> Result<(), String> {
+    let pid = match pid {
+        Some(pid) => pid,
+        None => return Err("No PID provided to kill.".to_string()),
+    };
+
+    let output = Command::new("cmd")
+        .args(&["/C", "taskkill", "/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute taskkill: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to kill process tree. Error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+pub struct HandleChildResult {
+    pub result_stream: Option<String>,
+    /// Last non-empty line the child wrote to **stdout**, unmasked, for executors
+    /// whose result convention is "last line of stdout" and that have no wrapper
+    /// script to tee it to a file (sandboxed containers). stderr is excluded: the two
+    /// pipes are merged by a fair `select`, so their relative order is arbitrary — a
+    /// diagnostic on stderr must not be able to win over the real result.
+    pub last_line: Option<String>,
+}
+
+/// A line read from a child, tagged with the pipe it came from.
+struct OutputLine {
+    stderr: bool,
+    line: String,
+}
+
+/// - wait until child exits and return with exit status
+/// - read lines from stdout and stderr and append them to the "queue"."logs"
+///   quitting early if output exceedes MAX_LOG_SIZE characters (not bytes)
+/// - update the `last_line` and `logs` strings with the program output
+/// - update "queue"."last_ping" every five seconds
+/// - kill process if we exceed timeout or "queue"."canceled" is set
+#[tracing::instrument(name="run_subprocess", level = "info", skip_all, fields(otel.name = %child_name))]
+pub async fn handle_child(
+    job_id: &Uuid,
+    conn: &Connection,
+    mem_peak: &mut i32,
+    canceled_by_ref: &mut Option<CanceledBy>,
+    mut child: Box<dyn TokioChildWrapper>,
+    nsjail: bool,
+    worker: &str,
+    w_id: &str,
+    child_name: &str,
+    custom_timeout: Option<i32>,
+    sigterm: bool,
+    occupancy_metrics: &mut Option<&mut OccupancyMetrics>,
+    // Do not print logs to output, but instead save to string.
+    pipe_stdout: Option<&mut String>,
+    stream_notifier: Option<StreamNotifier>,
+) -> error::Result<HandleChildResult> {
+    let start = Instant::now();
+
+    let pid = child.id();
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = pid {
+        let oom_score_adj = *windmill_common::worker::JOB_OOM_SCORE_ADJ;
+        // procfs handles writes synchronously in-kernel; no fsync (it returns
+        // EINVAL on procfs files).
+        match std::fs::write(
+            format!("/proc/{pid}/oom_score_adj"),
+            oom_score_adj.to_string(),
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!(
+                    "Failed to set oom_score_adj={oom_score_adj} for pid {pid}: {e:#}. \
+                    OOM killer may target the worker instead of this job"
+                );
+            }
+        }
+    } else {
+        tracing::info!("could not get child pid");
+    }
+    let (mut set_too_many_logs, mut too_many_logs) = watch::channel::<bool>(false);
+    let (tx, rx) = broadcast::channel::<()>(3);
+    let mut rx2: broadcast::Receiver<()> = tx.subscribe();
+
+    let output = child_joined_output_stream(&mut child, job_id.clone(), w_id.to_string());
+
+    let job_id: Uuid = job_id.clone();
+
+    /* the cancellation future is polled on by `wait_on_child` while
+     * waiting for the child to exit normally */
+    let update_job = update_job_poller(
+        job_id,
+        conn,
+        mem_peak,
+        canceled_by_ref,
+        Box::pin(stream::unfold((), move |_| async move {
+            Some((get_mem_peak(pid, nsjail).await, ()))
+        })),
+        worker,
+        w_id,
+        rx,
+        occupancy_metrics,
+    );
+
+    enum KillReason {
+        TooManyLogs,
+        Timeout { phase: String, source: TimeoutSource, secs: u64 },
+        Cancelled(Option<CanceledBy>),
+        AlreadyCompleted,
+    }
+
+    impl std::fmt::Debug for KillReason {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            match self {
+                KillReason::TooManyLogs => f.write_str("too many logs (max size: 2MB)"),
+                KillReason::Timeout { phase, source, secs } => {
+                    write!(f, "timeout: `{phase}` exceeded {}", source.describe(*secs))
+                }
+                KillReason::Cancelled(canceled_by) => {
+                    let mut reason = "cancelled".to_string();
+                    if let Some(canceled_by) = canceled_by {
+                        if let Some(by) = canceled_by.username.as_ref() {
+                            reason.push_str(&format!(" by {}", by));
+                        }
+                        if let Some(rsn) = canceled_by.reason.as_ref() {
+                            reason.push_str(&format!(" (reason: {})", rsn));
+                        }
+                    }
+                    f.write_str(&reason)
+                }
+                KillReason::AlreadyCompleted => f.write_str("already completed"),
+            }
+        }
+    }
+
+    impl KillReason {
+        /// Reports a kill once the process is gone: a span event on the enclosing span and,
+        /// through the logs bridge, a log record carrying the job's log context.
+        fn emit_canceled_event(
+            &self,
+            job_id: &Uuid,
+            timeout_reason: &str,
+            signal: &'static str,
+            detected_at: chrono::DateTime<chrono::Utc>,
+        ) {
+            // `force` is only known for a soft cancel: a job completed under the worker
+            // may have been force canceled or completed by anything else server-side.
+            let (kill_reason, canceled_by, canceled_reason, force) = match self {
+                KillReason::TooManyLogs => return,
+                KillReason::Timeout { .. } => {
+                    ("timeout", Some("timeout"), Some(timeout_reason), None)
+                }
+                KillReason::Cancelled(by) => (
+                    "cancelled",
+                    by.as_ref().and_then(|x| x.username.as_deref()),
+                    by.as_ref().and_then(|x| x.reason.as_deref()),
+                    Some(false),
+                ),
+                KillReason::AlreadyCompleted => ("already_completed", None, None, None),
+            };
+            let exited_at = chrono::Utc::now();
+            let root_job = windmill_common::log_context::current_log_context()
+                .and_then(|c| c.root_job.clone());
+            let rfc3339 = |t: chrono::DateTime<chrono::Utc>| {
+                t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            };
+            tracing::info!(
+                job_id = %job_id,
+                root_job,
+                kill_reason,
+                canceled_by,
+                canceled_reason,
+                force,
+                kill_signal = signal,
+                cancel_detected_at = %rfc3339(detected_at),
+                process_exited_at = %rfc3339(exited_at),
+                kill_duration_ms = (exited_at - detected_at).num_milliseconds(),
+                "job.canceled"
+            );
+        }
+    }
+
+    let (timeout_duration, timeout_warn_msg, timeout_source) =
+        resolve_job_timeout(&conn, w_id, job_id, custom_timeout).await;
+    if let Some(msg) = timeout_warn_msg {
+        append_logs(&job_id, w_id, msg.as_str(), conn).await;
+    }
+
+    /* a future that completes when the child process exits */
+    let wait_on_child = async {
+        let kill_reason = tokio::select! {
+            biased;
+            result = async {
+                #[cfg(target_os = "linux")]
+                if let Some(pid) = pid.filter(|_| job_id != Uuid::nil()) {
+                    if let Some(cpu) = wait_for_exit_cpu_time_ms(pid).await {
+                        *JOB_CPU_TIME_MS.lock().unwrap().entry(job_id).or_insert(0) += cpu;
+                    }
+                }
+                Box::into_pin(child.wait()).await
+            } => return result.map(Ok),
+            Ok(()) = too_many_logs.changed() => KillReason::TooManyLogs,
+            _ = sleep(timeout_duration) => KillReason::Timeout {
+                phase: child_name.to_string(),
+                source: timeout_source,
+                secs: timeout_duration.as_secs(),
+            },
+            ex = update_job, if job_id != Uuid::nil() => match ex {
+                UpdateJobPollingExit::Done(canceled_by) => KillReason::Cancelled(canceled_by),
+                UpdateJobPollingExit::AlreadyCompleted => KillReason::AlreadyCompleted,
+            },
+        };
+        let detected_at = chrono::Utc::now();
+        tx.send(()).expect("rx should never be dropped");
+        drop(tx);
+
+        let timeout_reason = format!(
+            "`{child_name}` exceeded {}",
+            timeout_source.describe(timeout_duration.as_secs())
+        );
+        let set_reason = async {
+            if matches!(kill_reason, KillReason::Timeout { .. }) {
+                match conn {
+                    Connection::Sql(db) => {
+                        if let Err(err) =
+                            set_job_cancelled_query(job_id, db, "timeout", &timeout_reason).await
+                        {
+                            tracing::error!(%job_id, %err, "error setting cancelation reason for job {job_id}: {err}");
+                        }
+                    }
+                    Connection::Http(client) => {
+                        if let Err(err) = client
+                            .post::<_, ()>(
+                                &format!("/api/agent_workers/set_job_cancelled/{}", job_id),
+                                None,
+                                &JobCancelled {
+                                    canceled_by: "timeout".to_string(),
+                                    reason: timeout_reason.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            tracing::error!(%job_id, %err, "error setting cancelation reason for job using http {job_id}: {err}");
+                        }
+                    }
+                }
+            }
+        };
+
+        // Resolves once the process is reaped, to the last signal it was sent, or to `None`
+        // when the kill could not be confirmed. SIGINT and SIGTERM are only sent where the
+        // sends below are compiled in: elsewhere an exit during their wait is unsignaled.
+        let unix_signal = |s: &'static str| {
+            if cfg!(any(target_os = "linux", target_os = "macos")) { s } else { "none" }
+        };
+        let kill = async {
+            #[allow(unused_variables)]
+            if let Some(id) = child.id() {
+                if *MAX_WAIT_FOR_SIGINT > 0 {
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    signal::kill(Pid::from_raw(id as i32), Signal::SIGINT).unwrap();
+
+                    for _ in 0..*MAX_WAIT_FOR_SIGINT {
+                        if child.try_wait().is_ok_and(|x| x.is_some()) {
+                            break;
+                        }
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    if child.try_wait().is_ok_and(|x| x.is_some()) {
+                        set_reason.await;
+                        return Ok(Some(unix_signal("SIGINT")));
+                    }
+                }
+                if sigterm {
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    signal::kill(Pid::from_raw(id as i32), Signal::SIGTERM).unwrap();
+
+                    for _ in 0..*MAX_WAIT_FOR_SIGTERM {
+                        if child.try_wait().is_ok_and(|x| x.is_some()) {
+                            break;
+                        }
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    if child.try_wait().is_ok_and(|x| x.is_some()) {
+                        set_reason.await;
+                        return Ok(Some(unix_signal("SIGTERM")));
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                let pid_to_kill = child.id();
+                let killed = match kill_process_tree(pid_to_kill).await {
+                    Ok(_) => {
+                        tracing::debug!(
+                            "successfully killed process tree with PID: {:?}",
+                            pid_to_kill
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to kill process tree: {:?}", e);
+                        false
+                    }
+                };
+                set_reason.await;
+                return Ok(killed.then_some("taskkill"));
+            }
+
+            #[cfg(unix)]
+            {
+                /* send SIGKILL and reap child process */
+                let (_, kill) = future::join(set_reason, Box::into_pin(child.kill())).await;
+                kill.map(|()| Some("SIGKILL"))
+            }
+        };
+        let signal: io::Result<Option<&'static str>> = kill.await;
+        if let Some(signal) = signal? {
+            kill_reason.emit_canceled_event(&job_id, &timeout_reason, signal, detected_at);
+        }
+        Ok(Err(kill_reason))
+    };
+
+    let mut stream_result = Vec::new();
+    let mut last_line = String::new();
+    /* a future that reads output from the child and appends to the database */
+    let lines = write_lines(
+        output,
+        &job_id,
+        w_id,
+        worker,
+        conn,
+        &mut set_too_many_logs,
+        start,
+        pipe_stdout,
+        &mut rx2,
+        child_name,
+        &mut stream_result,
+        stream_notifier,
+        Some(&mut last_line),
+    )
+    .instrument(trace_span!("child_lines"));
+
+    let (wait_result, _) = tokio::join!(wait_on_child, lines);
+
+    let success = wait_result.is_ok()
+        && wait_result.as_ref().unwrap().is_ok()
+        && wait_result.as_ref().unwrap().as_ref().unwrap().success();
+    tracing::info!(%job_id, %success, %mem_peak, %worker, "child process '{child_name}' took {}ms", start.elapsed().as_millis());
+
+    match wait_result {
+        _ if *too_many_logs.borrow() => Err(Error::ExecutionErr(format!(
+            "logs or result reached limit. (current max size: {MAX_RESULT_SIZE} characters)"
+        ))),
+        Ok(Ok(status)) => process_status(&child_name, status, stream_result).map(|mut r| {
+            r.last_line = (!last_line.is_empty()).then_some(last_line);
+            r
+        }),
+        Ok(Err(kill_reason)) => match kill_reason {
+            KillReason::AlreadyCompleted => {
+                Err(Error::AlreadyCompleted("Job already completed".to_string()))
+            }
+            _ => Err(Error::ExecutionErr(format!(
+                "job process terminated due to {kill_reason:#?}"
+            ))),
+        },
+        Err(err) => Err(Error::ExecutionErr(format!("job process io error: {err}"))),
+    }
+}
+
+pub const WAC_STEP_PREFIX: &str = "WM_WAC_STEP: ";
+
+async fn write_lines(
+    output: impl stream::Stream<Item = io::Result<OutputLine>> + Send,
+    job_id: &Uuid,
+    w_id: &str,
+    worker: &str,
+    conn: &Connection,
+    set_too_many_logs: &mut watch::Sender<bool>,
+    start: Instant,
+    pipe_stdout: Option<&mut String>,
+    rx2: &mut broadcast::Receiver<()>,
+    child_name: &str,
+    stream_result: &mut Vec<String>,
+    stream_notifier: Option<StreamNotifier>,
+    mut last_line: Option<&mut String>,
+) {
+    let max_log_size = if *CLOUD_HOSTED {
+        MAX_RESULT_SIZE
+    } else {
+        usize::MAX
+    };
+
+    /* log_remaining is zero when output limit was reached */
+    let mut log_remaining = if *CLOUD_HOSTED {
+        max_log_size
+    } else {
+        usize::MAX
+    };
+    let mut result = io::Result::Ok(());
+    let mut output = output
+        .take_until(async {
+            let _ = rx2.recv().await;
+            //wait at most 50ms after end of a script for output stream to end
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .boxed();
+    /* `do_write` resolves the task, but does not contain the Result.
+     * It's useful to know if the task completed. */
+    let (mut do_write, mut write_result) = tokio::spawn(ready(())).remote_handle();
+
+    let mut log_total_size: u64 = 0;
+    let pg_log_total_size = Arc::new(AtomicU32::new(0));
+
+    let mut pipe_stdout = pipe_stdout;
+
+    let is_stream = Arc::new(AtomicBool::new(false));
+    let offset = Arc::new(AtomicI32::new(0));
+    while let Some(line) = output.by_ref().next().await {
+        let do_write_ = do_write.shared();
+
+        let delay = if start.elapsed() < Duration::from_secs(10) {
+            Duration::from_millis(500)
+        } else if start.elapsed() < Duration::from_secs(60) {
+            Duration::from_millis(2500)
+        } else {
+            Duration::from_millis(5000)
+        };
+
+        let delay = if *SLOW_LOGS { delay * 10 } else { delay };
+
+        let mut read_lines = stream::once(async { line })
+            .chain(output.by_ref())
+            /* after receiving a line, continue until some delay has passed
+             * _and_ the previous database write is complete */
+            .take_until(future::join(sleep(delay), do_write_.clone()))
+            .boxed();
+
+        /* Read up until an error is encountered,
+         * handle log lines first and then the error... */
+        let mut joined = String::new();
+
+        let job_id = job_id.clone();
+        let mut nstream = String::new();
+
+        // Snapshot secrets once per batch — no lock needed per line.
+        // Trade-off: secrets registered mid-batch (between snapshot and log line)
+        // won't be masked until the next batch. In practice the async HTTP round-trip
+        // to fetch a secret completes before the script's log line arrives.
+        let mask_snapshot = windmill_common::sensitive_log_masks::snapshot(&job_id);
+
+        while let Some(line) = read_lines.next().await {
+            match line {
+                Ok(OutputLine { stderr, line }) => {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    // Masking is a log concern only: `mask` also appends a multi-line
+                    // notice, which would end up inside a captured result. Keep `line`
+                    // raw and log `logged`.
+                    let masked = mask_snapshot
+                        .as_ref()
+                        .and_then(|snap| match snap.mask(&line) {
+                            std::borrow::Cow::Owned(masked) => Some(masked),
+                            std::borrow::Cow::Borrowed(_) => None,
+                        });
+                    let logged = masked.as_deref().unwrap_or(line.as_str());
+                    if *OTEL_JOB_LOGS {
+                        if let Some(otel_suffix) = logged.strip_prefix(OTEL_PREFIX) {
+                            tracing::event!(tracing::Level::INFO, otel_suffix);
+                        }
+                    }
+                    if let Some(step_json) = logged.strip_prefix(WAC_STEP_PREFIX) {
+                        // Real-time WAC step start marker — fire-and-forget DB write
+                        let conn = conn.clone();
+                        let job_id = job_id.clone();
+                        let step_json = step_json.to_string();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_wac_step_marker(&conn, &job_id, &step_json).await
+                            {
+                                tracing::warn!(%job_id, "Failed to write WAC step marker: {e}");
+                            }
+                        });
+                        continue;
+                    }
+                    if let Some(stream) = extract_stream_from_logs(logged) {
+                        let len = stream.len();
+                        if log_remaining >= len {
+                            log_remaining -= len;
+                            nstream.push_str(&stream);
+                            stream_result.push(stream);
+                        } else {
+                            log_remaining = 0;
+                        }
+                    } else {
+                        if let Some(buf) = last_line.as_mut() {
+                            if !stderr && !line.trim().is_empty() {
+                                buf.clear();
+                                // Same NUL scrub the log path applies: Postgres rejects
+                                // a NUL in the resulting jsonb too.
+                                buf.push_str(&strip_nul(&line));
+                            }
+                        }
+                        append_with_limit(&mut joined, logged, &mut log_remaining);
+                    }
+                    if log_remaining == 0 {
+                        tracing::info!(%job_id, "Too many logs lines for job {job_id}");
+                        let _ = set_too_many_logs.send(true);
+                        joined.push_str(&format!(
+                                "Job logs or result reached character limit of {MAX_RESULT_SIZE}; killing job."
+                            ));
+                        /* stop reading and drop our streams fairly quickly */
+                        break;
+                    }
+                }
+                Err(err) => {
+                    result = Err(err);
+                    break;
+                }
+            }
+        }
+
+        /* Ensure the last flush completed before starting a new one.
+         *
+         * This shouldn't pause since `take_until()` reads lines until `do_write`
+         * resolves. We only stop reading lines before `take_until()` resolves if we reach
+         * EOF or a read error.  In those cases, waiting on a database query to complete is
+         * fine because we're done. */
+
+        if let Some(Ok(p)) = do_write_
+            .then(|()| write_result)
+            .await
+            .err()
+            .map(|err| err.try_into_panic())
+        {
+            panic::resume_unwind(p);
+        }
+
+        let joined_len = joined.len() as u64;
+        log_total_size += joined_len;
+        let compact_logs = log_total_size > LARGE_LOG_THRESHOLD_SIZE as u64;
+        if compact_logs {
+            log_total_size = 0;
+        }
+
+        let worker_name = worker.to_string();
+
+        if let Some(buf) = &mut pipe_stdout {
+            buf.push_str(&joined);
+            (do_write, write_result) = tokio::spawn(async {}).remote_handle();
+        } else {
+            let conn = conn.clone();
+            let worker_name = worker_name.to_string();
+            let w_id = w_id.to_string();
+            let job_id = job_id.clone();
+            let pg_log_total_size = pg_log_total_size.clone();
+            let stream_notifier = stream_notifier.clone();
+            let is_stream = is_stream.clone();
+            let offset = offset.clone();
+            (do_write, write_result) = tokio::spawn(async move {
+                if !nstream.is_empty() {
+                    if let Some(stream_notifier) = stream_notifier {
+                        if !is_stream.load(Ordering::SeqCst) {
+                            is_stream.store(true, Ordering::SeqCst);
+                            stream_notifier.update_flow_status_with_stream_job();
+                        }
+                    };
+
+                    if let Err(err) = append_result_stream(
+                        &conn,
+                        &w_id,
+                        &job_id,
+                        &nstream,
+                        offset.fetch_add(1, Ordering::SeqCst),
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "Unable to send result stream for job {job_id}. Error was: {:?}",
+                            err
+                        );
+                    }
+                }
+                append_job_logs(
+                    &job_id,
+                    &w_id,
+                    &joined,
+                    &conn,
+                    compact_logs,
+                    pg_log_total_size,
+                    &worker_name,
+                )
+                .await;
+            })
+            .remote_handle();
+        }
+
+        if let Err(err) = result {
+            tracing::error!(%job_id, %err, "error reading output for job {job_id} '{child_name}': {err}");
+            break;
+        }
+
+        if *set_too_many_logs.borrow() {
+            break;
+        }
+    }
+
+    /* drop our end of the pipe */
+    drop(output);
+
+    if let Some(Ok(p)) = do_write
+        .then(|()| write_result)
+        .await
+        .err()
+        .map(|err| err.try_into_panic())
+    {
+        panic::resume_unwind(p);
+    }
+}
+
+/// Handle a real-time WAC step start marker emitted via stdout.
+/// Writes a timeline entry (with started_at but no duration_ms) to workflow_as_code_status
+/// so the frontend can show the step immediately while it's still running.
+async fn handle_wac_step_marker(
+    conn: &Connection,
+    job_id: &Uuid,
+    json_str: &str,
+) -> error::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct StepMarker {
+        key: String,
+        started_at: String,
+    }
+    let marker: StepMarker = serde_json::from_str(json_str).map_err(|e| {
+        error::Error::internal_err(format!("Failed to parse WM_WAC_STEP marker: {e}"))
+    })?;
+
+    let step_timeline_key = format!("_step/{}", marker.key);
+    let timeline_val = serde_json::json!({
+        "scheduled_for": marker.started_at,
+        "started_at": marker.started_at,
+        "name": marker.key,
+    });
+
+    match conn {
+        Connection::Sql(db) => {
+            sqlx::query(
+                "INSERT INTO v2_job_status (id, workflow_as_code_status)
+                 VALUES ($1, jsonb_build_object($2, $3::jsonb))
+                 ON CONFLICT (id) DO UPDATE SET
+                 workflow_as_code_status = jsonb_set(
+                     COALESCE(v2_job_status.workflow_as_code_status, '{}'::jsonb),
+                     ARRAY[$2],
+                     $3::jsonb
+                 )",
+            )
+            .bind(job_id)
+            .bind(&step_timeline_key)
+            .bind(&timeline_val)
+            .execute(db)
+            .await
+            .map_err(|e| {
+                error::Error::internal_err(format!("DB error writing WAC step marker: {e}"))
+            })?;
+        }
+        Connection::Http(_) => {
+            // Agent workers don't support WAC v2 yet
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn get_mem_peak(pid: Option<u32>, nsjail: bool) -> i32 {
+    if pid.is_none() {
+        return -1;
+    }
+    let pid = if nsjail {
+        // Read /proc/<nsjail_pid>/task/<nsjail_pid>/children and extract pid
+        let nsjail_pid = pid.unwrap();
+        let children_path = format!("/proc/{}/task/{}/children", nsjail_pid, nsjail_pid);
+        if let Ok(mut file) = File::open(children_path).await {
+            let mut contents = String::new();
+            if tokio::io::AsyncReadExt::read_to_string(&mut file, &mut contents)
+                .await
+                .is_ok()
+            {
+                if let Some(child_pid) = contents.split_whitespace().next() {
+                    if let Ok(child_pid) = child_pid.parse::<u32>() {
+                        child_pid
+                    } else {
+                        return -1;
+                    }
+                } else {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    } else {
+        pid.unwrap()
+    };
+
+    if let Ok(file) = File::open(format!("/proc/{}/status", pid)).await {
+        let mut lines = BufReader::new(file).lines();
+        while let Some(line) = lines.next_line().await.unwrap_or(None) {
+            if line.starts_with("VmHWM:") {
+                return line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(-1);
+            };
+        }
+        -2
+    } else {
+        // rand::random::<i32>() % 100 // to remove - used to fake memory data on MacOS
+        -3
+    }
+}
+
+/// The job state a command run outside the main script needs to stay
+/// cancellable. `dbt deps` can hang on an unreachable package endpoint and
+/// `dbt parse`/`ls` on a warehouse handshake, so running them detached would
+/// hold a worker slot past a cancel or a timeout.
+pub struct JobCtx<'a> {
+    pub mem_peak: &'a mut i32,
+    pub canceled_by: &'a mut Option<CanceledBy>,
+    pub occupancy_metrics: &'a mut OccupancyMetrics,
+    pub worker_name: &'a str,
+    pub deadline: JobDeadline,
+}
+
+impl JobCtx<'_> {
+    /// What is left of the job's wall clock, for the phase about to start.
+    pub fn timeout(&self) -> Option<i32> {
+        self.deadline.remaining_secs()
+    }
+}
+
+/// One wall clock for a job that runs several subprocesses in sequence.
+///
+/// Both `handle_child` and `run_future_with_polling_update_job_poller` resolve
+/// the timeout they are handed into a fresh duration, so handing each phase the
+/// job's full timeout lets a job with N phases run for N times it. Resolved
+/// once at the start, then spent down.
+#[derive(Clone, Copy)]
+pub struct JobDeadline(Option<Instant>);
+
+impl JobDeadline {
+    pub async fn start(
+        conn: &Connection,
+        w_id: &str,
+        job_id: Uuid,
+        custom_timeout: Option<i32>,
+    ) -> Self {
+        let (d, _, _) = resolve_job_timeout(conn, w_id, job_id, custom_timeout).await;
+        Self(Some(Instant::now() + d))
+    }
+
+    /// Whether the job's wall clock is already spent.
+    ///
+    /// Distinct from `remaining_secs`, which deliberately never reports zero:
+    /// an expired budget still has to hand the next phase a positive timeout so
+    /// the poller fires. A caller deciding whether to START more work needs the
+    /// honest answer.
+    pub fn is_expired(&self) -> bool {
+        self.0.is_some_and(|d| d <= Instant::now())
+    }
+
+    pub fn remaining_secs(&self) -> Option<i32> {
+        let deadline = self.0?;
+        // A non-positive timeout reads as "unset" downstream, so an expired
+        // budget must still ask for a positive one and let the poller fire.
+        Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .clamp(1, i32::MAX as u64) as i32,
+        )
+    }
+}
+
+pub async fn run_future_with_polling_update_job_poller<Fut, T, S>(
+    job_id: Uuid,
+    timeout: Option<i32>,
+    conn: &Connection,
+    mem_peak: &mut i32,
+    canceled_by_ref: &mut Option<CanceledBy>,
+    result_f: Fut,
+    worker_name: &str,
+    w_id: &str,
+    occupancy_metrics: &mut Option<&mut OccupancyMetrics>,
+    get_mem: S,
+) -> error::Result<T>
+where
+    Fut: Future<Output = windmill_common::error::Result<T>>,
+    S: stream::Stream<Item = i32> + Unpin,
+{
+    let (tx, rx) = broadcast::channel::<()>(3);
+
+    let update_job = update_job_poller(
+        job_id,
+        conn,
+        mem_peak,
+        canceled_by_ref,
+        get_mem,
+        worker_name,
+        w_id,
+        rx,
+        occupancy_metrics,
+    );
+
+    let timeout_ms = u64::try_from(
+        resolve_job_timeout(&conn, &w_id, job_id, timeout)
+            .await
+            .0
+            .as_millis(),
+    )
+    .unwrap_or(200000);
+
+    let rows = tokio::select! {
+        biased;
+        result = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), result_f) => result
+        .map_err(|e| {
+            tracing::error!("Query timeout: {}", e);
+            Error::ExecutionErr(format!("Query timeout after (>{}s)", timeout_ms/1000))
+        })?,
+        ex = update_job, if job_id != Uuid::nil() => {
+            match ex {
+                UpdateJobPollingExit::Done(canceled_by) => {
+                    let (by, reason) = canceled_by.as_ref().map_or(("unknown".to_string(), "unknown".to_string()), |x| (x.username.clone().unwrap_or("".to_string()), x.reason.clone().unwrap_or("".to_string())));
+                    Err(Error::ExecutionErr(format!("Job cancelled by {by} (reason: {reason})",))).map_err(to_anyhow)?
+                },
+                UpdateJobPollingExit::AlreadyCompleted => Err(Error::AlreadyCompleted("Job already completed".to_string())).map_err(to_anyhow)?,
+            }
+        }
+    }?;
+    drop(tx);
+    Ok(rows)
+}
+
+/// Outcome of [`run_future_with_polling_update_job_poller_graceful`].
+pub enum GracefulPollOutcome<T> {
+    /// The future completed normally.
+    Ok(T),
+    /// The job timed out.
+    Timeout(u64),
+    /// The job was cancelled and the future finished within the grace period.
+    Cancelled { canceled_by: Option<CanceledBy> },
+    /// The job was cancelled but the future did NOT finish within the grace period.
+    CancelledTimeout { canceled_by: Option<CanceledBy> },
+    /// The job was already moved to v2_job_completed externally.
+    AlreadyCompleted,
+}
+
+/// Like [`run_future_with_polling_update_job_poller`] but on cancellation, signals
+/// `cancel_tx` and waits up to `grace_period` for the future to finish instead of
+/// dropping it immediately. This lets in-flight work (e.g. AI tool calls) complete
+/// and clean up properly.
+pub async fn run_future_with_polling_update_job_poller_graceful<Fut, T, S>(
+    job_id: Uuid,
+    timeout: Option<i32>,
+    conn: &Connection,
+    mem_peak: &mut i32,
+    canceled_by_ref: &mut Option<CanceledBy>,
+    result_f: Fut,
+    worker_name: &str,
+    w_id: &str,
+    occupancy_metrics: &mut Option<&mut OccupancyMetrics>,
+    get_mem: S,
+    cancel_tx: watch::Sender<bool>,
+    grace_period: std::time::Duration,
+) -> error::Result<GracefulPollOutcome<T>>
+where
+    Fut: Future<Output = error::Result<T>>,
+    S: stream::Stream<Item = i32> + Unpin,
+{
+    let (tx, rx) = broadcast::channel::<()>(3);
+
+    let mut update_job = Box::pin(update_job_poller(
+        job_id,
+        conn,
+        mem_peak,
+        canceled_by_ref,
+        get_mem,
+        worker_name,
+        w_id,
+        rx,
+        occupancy_metrics,
+    ));
+
+    let timeout_ms = u64::try_from(
+        resolve_job_timeout(conn, w_id, job_id, timeout)
+            .await
+            .0
+            .as_millis(),
+    )
+    .unwrap_or(200_000);
+
+    let mut result_f = Box::pin(result_f);
+
+    let outcome = tokio::select! {
+        biased;
+        result = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            &mut result_f,
+        ) => {
+            match result {
+                Ok(Ok(v)) => GracefulPollOutcome::Ok(v),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => GracefulPollOutcome::Timeout(timeout_ms),
+            }
+        }
+        ex = &mut update_job, if job_id != Uuid::nil() => {
+            match ex {
+                UpdateJobPollingExit::Done(cb) => {
+                    let _ = cancel_tx.send(true);
+                    match tokio::time::timeout(grace_period, &mut result_f).await {
+                        Ok(_) => GracefulPollOutcome::Cancelled { canceled_by: cb },
+                        Err(_) => GracefulPollOutcome::CancelledTimeout { canceled_by: cb },
+                    }
+                }
+                UpdateJobPollingExit::AlreadyCompleted => GracefulPollOutcome::AlreadyCompleted,
+            }
+        }
+    };
+
+    drop(tx);
+    Ok(outcome)
+}
+
+pub enum UpdateJobPollingExit {
+    Done(Option<CanceledBy>),
+    AlreadyCompleted,
+}
+
+pub async fn update_job_poller<S>(
+    job_id: Uuid,
+    conn: &Connection,
+    mem_peak: &mut i32,
+    canceled_by_ref: &mut Option<CanceledBy>,
+    mut get_mem: S,
+    worker_name: &str,
+    w_id: &str,
+    mut rx: broadcast::Receiver<()>,
+    occupancy_metrics: &mut Option<&mut OccupancyMetrics>,
+) -> UpdateJobPollingExit
+where
+    S: stream::Stream<Item = i32> + Unpin,
+{
+    let update_job_interval = Duration::from_millis(500);
+
+    let conn = conn.clone();
+    // No tick at t=0: a job that finishes within the first interval issues none of the
+    // ping/metric statements below. Cancels are picked up by the next job ping. Memory is still
+    // sampled at start, without SQL: it is the only `mem_peak` reading a short job gets,
+    // and the completed job row reports it.
+    let mut interval = interval_at(Instant::now() + update_job_interval, update_job_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    *mem_peak = (*mem_peak).max(get_mem.next().await.unwrap_or(0));
+
+    let mut i = 0;
+
+    let mut memory_metric_id: Result<String, Error> =
+        Err(Error::NotFound("not yet initialized".to_string()));
+
+    loop {
+        tokio::select!(
+            _ = rx.recv() => break,
+            _ = interval.tick() => {
+                // update the last_ping column every 5 seconds (or 50 seconds in quiet mode)
+                i+=1;
+                // In quiet mode, emit memory snapshot logs 10x less frequently
+                let memory_snapshot_interval = if *QUIET_MODE { 100 } else { 10 };
+                if i == 1 || i % memory_snapshot_interval == 0 {
+                    let memory_usage = get_worker_memory_usage();
+                    let wm_memory_usage = get_windmill_memory_usage();
+                    tracing::info!("job {job_id} on {worker_name} in {w_id} worker memory snapshot {}kB/{}kB", memory_usage.unwrap_or_default()/1024, wm_memory_usage.unwrap_or_default()/1024);
+                    let occupancy = occupancy_metrics.as_mut().map(|x| x.update_occupancy_metrics());
+                    crate::resource_metrics::record_worker_resources(worker_name, memory_usage, wm_memory_usage, occupancy.as_ref());
+                    if job_id != Uuid::nil() {
+                        if let Err(err) = update_worker_ping_from_job(&conn, &job_id, w_id, worker_name, memory_usage, wm_memory_usage, occupancy).await {
+                            tracing::error!("Unable to update worker ping for job {} in workspace {}. Error was: {:?}", job_id, w_id, err);
+                        }
+                    }
+                }
+                let current_mem = get_mem.next().await.unwrap_or(0);
+                if current_mem > *mem_peak {
+                    *mem_peak = current_mem
+                }
+                // In quiet mode, emit "still running" logs 10x less frequently
+                let still_running_interval = if *QUIET_MODE { 10 } else { 1 };
+                if i % still_running_interval == 0 {
+                    tracing::info!("job {job_id} on {worker_name} in {w_id} still running.  mem: {current_mem}kB, peak mem: {mem_peak}kB");
+                }
+
+
+                let update_job_row = i == 1 || (!*SLOW_LOGS && (i < 20 || (i < 120 && i % 5 == 0) || i % 10 == 0)) || i % 20 == 0;
+                if update_job_row && job_id != Uuid::nil() {
+                    if let Connection::Sql(ref db) = conn {
+                        // Only track memory when it's non-zero (avoids storing all-zero timeseries for jobs that don't report memory)
+                        if current_mem > 0 {
+                            // Register on first non-zero reading, so jobs with no memory reporting get no metric
+                            if memory_metric_id.is_err() {
+                                memory_metric_id = job_metrics::register_metric_for_job(
+                                    &db,
+                                    w_id.to_string(),
+                                    job_id,
+                                    "memory_kb".to_string(),
+                                    job_metrics::MetricKind::TimeseriesInt,
+                                    Some("Job Memory Footprint (kB)".to_string()),
+                                )
+                                .await;
+                            }
+                            if let Ok(ref metric_id) = memory_metric_id {
+                                if let Err(err) = job_metrics::record_timeseries_value(&db, w_id.to_string(), job_id, metric_id.to_owned(), job_metrics::MetricNumericValue::Integer(current_mem), job_metrics::MetricKind::TimeseriesInt).await {
+                                    tracing::error!("Unable to save memory stat for job {} in workspace {}. Error was: {:?}", job_id, w_id, err);
+                                }
+                            }
+                        }
+                    }
+                    // An agent worker pays an HTTP round trip per ping, so it pings every 2 s for
+                    // the first 10 s, then every 5 s.
+                    if matches!(conn, Connection::Http(_)) && i % if i < 20 { 4 } else { 10 } != 0 {
+                        continue;
+                    }
+                    let ping_job_status = ping_job_status(&conn, &job_id, Some(*mem_peak), if current_mem > 0 { Some(current_mem) } else { None }).await.unwrap_or_else(|e| {
+                        tracing::error!("Unable to ping job status for job {job_id}. Error was: {:?}", e);
+                        PingJobStatusResponse {
+                            canceled_by: None,
+                            canceled_reason: None,
+                            already_completed: false,
+                        }
+                    });
+                    if ping_job_status.already_completed {
+                        return UpdateJobPollingExit::AlreadyCompleted
+                    }
+                    if ping_job_status.canceled_by.is_some() {
+                        canceled_by_ref.replace(CanceledBy {
+                            username: ping_job_status.canceled_by.clone(),
+                            reason: ping_job_status.canceled_reason.clone(),
+                        });
+                        break
+                    }
+                }
+            },
+        );
+    }
+    tracing::info!(target: VERBOSE_TARGET, "job {job_id} finished");
+
+    UpdateJobPollingExit::Done(canceled_by_ref.clone())
+}
+
+/// takes stdout and stderr from Child, panics if either are not present
+///
+/// builds a stream joining both stdout and stderr each read line by line
+fn child_joined_output_stream(
+    child: &mut Box<dyn TokioChildWrapper>,
+    job_id: Uuid,
+    w_id: String,
+) -> impl stream::FusedStream<Item = io::Result<OutputLine>> {
+    let stderr = child
+        .stderr()
+        .take()
+        .expect("child did not have a handle to stderr");
+
+    let stdout = child
+        .stdout()
+        .take()
+        .expect("child did not have a handle to stdout");
+
+    let stdout = BufReader::new(stdout).split(b'\n');
+    let stderr = BufReader::new(stderr).split(b'\n');
+    stream::select(
+        lines_to_stream(stderr, true, job_id.clone(), w_id.clone())
+            .map(|l| l.map(|line| OutputLine { stderr: true, line })),
+        lines_to_stream(stdout, false, job_id, w_id)
+            .map(|l| l.map(|line| OutputLine { stderr: false, line })),
+    )
+}
+
+pub fn lines_to_stream<R: tokio::io::AsyncBufRead + Unpin>(
+    mut lines: tokio::io::Split<R>,
+    stderr: bool,
+    job_id: Uuid,
+    w_id: String,
+) -> impl futures::Stream<Item = io::Result<String>> {
+    stream::poll_fn(move |cx| {
+        std::pin::Pin::new(&mut lines)
+            .poll_next_segment(cx)
+            .map(|result| {
+                let result = result.map(|segment| segment.map(decode_output_line));
+                process_streaming_log_lines(result, stderr, &job_id, &w_id)
+            })
+    })
+}
+
+/// Child output is not guaranteed to be UTF-8 (e.g. pwsh on Windows writes in the
+/// console code page), so decode lossily: a strict decode errors out and ends log
+/// capture for the rest of the job. Strips a trailing `\r` so CRLF output doesn't keep it.
+pub(crate) fn decode_output_line(mut segment: Vec<u8>) -> String {
+    if segment.last() == Some(&b'\r') {
+        segment.pop();
+    }
+    String::from_utf8(segment)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
+pub fn process_status(
+    program: &str,
+    status: ExitStatus,
+    stream_result: Vec<String>,
+) -> error::Result<HandleChildResult> {
+    if status.success() {
+        Ok(HandleChildResult {
+            result_stream: if stream_result.is_empty() {
+                None
+            } else {
+                Some(stream_result.join(""))
+            },
+            last_line: None,
+        })
+    } else if let Some(code) = status.code() {
+        Err(error::Error::ExitStatus(program.to_string(), code))
+    } else {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return Err(error::Error::ExecutionErr(format!(
+            "process terminated by signal: {:#?}, stopped_signal: {:#?}, core_dumped: {}",
+            status.signal(),
+            status.stopped_signal(),
+            status.core_dumped()
+        )));
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return Err(error::Error::ExecutionErr(String::from(
+            "process terminated by signal",
+        )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_stat_cpu_time_survives_a_hostile_process_name() {
+        // utime 150, stime 50, cutime 700, cstime 100 ticks: 1000 ticks, 10 s.
+        let tail = "Z 1 42 42 0 -1 4194560 100 200 0 0 150 50 700 100 20 0 1 0 12345 0 0";
+        assert_eq!(
+            parse_proc_stat_cpu_ms(&format!("42 (bun) {tail}")),
+            Some(10_000)
+        );
+        assert_eq!(
+            parse_proc_stat_cpu_ms(&format!("42 (a) R 9 (9 9 9 9 9 9 9 9 9) {tail}")),
+            Some(10_000)
+        );
+        assert_eq!(parse_proc_stat_cpu_ms("42 (bun) Z 1 42"), None);
+    }
+
+    // A non-positive timeout means "unset" to `resolve_job_timeout`, so an
+    // exhausted budget that reported 0 would hand the next phase no deadline at
+    // all — the opposite of what running out of time should do.
+    #[test]
+    fn an_exhausted_budget_still_asks_for_a_positive_timeout() {
+        let spent = JobDeadline(Some(Instant::now() - Duration::from_secs(30)));
+        assert_eq!(spent.remaining_secs(), Some(1));
+        let left = JobDeadline(Some(Instant::now() + Duration::from_secs(120)));
+        assert!(matches!(left.remaining_secs(), Some(s) if (118..=120).contains(&s)));
+    }
+
+    // "Prüfe" in CP850/1252 is not UTF-8. A strict decode errors on that line and
+    // would stop log capture, dropping every line after it.
+    #[tokio::test]
+    async fn a_non_utf8_line_is_decoded_lossily_and_later_lines_still_arrive() {
+        let output: &[u8] =
+            b"start\r\nPr\x81fe Benutzer\nPr\xfcfe\nGr\xc3\xbc\xc3\x9fe\r\nafter\n\nlast";
+        let lines: Vec<String> = lines_to_stream(
+            BufReader::new(output).split(b'\n'),
+            false,
+            Uuid::nil(),
+            "w".into(),
+        )
+        .map(|line| line.expect("reading from a byte slice cannot fail"))
+        .collect()
+        .await;
+        assert_eq!(
+            lines,
+            vec![
+                "start",
+                "Pr\u{FFFD}fe Benutzer",
+                "Pr\u{FFFD}fe",
+                "Grüße",
+                "after",
+                "",
+                "last",
+            ]
+        );
+    }
+}

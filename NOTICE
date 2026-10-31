@@ -1,0 +1,24 @@
+Gantry
+Copyright (c) 2026 The Gantry contributors
+
+Gantry is a modified version of the open-source (AGPLv3) parts of Windmill.
+Original work Copyright (c) 2021-2026 Windmill Labs, Inc. "Windmill" is a
+trademark of Windmill Labs, Inc.; Gantry is not affiliated with or endorsed by
+Windmill Labs, Inc.
+
+Modifications (see PROVENANCE.md for the full process):
+
+  * 2026-10-31: Imported backend/ from upstream commit recorded in
+    UPSTREAM_COMMIT and removed all code that upstream licenses under
+    proprietary terms (code gated on the "enterprise", "private" and
+    "enterprise_saml" Cargo features), using tools/cfg-strip.
+  * The upstream frontend was not imported.
+
+Licensing:
+
+  * backend/ is licensed under the GNU Affero General Public License v3
+    (LICENSE-AGPL). Upstream copyright and license notices in backend/ are
+    retained as required.
+  * openflow.openapi.yaml and the OpenAPI specifications are licensed under the
+    Apache License 2.0 (LICENSE-APACHE).
+  * tools/ and scripts/ are original to Gantry and licensed under the AGPLv3.

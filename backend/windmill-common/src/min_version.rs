@@ -1,0 +1,226 @@
+use crate::error::{self, Error};
+use semver::Version;
+
+// ============ Feature Definitions ============
+
+// The release that stops reading `script`/`flow`.`on_behalf_of_email`. It must name the release
+// this actually ships in: set below it, the compatibility write stops while a worker that still
+// reads that column is live, and those runnables run as their deployer with no error anywhere.
+pub const MIN_VERSION_SUPPORTS_ON_BEHALF_OF_PRINCIPAL: VC = vc(1, 776, 0, "On-behalf-of principal");
+// A deploy-time binary build is a `dependencies` job distinguished only by a job arg. A
+// worker that predates the arg would run it as a real lock generation, redeploying an
+// already-deployed hash (duplicate git-sync commit, duplicate fork tally, a re-triggered
+// relative-import cascade). Must name the release this ships in.
+pub const MIN_VERSION_SUPPORTS_BINARY_PREBUILD: VC = vc(1, 789, 0, "Auto-build binary on deploy");
+// The release that ships bun 1.4, which writes `bun.lock` v2 (v3 with overrides or catalogs).
+// Bun 1.3 reports `error: Unknown lockfile version`, then installs anyway from `package.json`
+// alone — and the dependency job writes every dependency as `"latest"`, so the lockfile is the
+// only pin and an older worker resolves whatever is newest instead. Below this version the
+// dependency job asks bun for a v1 lockfile, and refuses to store one bun raised anyway.
+// Must name the release this ships in.
+pub const MIN_VERSION_SUPPORTS_BUN_LOCKFILE_V2: VC = vc(1, 794, 0, "Bun v2 lockfiles");
+// A worker that predates `job_token_scopes` mints the token of every job it pulls without
+// them, so a restriction set while one is live is silently ignored on the jobs it runs. Must
+// name the release this ships in.
+pub const MIN_VERSION_SUPPORTS_JOB_TOKEN_SCOPES: VC = vc(1, 822, 0, "Restricted job tokens");
+// Gates writing AES-256-GCM workspace ciphertext and the background pass that rewrites the
+// stored secret variables. Reading it ships one release earlier (1.831), so a rollback to
+// that release still reads every secret; below it, secrets written after the switch stay
+// unreadable until rolled forward. Only worker versions are seen here, not servers.
+pub const MIN_VERSION_SUPPORTS_AEAD_SECRETS: VC = vc(1, 832, 0, "AES-GCM secret encryption");
+// Gates widening `variable.value`. Every query returning that column casts it to text from
+// this release, so the widening changes no result type: before it, each statement prepared on
+// the column fails once per connection, and behind PgBouncer until its server connection
+// closes. Must name the release this ships in.
+pub const MIN_VERSION_SUPPORTS_VARIABLE_VALUE_WIDENING: VC =
+    vc(1, 848, 0, "variable.value widening");
+// A renewed license key replaces the one every process reads, and a worker that predates
+// Ed25519 support rejects an Ed25519-signed key and stops pulling jobs, so renewal only offers
+// to accept one once this is met. Only worker versions are seen here, not servers. Must name
+// the release this ships in.
+pub const MIN_VERSION_SUPPORTS_ED25519_LICENSE: VC = vc(1, 838, 0, "Ed25519 license keys");
+pub const MIN_VERSION_SUPPORTS_NODE_DEBOUNCING: VC = vc(1, 658, 0, "Flow node debouncing");
+pub const MIN_VERSION_SUPPORTS_TOKEN_HASH: VC = vc(1, 659, 0, "Token hash storage");
+pub const MIN_VERSION_SUPPORTS_SYNC_JOBS_DEBOUNCING: VC = vc(1, 602, 0, "Sync jobs debouncing");
+pub const MIN_VERSION_SUPPORTS_DEBOUNCING_V2: VC = vc(1, 597, 0, "Debouncing V2");
+pub const MIN_VERSION_IS_AT_LEAST_1_595: VC = vc(1, 595, 0, "Flow status separate table");
+pub const MIN_VERSION_SUPPORTS_RUNNABLE_SETTINGS_V0: VC = vc(1, 592, 0, "Runnable settings V0");
+pub const MIN_VERSION_SUPPORTS_V0_WORKSPACE_DEPENDENCIES: VC =
+    vc(1, 587, 0, "Workspace dependencies");
+pub const MIN_VERSION_SUPPORTS_DEBOUNCING: VC = vc(1, 566, 0, "Debouncing");
+pub const MIN_VERSION_IS_AT_LEAST_1_440: VC = vc(1, 440, 0, "Flow node value on pull");
+pub const MIN_VERSION_IS_AT_LEAST_1_432: VC = vc(1, 432, 0, "Flow script job kind");
+pub const MIN_VERSION_IS_AT_LEAST_1_427: VC = vc(1, 427, 0, "Flow version lite table");
+
+// TODO: Currently only shows warning in frontend. In the future,
+// workers below this version should be terminated automatically.
+
+/// Minimum version workers must have to stay connected.
+/// Served via: GET /api/min_keep_alive_version (returns { worker, agent })
+/// Also used by vc() for compile-time checks.
+pub const MIN_KEEP_ALIVE_VERSION: (u64, u64, u64) = (1, 420, 0);
+
+/// Minimum version agent workers must have to stay connected.
+/// Served via: GET /api/min_keep_alive_version (returns { worker, agent })
+pub const AGENT_MIN_KEEP_ALIVE_VERSION: (u64, u64, u64) = (1, 0, 0);
+
+// Compile-time check: MIN_KEEP_ALIVE_VERSION must lag at least 50 minor versions behind current,
+// AGENT_MIN_KEEP_ALIVE_VERSION must lag at least 100 minor versions behind current.
+// NOTE: These version lags are constants and should NEVER be changed. If this check
+// fails, wait until enough versions have passed rather than reducing the lag requirement.
+// Skip check if GIT_VERSION is "unknown-version" (no git tags available during build)
+const _: () = assert!(
+    !const_str::contains!(crate::utils::GIT_VERSION, ".")
+        || (const_str::parse!(const_str::split!(crate::utils::GIT_VERSION, ".")[1], u64)
+            - MIN_KEEP_ALIVE_VERSION.1
+            >= 50
+            && const_str::parse!(const_str::split!(crate::utils::GIT_VERSION, ".")[1], u64)
+                - AGENT_MIN_KEEP_ALIVE_VERSION.1
+                >= 100)
+);
+
+// ============ Implementation ============
+lazy_static::lazy_static! {
+    // Global minimum version across all workers (for feature flags)
+    pub static ref MIN_VERSION: arc_swap::ArcSwap<Version> = arc_swap::ArcSwap::from_pointee(Version::new(0, 0, 0));
+}
+
+/// Creates a VersionConstraint with compile-time assertion that version > MIN_KEEP_ALIVE_VERSION.
+/// When MIN_KEEP_ALIVE_VERSION is raised, obsolete constraints will fail to compile.
+pub const fn vc(major: u64, minor: u64, patch: u64, name: &'static str) -> VersionConstraint {
+    let is_greater = major > MIN_KEEP_ALIVE_VERSION.0
+        || (major == MIN_KEEP_ALIVE_VERSION.0 && minor > MIN_KEEP_ALIVE_VERSION.1)
+        || (major == MIN_KEEP_ALIVE_VERSION.0
+            && minor == MIN_KEEP_ALIVE_VERSION.1
+            && patch > MIN_KEEP_ALIVE_VERSION.2);
+    assert!(
+        is_greater,
+        "Feature version must be > MIN_KEEP_ALIVE_VERSION. Remove this obsolete constraint."
+    );
+    VersionConstraint { available_since: Version::new(major, minor, patch), name }
+}
+
+pub type VC = VersionConstraint;
+
+#[derive(Clone)]
+pub struct VersionConstraint {
+    available_since: Version,
+    name: &'static str,
+}
+
+impl VersionConstraint {
+    pub fn version(&self) -> &Version {
+        &self.available_since
+    }
+
+    pub async fn met(&self) -> bool {
+        let min = MIN_VERSION.load();
+        // If MIN_VERSION is 0.0.0, it hasn't been set yet - assume met
+        if **min == Version::new(0, 0, 0) {
+            tracing::warn!(
+                "MIN_VERSION not set yet, assuming feature '{}' is met",
+                self.name
+            );
+            return true;
+        }
+        &self.available_since <= &**min
+    }
+
+    /// [`met`](Self::met) for a compatibility write rather than a feature switch.
+    ///
+    /// `met` assumes the best when no worker has reported a version yet, which is what you want
+    /// before turning something on. Dropping a write that an old worker still reads is the
+    /// opposite risk, so an unknown fleet counts as old.
+    pub fn met_conservatively(&self) -> bool {
+        let min = MIN_VERSION.load();
+        **min != Version::new(0, 0, 0) && self.available_since <= **min
+    }
+
+    pub async fn assert(&self) -> error::Result<()> {
+        if self.met().await {
+            Ok(())
+        } else {
+            Err(Error::WorkersAreBehind {
+                feature: self.name.to_string(),
+                min_version: self.available_since.to_string(),
+            })
+        }
+    }
+}
+
+// ============ Version Management ============
+
+use crate::utils::{GIT_SEM_VERSION, GIT_VERSION};
+use crate::worker::Connection;
+
+/// Fetches the minimum version across all workers.
+// TODO: consider using HTTP for everything instead of Connection enum
+pub async fn get_min_version(conn: &Connection) -> error::Result<Version> {
+    let fetched = match conn {
+        Connection::Sql(pool) => {
+            let pings = sqlx::query_scalar!(
+                "SELECT wm_version FROM worker_ping WHERE wm_version != $1 AND ping_at > now() - interval '5 minutes'",
+                GIT_VERSION
+            ).fetch_all(pool).await?;
+
+            pings
+                .iter()
+                .filter(|x| !x.is_empty())
+                .filter_map(|x| Version::parse(if x.starts_with('v') { &x[1..] } else { x }).ok())
+                .min()
+        }
+        Connection::Http(client) => Some(
+            client
+                .get::<String>("/api/agent_workers/get_min_version")
+                .await
+                .map(|v| Version::parse(&v))??,
+        ),
+    };
+
+    Ok(fetched.unwrap_or_else(|| GIT_SEM_VERSION.clone()))
+}
+
+/// Updates MIN_VERSION and optionally checks min keep-alive version for workers.
+/// If `_worker_mode` is true, checks min keep-alive version and sends critical alerts.
+/// If `initial_load` is true, skips the min keep-alive check (server may not be ready).
+pub async fn update_min_version(
+    conn: &Connection,
+    _worker_mode: bool,
+    _worker_names: Vec<String>,
+    _initial_load: bool,
+) {
+    // Update MIN_VERSION
+    match get_min_version(conn).await {
+        Ok(ref mut v) => {
+            let cur = GIT_SEM_VERSION.clone();
+            if v != &cur {
+                tracing::info!("Minimal worker version: {v}");
+            }
+            v.pre = semver::Prerelease::EMPTY;
+            v.build = semver::BuildMetadata::EMPTY;
+            MIN_VERSION.store(std::sync::Arc::new(v.clone()));
+        }
+        Err(e) => tracing::error!("Failed to fetch min version: {:#?}", e),
+    }
+}
+
+/// Stores the min keep-alive version in global_settings.
+/// Called by server on startup, NOT by workers.
+pub async fn store_min_keep_alive_version(db: &sqlx::Pool<sqlx::Postgres>) {
+    let version = format!(
+        "{}.{}.{}",
+        MIN_KEEP_ALIVE_VERSION.0, MIN_KEEP_ALIVE_VERSION.1, MIN_KEEP_ALIVE_VERSION.2
+    );
+    if let Err(e) = crate::global_settings::set_value_in_global_settings(
+        db,
+        crate::global_settings::MIN_KEEP_ALIVE_VERSION_SETTING,
+        serde_json::json!(version),
+    )
+    .await
+    {
+        tracing::error!(
+            "Failed to store min keep-alive version in global_settings: {:#?}",
+            e
+        );
+    }
+}

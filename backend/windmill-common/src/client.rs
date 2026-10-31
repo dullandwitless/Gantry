@@ -1,0 +1,519 @@
+use anyhow::Context;
+use reqwest::{Body, Response};
+use serde::de::DeserializeOwned;
+
+use crate::utils::{HTTP_CLIENT, HTTP_CLIENT_STREAMING};
+
+#[derive(Clone)]
+pub struct AuthedClient {
+    pub base_internal_url: String,
+    pub workspace: String,
+    pub token: String,
+    pub force_client: Option<reqwest::Client>,
+}
+
+impl AuthedClient {
+    pub fn new(
+        base_internal_url: String,
+        workspace: String,
+        token: String,
+        force_client: Option<reqwest::Client>,
+    ) -> AuthedClient {
+        AuthedClient { base_internal_url, workspace, token, force_client }
+    }
+
+    pub async fn get(&self, url: &str, query: Vec<(&str, String)>) -> anyhow::Result<Response> {
+        self.force_client
+            .as_ref()
+            .unwrap_or(&HTTP_CLIENT)
+            .get(url)
+            .query(&query)
+            .header(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            )
+            .header(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!("Error executing get request from authed http client to {url} with query {query:?}: {e:#?}");
+                anyhow::anyhow!("Error executing get request from authed http client to {url} with query {query:?}: {e:#?}")
+            })
+    }
+
+    /// Like [`AuthedClient::get`], but for a response whose size decides how
+    /// long it takes. `HTTP_CLIENT`'s total timeout would cut off a large one
+    /// partway through, so this uses the streaming client, which bounds only
+    /// the connect.
+    pub async fn get_streaming(
+        &self,
+        url: &str,
+        query: Vec<(&str, String)>,
+    ) -> anyhow::Result<Response> {
+        self.force_client
+            .as_ref()
+            .unwrap_or(&HTTP_CLIENT_STREAMING)
+            .get(url)
+            .query(&query)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!("Error streaming get request from authed http client to {url} with query {query:?}: {e:#?}");
+                anyhow::anyhow!("Error streaming get request from authed http client to {url} with query {query:?}: {e:#?}")
+            })
+    }
+
+    pub async fn get_id_token(&self, audience: &str) -> anyhow::Result<String> {
+        self.get_id_token_expiring_in(audience, None).await
+    }
+
+    /// `expires_in` caps the token's lifetime below the instance default, for
+    /// audiences that refuse long-lived assertions.
+    pub async fn get_id_token_expiring_in(
+        &self,
+        audience: &str,
+        expires_in: Option<i64>,
+    ) -> anyhow::Result<String> {
+        // An audience can be a URL, whose slashes would otherwise split the path segment.
+        let url = format!(
+            "{}/api/w/{}/oidc/token/{}",
+            self.base_internal_url,
+            self.workspace,
+            urlencoding::encode(audience)
+        );
+        let mut request = self
+            .force_client
+            .as_ref()
+            .unwrap_or(&HTTP_CLIENT)
+            .post(&url);
+        if let Some(expires_in) = expires_in {
+            request = request.query(&[("expires_in", expires_in)]);
+        }
+        let response = request
+            .header(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!("Error requesting oidc token from {url}: {e:#?}");
+                anyhow::anyhow!("Error requesting oidc token from {url}: {e:#?}")
+            })?;
+
+        match response.status().as_u16() {
+            200u16 => Ok(response.text().await.context("reading oidc token body")?),
+            status => {
+                let body = response.text().await.unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "oidc token request to {url} failed with status {status}: {body}"
+                ))
+            }
+        }
+    }
+
+    pub async fn get_resource_value<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/resources/get_value/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        make_basic_get_request(self, &url, None, Some("decoding resource value as json")).await
+    }
+
+    /// The value of the `ai_agent` resource at `path`, refused when the resource there is of another
+    /// type. Only writes of an agent are checked for operators, so a step linking a path must not run
+    /// tools from a resource retyped, or recreated as another type, since the link was approved.
+    pub async fn get_agent_value(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        #[derive(serde::Deserialize)]
+        struct Resource {
+            resource_type: String,
+            value: Option<serde_json::Value>,
+        }
+        let url = format!(
+            "{}/api/w/{}/resources/get/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        let resource: Resource =
+            make_basic_get_request(self, &url, None, Some("decoding the agent resource")).await?;
+        if resource.resource_type != "ai_agent" {
+            anyhow::bail!(
+                "{path} is a {} resource, not an AI agent",
+                resource.resource_type
+            );
+        }
+        Ok(resource.value.unwrap_or_default())
+    }
+
+    pub async fn get_variable_value(&self, path: &str) -> anyhow::Result<String> {
+        let url = format!(
+            "{}/api/w/{}/variables/get_value/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        make_basic_get_request(self, &url, None, Some("decoding variable value as json")).await
+    }
+
+    pub async fn get_resource_value_interpolated<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        job_id: Option<String>,
+    ) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/resources/get_value_interpolated/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        let mut query = Vec::with_capacity(1usize);
+        if let Some(v) = &job_id {
+            query.push(("job_id", v.to_string()));
+        }
+        let response = self.get(&url, query).await?;
+        match response.status().as_u16() {
+            200u16 => Ok(response
+                .json::<T>()
+                .await
+                .context("decoding interpolated resource value as json")?),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+
+    /// Whether the workspace configures this dbt warehouse. Resolves nothing.
+    pub async fn dbt_warehouse_exists(&self, name: &str) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/api/w/{}/dbt/warehouse_exists/{}",
+            self.base_internal_url, self.workspace, name
+        );
+        let response = self.get(&url, vec![]).await?;
+        match response.status().as_u16() {
+            200u16 => Ok(()),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+
+    /// Record a run's settled dbt nodes, for a worker with no database.
+    ///
+    /// Posted with the JOB's token, not the agent's: the route takes the job
+    /// from the token, and the agent's own credential only authenticates
+    /// against the agent surface.
+    pub async fn record_dbt_run_progress(
+        &self,
+        req: &[crate::dbt_manifest::DbtRunProgressRequest],
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/api/w/{}/dbt/run_progress",
+            self.base_internal_url, self.workspace
+        );
+        let response = self
+            .force_client
+            .as_ref()
+            .unwrap_or(&HTTP_CLIENT)
+            .post(&url)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+            )
+            .json(req)
+            .send()
+            .await?;
+        match response.status().as_u16() {
+            200u16 => Ok(()),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+
+    /// Where a dbt warehouse name points, for a worker with no database.
+    pub async fn get_dbt_warehouse<T: DeserializeOwned>(&self, name: &str) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/dbt/warehouse/{}",
+            self.base_internal_url, self.workspace, name
+        );
+        make_basic_get_request(self, &url, None, Some("decoding the dbt warehouse ref")).await
+    }
+
+    pub async fn get_completed_job_result<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        json_path: Option<String>,
+    ) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/jobs_u/completed/get_result/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        let query = query_from_json_path(json_path);
+        make_basic_get_request(
+            self,
+            &url,
+            Some(query),
+            Some("decoding completed job result as json"),
+        )
+        .await
+    }
+
+    pub async fn get_result_by_id<T: DeserializeOwned>(
+        &self,
+        flow_job_id: &str,
+        node_id: &str,
+        json_path: Option<String>,
+    ) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/jobs/result_by_id/{}/{}",
+            self.base_internal_url, self.workspace, flow_job_id, node_id
+        );
+        let query = query_from_json_path(json_path);
+        make_basic_get_request(
+            self,
+            &url,
+            Some(query),
+            Some("decoding result by id as json"),
+        )
+        .await
+    }
+
+    pub async fn get_flow_user_state(
+        &self,
+        job_id: &str,
+        key: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!(
+            "{}/api/w/{}/jobs/flow/user_states/{}/{}",
+            self.base_internal_url,
+            self.workspace,
+            job_id,
+            urlencoding::encode(key),
+        );
+        make_basic_get_request(self, &url, None, Some("decoding flow user state as json")).await
+    }
+
+    pub async fn upload_s3_file<S>(
+        &self,
+        workspace_id: &str,
+        object_key: String,
+        storage: Option<String>,
+        body: S,
+    ) -> anyhow::Result<()>
+    where
+        S: futures::stream::TryStream + Send + 'static,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        bytes::Bytes: From<S::Ok>,
+    {
+        let mut query = vec![("file_key", object_key)];
+        if let Some(storage) = storage {
+            query.push(("storage", storage));
+        }
+        let url = format!(
+            "{}/api/w/{}/job_helpers/upload_s3_file",
+            self.base_internal_url, workspace_id
+        );
+        // Use the streaming HTTP client (no total request timeout) because the
+        // upload body is streamed and total time depends on data size.
+        let response = self
+            .force_client
+            .as_ref()
+            .unwrap_or(&HTTP_CLIENT_STREAMING)
+            .post(&url)
+            .query(&query)
+            .header(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            )
+            .header(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            )
+            .body(Body::wrap_stream(body))
+            .send()
+            .await
+            .context(format!("Failed to send upload_s3_file request to {url}"))?;
+
+        match response.status().as_u16() {
+            200u16 => Ok(()),
+            _ => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "upload_s3_file request to {url} failed with status {status}: {body}"
+                ))
+            }
+        }
+    }
+
+    pub async fn download_s3_file(
+        &self,
+        workspace_id: &str,
+        file_key: &str,
+        storage: Option<String>,
+        max_bytes: Option<usize>,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let mut query = vec![("file_key", file_key.to_string())];
+        if let Some(storage) = storage {
+            query.push(("storage", storage));
+        }
+        let mut response = self
+            .force_client
+            .as_ref()
+            .unwrap_or(&HTTP_CLIENT)
+            .get(&format!(
+                "{}/api/w/{}/job_helpers/download_s3_file",
+                self.base_internal_url, workspace_id
+            ))
+            .query(&query)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            )
+            .send()
+            .await
+            .context("Failed to send download_s3_file request")
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        if let Some(max_bytes) = max_bytes {
+            let size_error = || {
+                anyhow::anyhow!(
+                    "S3 file '{file_key}' exceeds maximum supported download size of {max_bytes} bytes"
+                )
+            };
+            if response
+                .content_length()
+                .is_some_and(|len| len > max_bytes as u64)
+            {
+                return Err(size_error());
+            }
+
+            let status = response.status();
+            let mut bytes = Vec::new();
+            // Content-Length may be absent (including for decoded compressed responses).
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .context("Failed to read response bytes")?
+            {
+                if chunk.len() > max_bytes - bytes.len() {
+                    return Err(size_error());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return if status == reqwest::StatusCode::OK {
+                Ok(bytes.into())
+            } else {
+                Err(anyhow::anyhow!(String::from_utf8_lossy(&bytes).into_owned()))
+            };
+        }
+
+        match response.status().as_u16() {
+            200u16 => Ok(response
+                .bytes()
+                .await
+                .context("Failed to read response bytes")?),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn download_response(
+        response: &'static str,
+        max_bytes: Option<usize>,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = AuthedClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "test_ws".to_string(),
+            "test_token".to_string(),
+            Some(reqwest::Client::builder().no_proxy().build().unwrap()),
+        );
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            loop {
+                let mut line = String::new();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            socket
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            // Keep incomplete bodies open so rejection must happen before EOF.
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.download_s3_file("test_ws", "image.png", None, max_bytes),
+        )
+        .await;
+        server.abort();
+        result.expect("download waited for the oversized body to finish")
+    }
+
+    #[tokio::test]
+    async fn download_s3_file_rejects_oversized_body_before_eof() {
+        for response in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n1\r\ne\r\n",
+            "HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nerror\r\n",
+        ] {
+            let error = download_response(response, Some(4)).await.unwrap_err();
+            assert!(error.to_string().contains(
+                "S3 file 'image.png' exceeds maximum supported download size of 4 bytes"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn download_s3_file_accepts_body_at_limit() {
+        for response in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
+        ] {
+            assert_eq!(
+                download_response(response, Some(4)).await.unwrap(),
+                &b"abcd"[..]
+            );
+        }
+    }
+}
+
+#[inline]
+fn query_from_json_path(json_path: Option<String>) -> Vec<(&'static str, String)> {
+    json_path
+        .map(|json_path| vec![("json_path", json_path)])
+        .unwrap_or_else(|| Vec::new())
+}
+
+#[inline]
+async fn make_basic_get_request<T: DeserializeOwned>(
+    client: &AuthedClient,
+    url: &str,
+    query: Option<Vec<(&'static str, String)>>,
+    context: Option<&'static str>,
+) -> anyhow::Result<T> {
+    let response = client
+        .get(&url, query.unwrap_or_else(|| Vec::new()))
+        .await?;
+
+    match response.status().as_u16() {
+        200u16 => {
+            let json_body = response
+                .json::<T>()
+                .await
+                .context(context.unwrap_or("error decoding body as json"))?;
+            Ok(json_body)
+        }
+        _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+    }
+}

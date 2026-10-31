@@ -1,0 +1,1491 @@
+/*
+ * Author: Windmill Labs, Inc
+ * Copyright: Windmill Labs, Inc 2024
+ * This file and its contents are licensed under the AGPLv3 License.
+ * Please see the included NOTICE for copyright information and
+ * LICENSE-AGPL for a copy of the license.
+ */
+
+//! Job execution primitives: push, cancel, tag/license checks, wait-for-result.
+
+use axum::{
+    response::{IntoResponse, Response},
+    Json,
+};
+use base64::Engine as _;
+use http::{HeaderMap, HeaderName, HeaderValue};
+use hyper::StatusCode;
+use serde::Deserialize;
+use serde_json::value::RawValue;
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+use windmill_api_auth::{check_scopes, get_scope_tags, ApiAuthed};
+use windmill_audit::{
+    audit_oss::{audit_log_many, AuditAuthorable},
+    ActionKind,
+};
+use windmill_common::{
+    db::{UserDB, UserDbWithAuthed},
+    error::{self, Error},
+    flow_conversations::{
+        add_message_to_conversation_tx, message_attachments, MessageExtras, MessageType,
+    },
+    flows::Retry,
+    get_latest_flow_version_info_for_path,
+    jobs::{
+        check_tag_available_for_workspace_internal, format_result, script_path_to_payload,
+        JobPayload,
+    },
+    triggers::TriggerMetadata,
+    users::username_to_permissioned_as,
+    utils::StripPath,
+    FlowVersionInfo, DB,
+};
+use windmill_queue::{
+    cancel_job, check_tag_available_for_push, get_result_and_success_by_id_from_flow,
+    parse_result_object, push, tag_reads_args, PushArgs, PushArgsOwned, PushIsolationLevel,
+};
+
+use crate::types::RunJobQuery;
+
+// ---------------------------------------------------------------------------
+// Tag / license checks
+// ---------------------------------------------------------------------------
+
+/// `args` must be the ones the job is pushed with, see [`windmill_queue::check_tag_available_for_push`].
+pub async fn check_tag_available_for_workspace(
+    db: &DB,
+    w_id: &str,
+    tag: &Option<String>,
+    args: &PushArgs<'_>,
+    authed: &ApiAuthed,
+) -> error::Result<()> {
+    if let Some(tag) = tag.as_deref().filter(|t| !t.is_empty()) {
+        let tags = get_scope_tags(authed);
+        // Job-aware: a WM_TOKEN running as a superadmin must not unlock restricted tags.
+        let is_super_admin = windmill_api_auth::is_super_admin_authed(db, authed).await?;
+        check_tag_available_for_push(db, w_id, tag, args, is_super_admin, tags).await
+    } else {
+        Ok(())
+    }
+}
+
+/// [`check_tag_available_for_workspace`] for a tag filled in from values nothing can check yet,
+/// such as a flow's preprocessor output: only an entry spelled exactly like it admits it.
+pub async fn check_tag_as_written_available_for_workspace(
+    db: &DB,
+    w_id: &str,
+    tag: &Option<String>,
+    authed: &ApiAuthed,
+) -> error::Result<()> {
+    if let Some(tag) = tag.as_deref().filter(|t| !t.is_empty()) {
+        let tags = get_scope_tags(authed);
+        // Job-aware: a WM_TOKEN running as a superadmin must not unlock restricted tags.
+        let is_super_admin = windmill_api_auth::is_super_admin_authed(db, authed).await?;
+        check_tag_available_for_workspace_internal(
+            db,
+            w_id,
+            tag,
+            None,
+            std::future::ready(w_id.to_string()),
+            is_super_admin,
+            tags,
+        )
+        .await
+    } else {
+        Ok(())
+    }
+}
+
+/// Clears a `parent_job` / `root_job` the caller cannot claim. They identify the pushed job
+/// (`WM_FLOW_JOB_ID`, `WM_ROOT_FLOW_JOB_ID`, the OIDC token's flow path), so only a job's own
+/// `WM_TOKEN` may name that job or its ancestors, and a workspace admin any job of the workspace.
+/// Cleared rather than refused: the SDKs send them from inside a job whatever token they hold.
+pub async fn drop_unclaimable_run_lineage(
+    db: &DB,
+    w_id: &str,
+    run_query: &mut RunJobQuery,
+    authed: &ApiAuthed,
+) -> error::Result<()> {
+    let referenced: Vec<Uuid> = [run_query.parent_job, run_query.root_job]
+        .into_iter()
+        .flatten()
+        .collect();
+    let unclaimable = unclaimable_run_lineage(db, w_id, referenced, authed).await?;
+    for field in [&mut run_query.parent_job, &mut run_query.root_job] {
+        if field.is_some_and(|id| unclaimable.contains(&id)) {
+            tracing::warn!(
+                "ignoring parent_job/root_job {field:?} that {} cannot claim in {w_id}",
+                authed.username
+            );
+            *field = None;
+        }
+    }
+    Ok(())
+}
+
+/// Applies the run's `retry` policy by handing `push` a one-step-flow request, which it
+/// materializes as a native retryable `Script`.
+pub fn with_run_retry(
+    run_query: &RunJobQuery,
+    payload: JobPayload,
+    args: &PushArgs<'_>,
+    tag: &Option<String>,
+) -> error::Result<JobPayload> {
+    let Some(retry) = run_query.retry.as_deref() else {
+        return Ok(payload);
+    };
+    // Retry attempts are always pushed visible to the owner, which would leak a private run.
+    if run_query.invisible_to_owner.unwrap_or(false) {
+        return Err(Error::BadRequest(
+            "retry cannot be combined with invisible_to_owner".to_string(),
+        ));
+    }
+    let retry: Retry = serde_json::from_str(retry)
+        .map_err(|e| Error::BadRequest(format!("invalid retry policy: {e}")))?;
+    let JobPayload::ScriptHash {
+        hash,
+        path,
+        cache_ttl,
+        cache_ignore_s3_path,
+        language,
+        priority,
+        apply_preprocessor,
+        debouncing_settings,
+        concurrency_settings,
+        ..
+    } = payload
+    else {
+        return Err(Error::BadRequest(
+            "retry is only supported for workspace scripts".to_string(),
+        ));
+    };
+    // A failed attempt keeps its raw args and the retry re-push skips the preprocessor, so
+    // every retry would call `main` with un-preprocessed input.
+    if apply_preprocessor {
+        return Err(Error::BadRequest(
+            "retry is not supported for a script with a preprocessor unless skip_preprocessor is set"
+                .to_string(),
+        ));
+    }
+    Ok(JobPayload::SingleStepFlow {
+        path,
+        hash: Some(hash),
+        flow_version: None,
+        language: Some(language),
+        args: HashMap::from(args),
+        retry: Some(retry),
+        error_handler_path: None,
+        error_handler_args: None,
+        skip_handler: None,
+        cache_ttl,
+        cache_ignore_s3_path,
+        priority,
+        tag_override: tag.clone(),
+        trigger_path: None,
+        apply_preprocessor,
+        concurrency_settings,
+        debouncing_settings,
+    })
+}
+
+/// The jobs of `referenced` that `authed` cannot claim as its own run lineage: anything but the
+/// token's own job and that job's `parent_job`, `root_job` and `flow_innermost_root_job`, or for
+/// a workspace admin anything outside the workspace. A restricted job token never gets the admin
+/// latitude: its flow-run routes trust this lineage (`job_in_same_flow_run`), so a claimed
+/// unrelated run would escape its scopes.
+pub async fn unclaimable_run_lineage(
+    db: &DB,
+    w_id: &str,
+    mut referenced: Vec<Uuid>,
+    authed: &ApiAuthed,
+) -> error::Result<Vec<Uuid>> {
+    referenced.sort();
+    referenced.dedup();
+    if let Some(token_job) = authed.job_id {
+        referenced.retain(|id| *id != token_job);
+        if !referenced.is_empty() {
+            if let Some(lineage) = sqlx::query!(
+                "SELECT parent_job, root_job, flow_innermost_root_job FROM v2_job
+                WHERE id = $1 AND workspace_id = $2",
+                token_job,
+                w_id
+            )
+            .fetch_optional(db)
+            .await?
+            {
+                let ancestors = [
+                    lineage.parent_job,
+                    lineage.root_job,
+                    lineage.flow_innermost_root_job,
+                ];
+                referenced.retain(|id| !ancestors.contains(&Some(*id)));
+            }
+        }
+    }
+    if referenced.is_empty() {
+        return Ok(referenced);
+    }
+    let restricted_job_token = authed.job_id.is_some() && authed.scopes.is_some();
+    let in_workspace = if authed.is_admin && !restricted_job_token {
+        sqlx::query_scalar!(
+            "SELECT id FROM v2_job WHERE id = ANY($1) AND workspace_id = $2",
+            &referenced,
+            w_id,
+        )
+        .fetch_all(db)
+        .await?
+    } else {
+        vec![]
+    };
+    referenced.retain(|id| !in_workspace.contains(id));
+    Ok(referenced)
+}
+
+/// `WM_END_USER_EMAIL` of a run started through a `/jobs/run*` route. `WM_EMAIL` names the
+/// runnable's `on_behalf_of` identity when it has one, so this is the only place the caller's
+/// address reaches the job. A job's own `WM_TOKEN` passes on the end user of that job, and a run
+/// a trigger fired has no end user.
+pub async fn run_end_user_email(
+    db: &DB,
+    w_id: &str,
+    authed: &ApiAuthed,
+    trigger: Option<&TriggerMetadata>,
+) -> error::Result<Option<String>> {
+    if trigger.is_some() {
+        return Ok(None);
+    }
+    match authed.job_id {
+        Some(job_id) => Ok(windmill_common::auth::get_job_perms(db, &job_id, w_id)
+            .await?
+            .and_then(|p| p.end_user_email)),
+        None => Ok(Some(authed.email.clone())),
+    }
+}
+
+/// [`run_end_user_email`] of an inline run of the caller's own code, and whether its data table
+/// connections are made as that end user: they are when the calling job's are, since the code is
+/// that job's own.
+pub async fn run_inline_preview_end_user(
+    db: &DB,
+    w_id: &str,
+    authed: &ApiAuthed,
+) -> error::Result<(Option<String>, bool)> {
+    match authed.job_id {
+        Some(job_id) => Ok(windmill_common::auth::get_job_perms(db, &job_id, w_id)
+            .await?
+            .map_or((None, false), |p| (p.end_user_email, p.viewer_data_access))),
+        None => Ok((Some(authed.email.clone()), false)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cancel jobs
+// ---------------------------------------------------------------------------
+
+pub async fn cancel_jobs(
+    jobs: Vec<Uuid>,
+    db: &DB,
+    author: &(impl AuditAuthorable + Sync),
+    w_id: &str,
+    force_cancel: bool,
+) -> error::JsonResult<Vec<Uuid>> {
+    let username = author.username();
+    let mut uuids = vec![];
+    // A job that completed before its turn is reported back like the others but was not
+    // cancelled, so it gets no audit entry.
+    let mut audited = vec![];
+    tracing::info!("Cancelling jobs: {:?}", jobs);
+    let mut tx = db.begin().await?;
+    let trivial_jobs =  sqlx::query!("INSERT INTO v2_job_completed AS cj
+                   ( workspace_id
+                   , id
+                   , duration_ms
+                   , result
+                   , canceled_by
+                   , canceled_reason
+                   , flow_status
+                   , status
+                   , worker
+                )
+                SELECT  q.workspace_id
+                   , q.id
+                   , 0
+                   , $4
+                   , $1
+                   , 'cancel all'
+                   , (SELECT flow_status FROM v2_job_status WHERE id = q.id)
+                   , 'canceled'::job_status
+                   , worker
+        FROM v2_job_queue q
+            JOIN v2_job USING (id)
+        WHERE q.id = any($2) AND running = false AND parent_job IS NULL AND q.workspace_id = $3 AND trigger_kind IS DISTINCT FROM 'schedule'
+            FOR UPDATE SKIP LOCKED
+        ON CONFLICT (id) DO NOTHING RETURNING id AS \"id!\"", username, &jobs, w_id, serde_json::json!({"error": { "message": format!("Job canceled: cancel all by {username}"), "name": "Canceled", "reason": "cancel all", "canceler": username}}))
+        .fetch_all(&mut *tx)
+        .await?.into_iter().map(|x| x.id).collect::<Vec<Uuid>>();
+
+    sqlx::query!(
+        "DELETE FROM v2_job_queue WHERE id = any($1) AND workspace_id = $2",
+        &trivial_jobs,
+        w_id
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    for job_id in jobs.into_iter() {
+        if trivial_jobs.contains(&job_id) {
+            continue;
+        }
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), async move {
+            let tx = db.begin().await?;
+            let (tx, cancelled) = cancel_job(
+                username,
+                None,
+                job_id.clone(),
+                w_id,
+                tx,
+                db,
+                force_cancel,
+                false,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok::<_, anyhow::Error>(cancelled)
+        })
+        .await
+        {
+            Ok(result) => match result {
+                Ok(cancelled) => {
+                    uuids.push(job_id);
+                    audited.extend(cancelled);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to cancel job {:?}: {:?}", job_id, e);
+                }
+            },
+            Err(_) => {
+                tracing::error!(
+                    "Timeout while trying to cancel job {:?} after 5 seconds",
+                    job_id
+                );
+            }
+        }
+    }
+
+    audited.extend(trivial_jobs.iter().copied());
+    uuids.extend(trivial_jobs);
+
+    // The cancels are committed by now: failing here would report them as not done.
+    if let Err(e) = audit_log_many(
+        db,
+        author,
+        if force_cancel {
+            "jobs.force_cancel"
+        } else {
+            "jobs.cancel"
+        },
+        ActionKind::Delete,
+        w_id,
+        &audited.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+    )
+    .await
+    {
+        tracing::error!("Failed to write audit entries for cancelled jobs in {w_id}: {e:#}");
+    }
+
+    Ok(Json(uuids))
+}
+
+// ---------------------------------------------------------------------------
+// Wait-for-result infrastructure
+// ---------------------------------------------------------------------------
+
+struct Guard {
+    done: bool,
+    id: Uuid,
+    w_id: String,
+    db: DB,
+    username: String,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if !&self.done {
+            let id = self.id;
+            let w_id = self.w_id.clone();
+            let db = self.db.clone();
+            let username = self.username.clone();
+
+            tracing::info!("http connection broke, marking job {id} as canceled");
+            tokio::spawn(async move {
+                let cancel_f = async {
+                    let tx = db.begin().await?;
+                    let (tx, _) = cancel_job(
+                        &username,
+                        Some("http connection broke".to_string()),
+                        id,
+                        &w_id,
+                        tx,
+                        &db,
+                        false,
+                        false,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok::<_, anyhow::Error>(())
+                };
+
+                if let Err(e) = cancel_f.await {
+                    tracing::error!(
+                        "Error marking job as canceled after http connection broke: {e}"
+                    );
+                }
+            });
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    pub static ref TIMEOUT_WAIT_RESULT: Arc<RwLock<Option<u64>>> = Arc::new(RwLock::new(
+        std::env::var("TIMEOUT_WAIT_RESULT")
+            .ok()
+            .and_then(|x| x.parse::<u64>().ok())
+    ));
+
+    pub static ref QUEUE_LIMIT_WAIT_RESULT: Option<i64> = std::env::var("QUEUE_LIMIT_WAIT_RESULT")
+        .ok()
+        .and_then(|x| x.parse().ok());
+
+    pub static ref WAIT_RESULT_FAST_POLL_INTERVAL_MS: u64 = std::env::var("WAIT_RESULT_FAST_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(50);
+
+    pub static ref WAIT_RESULT_FAST_POLL_DURATION_SECS: u16 = std::env::var("WAIT_RESULT_FAST_POLL_DURATION_SECS")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(2);
+
+    pub static ref WAIT_RESULT_SLOW_POLL_INTERVAL_MS: u64 = std::env::var("WAIT_RESULT_SLOW_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(200);
+}
+
+#[derive(Deserialize)]
+pub struct WindmillCompositeResult {
+    #[serde(alias = "wm_status_code")]
+    windmill_status_code: Option<u16>,
+    #[serde(alias = "wm_content_type")]
+    windmill_content_type: Option<String>,
+    #[serde(alias = "wm_headers")]
+    windmill_headers: Option<HashMap<String, String>>,
+    #[serde(alias = "wm_content_transfer_encoding")]
+    windmill_content_transfer_encoding: Option<String>,
+    result: Option<Box<RawValue>>,
+}
+
+pub async fn run_wait_result_internal(
+    db: &DB,
+    uuid: Uuid,
+    w_id: &str,
+    node_id_for_empty_return: Option<String>,
+    has_failure_module: bool,
+    username: &str,
+) -> error::Result<(Box<RawValue>, bool)> {
+    let mut result = None;
+    let mut success = false;
+    let timeout = TIMEOUT_WAIT_RESULT.read().await.clone().unwrap_or(600);
+    let timeout_ms = if timeout <= 0 {
+        2000
+    } else {
+        (timeout * 1000) as u64
+    };
+
+    let mut g = Guard {
+        done: false,
+        id: uuid,
+        w_id: w_id.to_string(),
+        db: db.clone(),
+        username: username.to_string(),
+    };
+
+    let fast_poll_duration = *WAIT_RESULT_FAST_POLL_DURATION_SECS as u64 * 1000;
+    let mut accumulated_delay = 0 as u64;
+    // Once we observe the early_return node failed with a failure_module configured,
+    // its result is final — no need to re-query it on every poll.
+    let mut early_return_failed_and_suppressed = false;
+
+    loop {
+        if let Some(node_id_for_empty_return) = node_id_for_empty_return
+            .as_ref()
+            .filter(|_| !early_return_failed_and_suppressed)
+        {
+            let result_and_success = get_result_and_success_by_id_from_flow(
+                &db,
+                w_id,
+                &uuid,
+                node_id_for_empty_return,
+                None,
+            )
+            .await
+            .ok();
+            if let Some((r, s)) = result_and_success {
+                // When the early_return node failed but the flow has a failure_module,
+                // the error handler will run and may recover. Skip this result and let
+                // the loop fall through to the completed flow result below, which is
+                // the failure_module's output.
+                if has_failure_module && !s {
+                    early_return_failed_and_suppressed = true;
+                } else {
+                    result = Some(r);
+                    success = s;
+                }
+            }
+        }
+
+        if result.is_none() {
+            let row = sqlx::query!(
+                "
+                    SELECT
+                        result AS \"result: sqlx::types::Json<Box<RawValue>>\",
+                        result_columns,
+                        status = 'success' AS \"success!\"
+                    FROM
+                        v2_job_completed
+                    WHERE
+                        id = $1 AND
+                        workspace_id = $2
+                    ",
+                uuid,
+                &w_id
+            )
+            .fetch_optional(db)
+            .await?;
+            if let Some(mut raw_result) = row {
+                format_result(
+                    raw_result.result_columns.as_ref(),
+                    raw_result.result.as_mut(),
+                );
+                result = raw_result.result.map(|x| x.0);
+                success = raw_result.success;
+            }
+        }
+
+        if result.is_some() {
+            break;
+        }
+
+        let delay = if accumulated_delay <= fast_poll_duration {
+            *WAIT_RESULT_FAST_POLL_INTERVAL_MS
+        } else {
+            *WAIT_RESULT_SLOW_POLL_INTERVAL_MS
+        };
+        accumulated_delay += delay;
+        if accumulated_delay > timeout_ms {
+            break;
+        };
+        tokio::time::sleep(core::time::Duration::from_millis(delay)).await;
+    }
+
+    if let Some(result) = result {
+        g.done = true;
+        Ok((result, success))
+    } else {
+        Err(Error::ExecutionErr(format!("timeout after {}s", timeout)))
+    }
+}
+
+pub fn result_to_response(result: Box<RawValue>, success: bool) -> error::Result<Response> {
+    let composite_result = parse_result_object::<WindmillCompositeResult>(result.get());
+    match composite_result {
+        Some(WindmillCompositeResult {
+            windmill_status_code,
+            windmill_content_type,
+            windmill_headers,
+            windmill_content_transfer_encoding,
+            result: result_value,
+        }) => {
+            if windmill_content_type.is_none()
+                && windmill_status_code.is_none()
+                && windmill_headers.is_none()
+                && windmill_content_transfer_encoding.is_none()
+            {
+                return Ok((
+                    if success {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    },
+                    Json(result),
+                )
+                    .into_response());
+            }
+
+            let status_code_or_default = windmill_status_code
+                .map(|val| match StatusCode::from_u16(val) {
+                    Ok(sc) => Ok(sc),
+                    Err(_) => Err(Error::ExecutionErr("Invalid status code".to_string())),
+                })
+                .unwrap_or_else(|| {
+                    if !success {
+                        Ok(StatusCode::UNPROCESSABLE_ENTITY)
+                    } else if result_value.is_some() {
+                        Ok(StatusCode::OK)
+                    } else {
+                        Ok(StatusCode::NO_CONTENT)
+                    }
+                })?;
+
+            let mut headers = HeaderMap::new();
+
+            // A reverse proxy consumes hop-by-hop headers instead of forwarding them and
+            // drops every header named by `Connection`, so a script could use one to strip
+            // the sandbox headers this function adds before they reach the browser.
+            const HOP_BY_HOP_HEADERS: [&str; 9] = [
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "proxy-connection",
+                "te",
+                "trailer",
+                "transfer-encoding",
+                "upgrade",
+            ];
+
+            if let Some(windmill_headers) = windmill_headers {
+                for (k, v) in windmill_headers {
+                    let k = HeaderName::from_str(k.as_str()).map_err(|err| {
+                        Error::internal_err(format!("Invalid header name {k}: {err}"))
+                    })?;
+                    if HOP_BY_HOP_HEADERS.contains(&k.as_str()) {
+                        return Err(Error::ExecutionErr(format!(
+                            "windmill_headers cannot set the hop-by-hop header \"{k}\""
+                        )));
+                    }
+                    let v = HeaderValue::from_str(v.as_str()).map_err(|err| {
+                        Error::internal_err(format!("Invalid header value {v}: {err}"))
+                    })?;
+                    headers.insert(k, v);
+                }
+            }
+
+            // The script controls the content type and body, and run_wait_result and sync
+            // HTTP routes are reachable by top-level GET navigation with the session cookie:
+            // sandbox the document into an opaque origin so HTML can never run with the
+            // viewer's session. Inserted after `wm_headers` so a script cannot override it.
+            headers.insert(
+                http::header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            headers.insert(
+                http::header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(
+                    "sandbox allow-scripts allow-forms allow-popups \
+                     allow-popups-to-escape-sandbox allow-downloads allow-modals",
+                ),
+            );
+
+            if let Some(content_type) = windmill_content_type {
+                let serialized_json_result = result_value
+                    .map(|val| val.get().to_owned())
+                    .unwrap_or_else(String::new);
+                let parsed_string =
+                    serde_json::from_str::<String>(serialized_json_result.as_str()).ok();
+                let result_is_json_string = parsed_string.is_some();
+                let serialized_result = parsed_string.unwrap_or(serialized_json_result);
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(content_type.as_str()).map_err(|err| {
+                        Error::internal_err(format!("Invalid content type {content_type}: {err}"))
+                    })?,
+                );
+                // Invalid base64 is a hard error, never a silent fallback to the encoded text.
+                match windmill_content_transfer_encoding.as_deref() {
+                    Some("base64") => {
+                        // Only a JSON string carries base64; a number/bool/null/array/object
+                        // must not have its raw JSON text decoded into arbitrary bytes.
+                        if !result_is_json_string {
+                            return Err(Error::ExecutionErr(
+                                "windmill_content_transfer_encoding \"base64\" requires result \
+                                 to be a base64-encoded string"
+                                    .to_string(),
+                            ));
+                        }
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(serialized_result.as_bytes())
+                            .map_err(|err| {
+                                Error::ExecutionErr(format!(
+                                    "windmill_content_transfer_encoding is \"base64\" but the \
+                                     result is not valid base64: {err}"
+                                ))
+                            })?;
+                        return Ok((status_code_or_default, headers, decoded).into_response());
+                    }
+                    Some(other) => {
+                        return Err(Error::ExecutionErr(format!(
+                            "Unsupported windmill_content_transfer_encoding \"{other}\" \
+                             (only \"base64\" is supported)"
+                        )));
+                    }
+                    None => {}
+                }
+                return Ok((status_code_or_default, headers, serialized_result).into_response());
+            }
+            if windmill_content_transfer_encoding.is_some() {
+                return Err(Error::ExecutionErr(
+                    "windmill_content_transfer_encoding requires windmill_content_type to be set"
+                        .to_string(),
+                ));
+            }
+            if let Some(result_value) = result_value {
+                return Ok((status_code_or_default, headers, Json(result_value)).into_response());
+            } else {
+                Ok((status_code_or_default, headers).into_response())
+            }
+        }
+        _ => Ok((
+            if success {
+                StatusCode::OK
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            },
+            Json(result),
+        )
+            .into_response()),
+    }
+}
+
+pub async fn run_wait_result(
+    db: &DB,
+    uuid: Uuid,
+    w_id: &str,
+    node_id_for_empty_return: Option<String>,
+    has_failure_module: bool,
+    username: &str,
+) -> error::Result<Response> {
+    let (result, success) = run_wait_result_internal(
+        db,
+        uuid,
+        w_id,
+        node_id_for_empty_return,
+        has_failure_module,
+        username,
+    )
+    .await?;
+
+    result_to_response(result, success)
+}
+
+// ---------------------------------------------------------------------------
+// Delete job metadata
+// ---------------------------------------------------------------------------
+
+pub async fn delete_job_metadata_after_use(db: &DB, job_uuid: Uuid) -> Result<(), Error> {
+    sqlx::query!(
+        "UPDATE v2_job SET args = '{}'::jsonb WHERE id = $1",
+        job_uuid,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query!(
+        "UPDATE v2_job_completed SET result = '{}'::jsonb WHERE id = $1",
+        job_uuid,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query!(
+        "UPDATE job_logs SET logs = '##DELETED##' WHERE job_id = $1",
+        job_uuid,
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub use windmill_common::jobs::resolve_delete_after_secs;
+pub use windmill_common::jobs::schedule_job_deletion;
+
+/// Handle deletion or scheduling for a completed job.
+pub async fn handle_delete_after_completion(
+    db: &DB,
+    job_uuid: Uuid,
+    w_id: &str,
+    delete_after_use: Option<bool>,
+    delete_after_secs: Option<i32>,
+) -> Result<(), Error> {
+    match resolve_delete_after_secs(delete_after_use, delete_after_secs) {
+        Some(0) => delete_job_metadata_after_use(db, job_uuid).await?,
+        Some(secs) => schedule_job_deletion(db, job_uuid, w_id, secs).await?,
+        None => {}
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Queue limit check
+// ---------------------------------------------------------------------------
+
+pub async fn check_queue_too_long(db: &DB, queue_limit: Option<i64>) -> error::Result<()> {
+    if let Some(limit) = queue_limit {
+        let count = sqlx::query_scalar!(
+                "SELECT COUNT(*) FROM v2_job_queue q WHERE q.canceled_by IS NULL AND (q.scheduled_for <= now()
+            OR (q.suspend_until IS NOT NULL
+                AND (q.suspend <= 0 OR q.suspend_until <= now())))",
+            )
+            .fetch_one(db)
+            .await?
+            .unwrap_or(0);
+
+        if count > queue_limit.unwrap() {
+            return Err(Error::internal_err(format!(
+                "Number of queued job is too high: {count} > {limit}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Flow run helpers
+// ---------------------------------------------------------------------------
+
+pub async fn set_flow_memory_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: Uuid,
+    memory_id: Uuid,
+) -> error::Result<()> {
+    sqlx::query!(
+        "UPDATE v2_job_status
+         SET flow_status = jsonb_set(
+             flow_status,
+             '{memory_id}',
+             to_jsonb($2::uuid)
+         )
+         WHERE id = $1",
+        job_id,
+        memory_id
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn handle_chat_conversation_messages(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    authed: &ApiAuthed,
+    w_id: &str,
+    flow_path: &str,
+    run_query: &RunJobQuery,
+    user_message_raw: Option<&Box<serde_json::value::RawValue>>,
+    job_id: Uuid,
+    is_test: bool,
+    // The run's args, for the files the message carried.
+    args: &HashMap<String, Box<serde_json::value::RawValue>>,
+) -> error::Result<()> {
+    file_chat_turn(
+        tx,
+        &authed.username,
+        authed.is_admin,
+        w_id,
+        flow_path,
+        run_query,
+        user_message_raw,
+        job_id,
+        is_test,
+        args,
+    )
+    .await
+}
+
+/// [`handle_chat_conversation_messages`] for a conversation owned by `owner`, which need not be a
+/// user: an anonymous app visitor's is owned by `ANONYMOUS_CONVERSATION_OWNER`.
+pub async fn file_chat_turn(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner: &str,
+    is_admin: bool,
+    w_id: &str,
+    flow_path: &str,
+    run_query: &RunJobQuery,
+    user_message_raw: Option<&Box<serde_json::value::RawValue>>,
+    job_id: Uuid,
+    is_test: bool,
+    args: &HashMap<String, Box<serde_json::value::RawValue>>,
+) -> error::Result<()> {
+    // Names the query parameter rather than the field: it is not a flow argument, and
+    // supplying it as one is the first thing tried on reading `memory_id is required`.
+    let memory_id = run_query.memory_key(w_id, flow_path).ok_or_else(|| {
+        windmill_common::error::Error::BadRequest(
+            "memory_id is required for chat-enabled flows. Pass it as the `memory_id` query \
+             parameter, not as a flow argument: it names the conversation the turn belongs to, \
+             so a fresh UUID starts one and reusing a UUID continues it."
+                .to_string(),
+        )
+    })?;
+
+    let user_message_raw = user_message_raw.ok_or_else(|| {
+        windmill_common::error::Error::BadRequest(
+            "user_message argument is required for chat-enabled flows".to_string(),
+        )
+    })?;
+
+    let user_message: String = serde_json::from_str(user_message_raw.get()).map_err(|e| {
+        windmill_common::error::Error::BadRequest(format!(
+            "Failed to deserialize user_message: {}",
+            e
+        ))
+    })?;
+
+    windmill_common::flow_conversations::get_or_create_conversation_with_id(
+        tx,
+        w_id,
+        flow_path,
+        owner,
+        is_admin,
+        &user_message,
+        memory_id,
+        is_test,
+    )
+    .await?;
+
+    // The run this message started. The row keeps the files the message carried as
+    // references; its args are the only record of every other flow input, and nothing
+    // written later points at them: an assistant row holds the AI agent step's job.
+    add_message_to_conversation_tx(
+        tx,
+        memory_id,
+        Some(job_id),
+        job_id,
+        &user_message,
+        MessageType::User,
+        None,
+        true,
+        Some(&MessageExtras { attachments: message_attachments(args), ..Default::default() }),
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub async fn run_flow<'c>(
+    authed: &ApiAuthed,
+    db: &DB,
+    tx_o: Option<sqlx::Transaction<'c, sqlx::Postgres>>,
+    user_db: UserDB,
+    w_id: &str,
+    flow_path: &str,
+    flow_version_info: FlowVersionInfo,
+    run_query: RunJobQuery,
+    args: PushArgsOwned,
+    trigger: Option<TriggerMetadata>,
+) -> error::Result<(
+    Uuid,
+    Option<String>,
+    bool,
+    Option<sqlx::Transaction<'c, sqlx::Postgres>>,
+)> {
+    let mut run_query = run_query;
+    drop_unclaimable_run_lineage(db, w_id, &mut run_query, authed).await?;
+    let on_behalf_of = flow_version_info.on_behalf_of(w_id, &db).await?;
+    let FlowVersionInfo {
+        version,
+        tag,
+        dedicated_worker,
+        has_preprocessor,
+        has_failure_module,
+        chat_input_enabled,
+        early_return,
+        labels,
+        job_token_scopes,
+        ..
+    } = flow_version_info;
+
+    let flow_tag = tag;
+    let tag = run_query.tag.clone().or(flow_tag.clone());
+    let push_args = PushArgs { args: &args.args, extra: args.extra };
+    let apply_preprocessor =
+        !run_query.skip_preprocessor.unwrap_or(false) && has_preprocessor.unwrap_or(false);
+
+    if !apply_preprocessor || run_query.tag.is_some() {
+        check_tag_available_for_workspace(&db, &w_id, &tag, &push_args, &authed).await?;
+    }
+    // `push` drops the tag of a flow whose preprocessor runs, and the worker then puts the flow on
+    // its own tag filled in from the preprocessor's output, after this caller's identity is gone.
+    // So that tag is the one to check, and an `$args[...]` in it is judged as written.
+    if apply_preprocessor {
+        if flow_tag.as_deref().is_some_and(tag_reads_args) {
+            check_tag_as_written_available_for_workspace(&db, &w_id, &flow_tag, &authed).await?;
+        } else {
+            check_tag_available_for_workspace(&db, &w_id, &flow_tag, &push_args, &authed).await?;
+        }
+    }
+    let scheduled_for = run_query.get_scheduled_for(&db).await?;
+
+    let return_tx = tx_o.is_some();
+
+    let (email, permissioned_as, push_authed, tx) = if let Some(tx) = tx_o {
+        (
+            &authed.email,
+            username_to_permissioned_as(&authed.username),
+            Some(authed.clone().into()),
+            PushIsolationLevel::Transaction(tx),
+        )
+    } else if let Some(obo) = on_behalf_of.as_ref() {
+        (
+            &obo.email,
+            obo.permissioned_as.clone(),
+            authed.mcp_client.is_some().then(|| authed.clone().into()),
+            PushIsolationLevel::IsolatedRoot(db.clone()),
+        )
+    } else {
+        (
+            &authed.email,
+            username_to_permissioned_as(&authed.username),
+            Some(authed.clone().into()),
+            PushIsolationLevel::Isolated(user_db.clone(), authed.clone().into()),
+        )
+    };
+
+    let end_user_email = run_end_user_email(db, w_id, authed, trigger.as_ref()).await?;
+    let scope_ceiling = windmill_api_auth::caller_scope_ceiling(db, authed).await?;
+    let (uuid, mut tx) = push(
+        &db,
+        tx,
+        &w_id,
+        JobPayload::Flow {
+            path: flow_path.to_string(),
+            dedicated_worker,
+            version,
+            apply_preprocessor,
+            labels,
+            job_token_scopes,
+        },
+        push_args,
+        authed.display_username(),
+        email,
+        permissioned_as,
+        authed.token_prefix.as_deref(),
+        authed.username_override.as_deref(),
+        scheduled_for,
+        None,
+        run_query.parent_job,
+        None,
+        run_query.root_job,
+        run_query.job_id,
+        false,
+        false,
+        None,
+        !run_query.invisible_to_owner.unwrap_or(false),
+        tag,
+        None,
+        None,
+        None,
+        push_authed.as_ref(),
+        false,
+        end_user_email,
+        authed.trigger_or_fallback(trigger),
+        run_query.suspended_mode,
+        scope_ceiling.as_deref(),
+    )
+    .await?;
+
+    // Set memory_id if provided (for agent memory)
+    if let Some(memory_id) = run_query.memory_key(w_id, flow_path) {
+        set_flow_memory_id(&mut tx, uuid, memory_id).await?;
+    }
+
+    // Handle conversation messages for chat-enabled flows
+    if chat_input_enabled.unwrap_or(false) {
+        handle_chat_conversation_messages(
+            &mut tx,
+            &authed,
+            &w_id,
+            &flow_path.to_string(),
+            &run_query,
+            args.args.get("user_message"),
+            uuid,
+            false,
+            &args.args,
+        )
+        .await?;
+    }
+
+    // If we were given a transaction, return it; otherwise commit it
+    if return_tx {
+        Ok((
+            uuid,
+            early_return,
+            has_failure_module.unwrap_or(false),
+            Some(tx),
+        ))
+    } else {
+        tx.commit().await?;
+        Ok((
+            uuid,
+            early_return,
+            has_failure_module.unwrap_or(false),
+            None,
+        ))
+    }
+}
+
+pub async fn run_flow_and_wait_result(
+    authed: &ApiAuthed,
+    db: &DB,
+    user_db: UserDB,
+    w_id: &str,
+    flow_path: &str,
+    flow_version_info: FlowVersionInfo,
+    run_query: RunJobQuery,
+    args: PushArgsOwned,
+    trigger: Option<TriggerMetadata>,
+) -> error::Result<Response> {
+    let (uuid, early_return, has_failure_module, _) = run_flow(
+        authed,
+        db,
+        None,
+        user_db,
+        w_id,
+        flow_path,
+        flow_version_info,
+        run_query,
+        args,
+        trigger,
+    )
+    .await?;
+
+    run_wait_result(
+        &db,
+        uuid,
+        w_id,
+        early_return,
+        has_failure_module,
+        &authed.username,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Push job by path
+// ---------------------------------------------------------------------------
+
+pub async fn push_flow_job_by_path_into_queue<'c>(
+    authed: ApiAuthed,
+    db: DB,
+    tx_o: Option<sqlx::Transaction<'c, sqlx::Postgres>>,
+    user_db: UserDB,
+    w_id: String,
+    flow_path: StripPath,
+    run_query: RunJobQuery,
+    args: PushArgsOwned,
+    trigger: Option<TriggerMetadata>,
+) -> error::Result<(
+    Uuid,
+    Option<String>,
+    bool,
+    Option<sqlx::Transaction<'c, sqlx::Postgres>>,
+)> {
+    let flow_path = flow_path.to_path();
+    check_scopes(&authed, || format!("jobs:run:flows:{flow_path}"))?;
+
+    let userdb_authed = UserDbWithAuthed { db: user_db.clone(), authed: &authed.to_authed_ref() };
+
+    let flow_version_info =
+        get_latest_flow_version_info_for_path(Some(userdb_authed), &db, &w_id, &flow_path, true)
+            .await?;
+
+    run_flow(
+        &authed,
+        &db,
+        tx_o,
+        user_db,
+        &w_id,
+        flow_path,
+        flow_version_info,
+        run_query,
+        args,
+        trigger,
+    )
+    .await
+}
+
+pub async fn push_script_job_by_path_into_queue<'c>(
+    authed: ApiAuthed,
+    db: DB,
+    tx_o: Option<sqlx::Transaction<'c, sqlx::Postgres>>,
+    user_db: UserDB,
+    w_id: String,
+    script_path: StripPath,
+    run_query: RunJobQuery,
+    args: PushArgsOwned,
+    trigger: Option<TriggerMetadata>,
+) -> error::Result<(
+    Uuid,
+    Option<i32>,
+    Option<sqlx::Transaction<'c, sqlx::Postgres>>,
+)> {
+    let script_path = script_path.to_path();
+    check_scopes(&authed, || format!("jobs:run:scripts:{script_path}"))?;
+    let mut run_query = run_query;
+    drop_unclaimable_run_lineage(&db, &w_id, &mut run_query, &authed).await?;
+
+    let userdb_authed = UserDbWithAuthed { db: user_db.clone(), authed: &authed.to_authed_ref() };
+    let (job_payload, tag, delete_after_use, delete_after_secs, timeout, on_behalf_of) =
+        script_path_to_payload(
+            script_path,
+            Some(userdb_authed),
+            db.clone(),
+            &w_id,
+            run_query.skip_preprocessor,
+        )
+        .await?;
+    let resolved_delete_secs = resolve_delete_after_secs(delete_after_use, delete_after_secs);
+    let scheduled_for = run_query.get_scheduled_for(&db).await?;
+
+    let tag = run_query.tag.clone().or(tag);
+    let push_args = PushArgs { args: &args.args, extra: args.extra };
+    check_tag_available_for_workspace(&db, &w_id, &tag, &push_args, &authed).await?;
+    let job_payload = with_run_retry(&run_query, job_payload, &push_args, &tag)?;
+
+    let return_tx = tx_o.is_some();
+
+    let (email, permissioned_as, push_authed, tx) = if let Some(tx) = tx_o {
+        (
+            authed.email.as_str(),
+            username_to_permissioned_as(&authed.username),
+            Some(authed.clone().into()),
+            PushIsolationLevel::Transaction(tx),
+        )
+    } else if let Some(on_behalf_of) = on_behalf_of.as_ref() {
+        (
+            on_behalf_of.email.as_str(),
+            on_behalf_of.permissioned_as.clone(),
+            authed.mcp_client.is_some().then(|| authed.clone().into()),
+            PushIsolationLevel::IsolatedRoot(db.clone()),
+        )
+    } else {
+        (
+            authed.email.as_str(),
+            username_to_permissioned_as(&authed.username),
+            Some(authed.clone().into()),
+            PushIsolationLevel::Isolated(user_db, authed.clone().into()),
+        )
+    };
+
+    let end_user_email = run_end_user_email(&db, &w_id, &authed, trigger.as_ref()).await?;
+    let scope_ceiling = windmill_api_auth::caller_scope_ceiling(&db, &authed).await?;
+    let (uuid, tx) = push(
+        &db,
+        tx,
+        &w_id,
+        job_payload,
+        push_args,
+        authed.display_username(),
+        email,
+        permissioned_as,
+        authed.token_prefix.as_deref(),
+        authed.username_override.as_deref(),
+        scheduled_for,
+        None,
+        run_query.parent_job,
+        None,
+        run_query.root_job,
+        run_query.job_id,
+        false,
+        false,
+        None,
+        !run_query.invisible_to_owner.unwrap_or(false),
+        tag,
+        timeout,
+        None,
+        // If the job has a parent job, set priority to 2 as it may be ran synchronously and block a current worker until being executed. Flow steps have a priority of 1 so this is higher.
+        if run_query.parent_job.is_some() || run_query.root_job.is_some() {
+            Some(2)
+        } else {
+            None
+        },
+        push_authed.as_ref(),
+        false,
+        end_user_email,
+        authed.trigger_or_fallback(trigger),
+        run_query.suspended_mode,
+        scope_ceiling.as_deref(),
+    )
+    .await?;
+
+    // If we were given a transaction, return it; otherwise commit it
+    if return_tx {
+        Ok((uuid, resolved_delete_secs, Some(tx)))
+    } else {
+        tx.commit().await?;
+        Ok((uuid, resolved_delete_secs, None))
+    }
+}
+
+#[cfg(test)]
+mod result_to_response_tests {
+    use super::*;
+
+    fn raw(json: &str) -> Box<RawValue> {
+        serde_json::from_str(json).expect("valid json")
+    }
+
+    async fn body_bytes(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn base64_result_is_decoded_to_raw_bytes() {
+        // 0x00 0x01 0x02 0xFF is not valid UTF-8, so it can only survive as bytes.
+        let bytes = vec![0u8, 1, 2, 255];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let resp = result_to_response(
+            raw(&format!(
+                r#"{{"wm_content_type":"application/pdf","wm_content_transfer_encoding":"base64","result":"{b64}"}}"#
+            )),
+            true,
+        )
+        .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/pdf"
+        );
+        assert_eq!(body_bytes(resp).await, bytes);
+    }
+
+    #[tokio::test]
+    async fn invalid_base64_is_a_hard_error() {
+        let res = result_to_response(
+            raw(
+                r#"{"wm_content_type":"application/pdf","wm_content_transfer_encoding":"base64","result":"not valid base64!!"}"#,
+            ),
+            true,
+        );
+        assert!(res.is_err(), "invalid base64 must not silently fall back");
+    }
+
+    #[tokio::test]
+    async fn base64_mode_rejects_non_string_results() {
+        // A number/bool whose raw JSON text happens to be valid base64 (right length,
+        // base64 alphabet) must not be decoded into bytes — it must be a hard error.
+        for result in ["12345678", "true", "null", "[1,2,3]"] {
+            let res = result_to_response(
+                raw(&format!(
+                    r#"{{"wm_content_type":"application/octet-stream","wm_content_transfer_encoding":"base64","result":{result}}}"#
+                )),
+                true,
+            );
+            assert!(
+                res.is_err(),
+                "base64 mode must reject non-string result: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_transfer_encoding_is_rejected() {
+        let res = result_to_response(
+            raw(
+                r#"{"wm_content_type":"text/plain","wm_content_transfer_encoding":"gzip","result":"x"}"#,
+            ),
+            true,
+        );
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn transfer_encoding_without_content_type_is_rejected() {
+        let res = result_to_response(
+            raw(r#"{"wm_content_transfer_encoding":"base64","result":"aGk="}"#),
+            true,
+        );
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn string_result_is_still_served_verbatim() {
+        // Regression: without a transfer encoding, a string result is sent as-is
+        // (quotes stripped), not base64-decoded.
+        let resp = result_to_response(
+            raw(r#"{"wm_content_type":"text/html","result":"<h1>hi</h1>"}"#),
+            true,
+        )
+        .expect("response");
+
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+        assert_sandboxed(resp.headers());
+        assert_eq!(body_bytes(resp).await, b"<h1>hi</h1>");
+    }
+
+    fn assert_sandboxed(headers: &HeaderMap) {
+        assert_eq!(
+            headers.get(http::header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        let csp = headers
+            .get(http::header::CONTENT_SECURITY_POLICY)
+            .expect("content-security-policy")
+            .to_str()
+            .unwrap();
+        assert!(csp.starts_with("sandbox "), "csp: {csp}");
+        assert!(!csp.contains("allow-same-origin"), "csp: {csp}");
+    }
+
+    #[tokio::test]
+    async fn custom_headers_cannot_override_sandbox() {
+        // wm_headers is script-controlled: a content-type set there replaces the JSON
+        // one even without wm_content_type, and the sandbox headers must survive an
+        // attempt to override them.
+        let resp = result_to_response(
+            raw(
+                r#"{"wm_headers":{"content-type":"text/html","content-security-policy":"default-src *","x-content-type-options":"none"},"result":"<h1>hi</h1>"}"#,
+            ),
+            true,
+        )
+        .expect("response");
+
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+        assert_sandboxed(resp.headers());
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_custom_headers_are_rejected() {
+        // A proxy drops every header named by `Connection`, which would strip the
+        // sandbox headers on the way to the browser.
+        for name in ["connection", "Connection", "transfer-encoding", "upgrade"] {
+            let res = result_to_response(
+                raw(&format!(
+                    r#"{{"wm_content_type":"text/html","wm_headers":{{"{name}":"content-security-policy, x-content-type-options"}},"result":"<h1>hi</h1>"}}"#
+                )),
+                true,
+            );
+            assert!(res.is_err(), "hop-by-hop header must be rejected: {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn array_result_is_not_a_composite_response() {
+        let json = r#"[201,"text/html",null,null,"<h1>hi</h1>"]"#;
+        let resp = result_to_response(raw(json), true).expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, json.as_bytes());
+    }
+}

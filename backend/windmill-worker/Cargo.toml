@@ -1,0 +1,159 @@
+[package]
+name = "windmill-worker"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+name = "windmill_worker"
+path = "src/lib.rs"
+# src/ has no doctests: remove this line before adding one, or cargo test never runs it.
+doctest = false
+
+[features]
+default = []
+mcp = ["windmill-ai/mcp", "dep:windmill-mcp"]
+prometheus = ["dep:prometheus", "windmill-common/prometheus"]
+mssql = ["dep:tiberius"]
+mssql-kerberos = ["mssql", "tiberius/integrated-auth-gssapi"]  # Linux/Unix integrated auth
+mssql-winauth = ["mssql", "tiberius/winauth"]  # Windows integrated auth
+bigquery = ["dep:gcp_auth"]
+snowflake = ["dep:pem", "dep:rsa"]  # pem/rsa: key-pair auth
+benchmark = ["windmill-queue/benchmark", "windmill-common/benchmark"]
+parquet = ["windmill-common/parquet", "windmill-object-store/parquet"]
+flow_testing = []
+failpoints = []
+cloud = ["windmill-queue/cloud", "windmill-common/cloud"]
+sqlx = []
+deno_core = ["dep:windmill-runtime-nativets"]
+libffi_mac = ["dep:libffi-sys"]
+otel = ["windmill-common/otel", "dep:opentelemetry", "dep:tracing-opentelemetry"]
+dind = ["dep:bollard"]
+php = ["dep:windmill-parser-php"]
+mysql = ["dep:mysql_async"]
+oracledb = ["dep:oracle"]
+python = ["dep:windmill-parser-py", "dep:windmill-parser-py-imports", "windmill-dep-map/python"]
+csharp = ["dep:windmill-parser-csharp"]
+rust = ["dep:windmill-parser-rust"]
+nu = ["dep:windmill-parser-nu"]
+java = ["dep:windmill-parser-java"]
+ruby = ["dep:windmill-parser-ruby"]
+rlang = ["dep:windmill-parser-r"]
+duckdb = []
+quickjs = ["windmill-jseval/quickjs", "windmill-queue/quickjs"]
+bedrock = ["windmill-ai/bedrock"]
+
+[dependencies]
+windmill-ai = { workspace = true, default-features = false }
+windmill-queue.workspace = true
+windmill-dep-map.workspace = true
+windmill-audit.workspace = true # there isn't really a reason for audit-worth actions to happen in the worker.
+windmill-common = { workspace = true, default-features = false }
+windmill-types.workspace = true
+windmill-object-store.workspace = true
+windmill-worker-volumes.workspace = true
+windmill-jseval.workspace = true
+windmill-runtime-nativets = { workspace = true, optional = true }
+windmill-mcp = { workspace = true, optional = true }
+windmill-macros.workspace = true
+windmill-parser.workspace = true
+windmill-parser-ts.workspace = true
+windmill-parser-go.workspace = true
+windmill-parser-rust = { workspace = true, optional = true }
+windmill-parser-csharp = { workspace = true, optional = true }
+windmill-parser-nu = { workspace = true, optional = true }
+windmill-parser-java = { workspace = true, optional = true }
+windmill-parser-ruby = { workspace = true, optional = true }
+windmill-parser-r = { workspace = true, optional = true }
+windmill-parser-py = { workspace = true, optional = true }
+windmill-parser-yaml.workspace = true
+windmill-parser-py-imports = { workspace = true, optional = true }
+windmill-parser-bash.workspace = true
+windmill-parser-sql.workspace = true
+windmill-parser-graphql.workspace = true
+windmill-parser-php = { workspace = true, optional = true }
+windmill-git-sync.workspace = true
+flume.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+ulid.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yml.workspace = true
+futures.workspace = true
+async-recursion.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+derive_more.workspace = true
+itertools.workspace = true
+regex.workspace = true
+prometheus = { workspace = true, optional = true }
+lazy_static.workspace = true
+quick_cache.workspace = true
+chrono.workspace = true
+dotenv.workspace = true
+rand.workspace = true # TODO: Remove. only used by token creation hack.
+const_format.workspace = true
+mappable-rc.workspace = true
+git-version.workspace = true
+once_cell.workspace = true
+tokio-postgres.workspace = true
+postgres-protocol.workspace = true
+bit-vec.workspace = true
+url.workspace = true
+async-stream.workspace = true
+
+postgres-native-tls.workspace = true
+native-tls.workspace = true
+mysql_async = { workspace = true, optional = true }
+base64.workspace = true
+gcp_auth = { workspace = true, optional = true }
+rust_decimal.workspace = true
+jsonwebtoken.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+# Reads the dbt engine's `target/index/*.parquet`, which is where column-level
+# lineage lives. Unconditional rather than behind the `parquet` FEATURE: that one
+# is object storage, and a build without it still runs dbt jobs.
+parquet.workspace = true
+pem = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
+urlencoding.workspace = true
+# `user` adds geteuid(2) to verify ownership of the ansible socket-dir root
+nix = { workspace = true, features = ["user"] }
+# Cross-platform advisory file lock (flock on unix, LockFileEx on windows) for the
+# cross-process Python install lock into shared wheel-cache dirs.
+fs4 = { workspace = true }
+bytes.workspace = true
+reqwest.workspace = true
+reqwest-middleware.workspace = true
+eventsource-stream.workspace = true
+mime_guess.workspace = true
+hex.workspace = true
+tiberius = { workspace = true, optional = true }
+tar.workspace = true
+flate2.workspace = true
+convert_case.workspace = true
+yaml-rust.workspace = true
+backon.workspace = true
+pep440_rs.workspace = true
+process-wrap.workspace = true
+async-once-cell.workspace = true
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+axum.workspace = true
+bollard = { workspace = true, optional = true }
+oracle = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+x509-parser.workspace = true
+
+[build-dependencies]
+libffi-sys = { workspace = true, optional = true }

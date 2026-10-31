@@ -1,0 +1,169 @@
+/*
+ * Author: Ruben Fiszel
+ * Copyright: Windmill Labs, Inc 2022
+ * This file and its contents are licensed under the AGPLv3 License.
+ * Please see the included NOTICE for copyright information and
+ * LICENSE-AGPL for a copy of the license.
+ */
+
+use std::sync::atomic::AtomicBool;
+
+use serde_json::{from_value, Value};
+
+use crate::{error, scripts::ScriptLang};
+
+pub use windmill_types::apps::*;
+
+lazy_static::lazy_static! {
+    pub static ref APP_WORKSPACED_ROUTE: AtomicBool = AtomicBool::new(false);
+}
+
+/// Whether the app value carries an `inlineScript` anywhere.
+///
+/// Deliberately not built on [`traverse_app_inline_scripts`], which only reports a script whose
+/// `language` parses and stops descending as soon as it sees an `inlineScript` key. That is right
+/// for locking (nothing to lock without a language) and wrong for an authorization check, where
+/// the author picks the fields: this refuses the key itself, whatever it contains.
+pub fn app_value_has_inline_script(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key("inlineScript") || object.values().any(app_value_has_inline_script)
+        }
+        Value::Array(array) => array.iter().any(app_value_has_inline_script),
+        _ => false,
+    }
+}
+
+/// What a path runnable of an app runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AppRunnableKind {
+    Script,
+    Flow,
+    /// A saved AI agent (an `ai_agent` resource), run as one chat turn.
+    Agent,
+}
+
+/// Every workspace runnable the app value points a component at, as `(kind, path)`.
+///
+/// This is what the deployed bundle actually asks `execute_component` to run: it resolves a
+/// `runnable_id` against the stored `runnables` and sends `{runType}/{path}`. The policy's
+/// triggerables are a separate surface, so both have to be authorized. Anything not plain text
+/// is refused, never skipped: the editor compares `type` loosely (`["path"] == "path"`) and
+/// interpolates `path` (`["u/x"]` → `u/x`), so a skipped entry still runs.
+pub fn app_value_runnable_paths(value: &Value) -> error::Result<Vec<(AppRunnableKind, String)>> {
+    let bad = |msg: String| error::Error::BadRequest(msg);
+    let runnables = match value.get("runnables") {
+        None | Some(Value::Null) => return Ok(vec![]),
+        Some(Value::Object(runnables)) => runnables,
+        Some(_) => return Err(bad("App runnables must be an object".to_string())),
+    };
+    let mut out = Vec::new();
+    for (id, runnable) in runnables {
+        let Value::Object(runnable) = runnable else {
+            return Err(bad(format!("Runnable {id} must be an object")));
+        };
+        match runnable.get("type") {
+            Some(Value::String(t)) if t == "runnableByPath" || t == "path" => {}
+            None | Some(Value::String(_)) => continue,
+            Some(_) => return Err(bad(format!("Runnable {id} has a non-text type"))),
+        }
+        let Some(Value::String(path)) = runnable.get("path") else {
+            return Err(bad(format!("Runnable {id} must name its path as text")));
+        };
+        let kind = match runnable.get("runType") {
+            Some(Value::String(t)) if t == "flow" => AppRunnableKind::Flow,
+            Some(Value::String(t)) if t == "script" || t == "hubscript" => AppRunnableKind::Script,
+            Some(Value::String(t)) if t == "agent" => AppRunnableKind::Agent,
+            _ => return Err(bad(format!("Unsupported runType for runnable {path}"))),
+        };
+        out.push((kind, path.clone()));
+    }
+    Ok(out)
+}
+
+pub const RAW_APP_RUNNABLES: &str = "runnables";
+
+/// The `runnables` map of a raw app, when `value` is it. An inline script's dependency-map node
+/// id is its closest enclosing component `id`; raw app runnables carry none, so each is keyed by
+/// its name in this map instead, or a relock could not tell them apart.
+pub fn raw_app_runnables_map<'a>(
+    key: &str,
+    value: &'a Value,
+    container_id: Option<&String>,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    match value {
+        Value::Object(runnables) if container_id.is_none() && key == RAW_APP_RUNNABLES => {
+            Some(runnables)
+        }
+        _ => None,
+    }
+}
+
+/// Traverse FlowValue while invoking provided by caller callback on leafs
+// #[async_recursion::async_recursion(?Send)]
+pub fn traverse_app_inline_scripts<
+    C: FnMut(AppInlineScript, Option<String>) -> error::Result<()>,
+>(
+    value: &Value,
+    // Set to None.
+    container_id: Option<String>,
+    cb: &mut C,
+) -> error::Result<()> {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Object(script)) = object.get("inlineScript") {
+                let (language, lock, code) = (
+                    script
+                        .get("language")
+                        .cloned()
+                        .map(|v| from_value::<ScriptLang>(v).ok())
+                        .flatten(),
+                    script
+                        .get("lock")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    script
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or(error::Error::internal_err(
+                            "Missing `content` in inlineScript".to_string(),
+                        ))?,
+                );
+                if language.is_some() {
+                    cb(
+                        AppInlineScript { language, content: code.to_owned(), lock },
+                        container_id.clone(),
+                    )?;
+                }
+            } else {
+                for (key, value) in object {
+                    if let Some(runnables) =
+                        raw_app_runnables_map(key, value, container_id.as_ref())
+                    {
+                        for (id, runnable) in runnables {
+                            traverse_app_inline_scripts(runnable, Some(id.clone()), cb)?;
+                        }
+                        continue;
+                    }
+                    traverse_app_inline_scripts(
+                        value,
+                        object
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .or(container_id.clone()),
+                        cb,
+                    )?;
+                }
+            }
+        }
+        Value::Array(array) => {
+            for value in array {
+                traverse_app_inline_scripts(value, container_id.clone(), cb)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}

@@ -1,0 +1,126 @@
+/*
+ * Author: Ruben Fiszel
+ * Copyright: Windmill Labs, Inc 2022
+ * This file and its contents are licensed under the AGPLv3 License.
+ * Please see the included NOTICE for copyright information and
+ * LICENSE-AGPL for a copy of the license.
+ */
+
+use crate::{jobs::QueuedJob, utils::Mode};
+use uuid::Uuid;
+
+pub fn set_span_parent(_span: &tracing::Span, _rj: &Uuid) {}
+
+pub(crate) type OtelProvider = Option<()>;
+
+#[cfg(not(feature = "otel"))]
+pub fn otel_ctx() -> () {}
+
+#[cfg(feature = "otel")]
+#[inline(always)]
+pub fn otel_ctx() -> opentelemetry::Context {
+    opentelemetry::Context::current()
+}
+
+#[cfg(not(feature = "otel"))]
+impl<T: Sized> FutureExt for T {}
+
+#[cfg(not(feature = "otel"))]
+pub trait FutureExt: Sized {
+    fn with_context(self, _otel_cx: ()) -> Self {
+        self
+    }
+}
+
+use tracing_subscriber::EnvFilter;
+
+pub(crate) fn init_logs_bridge(_mode: &Mode, _hostname: &str, _env: &str) -> Option<EnvFilter> {
+    None
+}
+
+pub(crate) fn init_logs_bridge_for_service(
+    _service: &str,
+    _hostname: &str,
+    _env: &str,
+) -> Option<EnvFilter> {
+    None
+}
+
+pub async fn flush_otel_logs() {}
+
+pub(crate) fn init_meter_provider(_mode: &Mode, _hostname: &str, _env: &str) -> OtelProvider {
+    None
+}
+
+pub fn add_root_flow_job_to_otlp(_queued_job: &QueuedJob, _success: bool) {}
+
+// ── OTel metric recording stubs (OSS) ───────────────────────────────────────
+
+pub fn otel_incr_queue_push_count() {}
+
+pub fn otel_incr_oidc_signature_count(_caller: &'static str) {}
+
+pub fn otel_incr_queue_delete_count() {}
+
+pub fn otel_incr_queue_pull_count() {}
+
+pub fn otel_incr_zombie_restart_count(_count: u64) {}
+
+pub fn otel_incr_zombie_delete_count(_count: u64) {}
+
+pub fn otel_set_queue_count(_tag: &str, _count: i64) {}
+
+pub fn otel_set_queue_delay(_tag: &str, _delay_secs: f64) {}
+
+pub fn otel_set_queue_running_count(_tag: &str, _count: i64) {}
+
+pub fn otel_incr_worker_execution_count(_tag: &str) {}
+
+pub fn otel_record_worker_execution_duration(_tag: &str, _secs: f64) {}
+
+pub fn otel_set_worker_busy(_worker: &str, _busy: i64) {}
+
+pub fn otel_record_worker_pull_duration(_worker: &str, _has_job: bool, _secs: f64) {}
+
+pub fn otel_incr_worker_execution_failed(_tag: &str) {}
+
+pub fn otel_set_db_pool(_active: i64, _idle: i64, _max: i64) {}
+
+pub fn otel_set_health_db_latency(_ms: f64) {}
+
+pub fn otel_incr_worker_started() {}
+
+pub fn otel_set_worker_uptime(_worker: &str, _secs: f64) {}
+
+pub fn otel_set_health_status_phase(_phase: &str) {}
+
+pub fn otel_set_health_db_unresponsive(_unresponsive: bool) {}
+
+pub fn otel_set_worker_memory(
+    _worker: &str,
+    _worker_group: &str,
+    _usage: Option<i64>,
+    _windmill_usage: Option<i64>,
+    _limit: Option<i64>,
+) {
+}
+
+pub fn otel_add_worker_cpu(
+    _worker: &str,
+    _worker_group: &str,
+    _usage_secs: f64,
+    _periods: u64,
+    _throttled_periods: u64,
+    _throttled_secs: f64,
+) {
+}
+
+pub fn otel_set_worker_occupancy_rate(
+    _worker: &str,
+    _worker_group: &str,
+    _window: &'static str,
+    _rate: f64,
+) {
+}
+
+pub fn otel_record_job_memory_peak(_tag: &str, _bytes: u64) {}

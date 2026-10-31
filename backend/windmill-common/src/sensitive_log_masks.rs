@@ -1,0 +1,440 @@
+//! In-memory store for masking sensitive values (secrets, password args) in job logs.
+//!
+//! Workers run an embedded server in the same process, so we use global state to track:
+//! - Which jobs are currently running
+//! - Which secret values each job should mask in its stdout
+//!
+//! When a secret is fetched via `get_value_internal` (embedded server handler), we don't know
+//! which job triggered the request (auth is user-based, not job-based), so we register the
+//! secret for ALL currently running jobs on this worker process.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
+use uuid::Uuid;
+
+/// Minimum length for a secret to be registered for masking.
+/// Short strings (e.g. "true", "1234") would cause too many false positives.
+const MIN_SECRET_LENGTH: usize = 8;
+
+const MASKED_NOTICE: &str =
+    "[windmill] secret value was masked for security reasons, use string transformations to display full value";
+
+/// The secrets registered for one job, plus the automaton compiled from them.
+#[derive(Default)]
+struct JobMasks {
+    secrets: HashSet<String>,
+    /// Built on the first `snapshot` after a change and shared by every later
+    /// snapshot. Every job registers at least its own token, so without this
+    /// cache each log batch of each job would rebuild the automaton.
+    compiled: Option<Arc<CompiledMasks>>,
+}
+
+/// Aho-Corasick automaton for O(m) multi-pattern matching in a single pass,
+/// regardless of the number of secrets registered, with the replacement
+/// strings indexed to match the automaton's pattern order.
+struct CompiledMasks {
+    ac: aho_corasick::AhoCorasick,
+    replacements: Vec<String>,
+}
+
+lazy_static::lazy_static! {
+    /// Map of job_id -> secret values that should be masked in that job's logs.
+    static ref SENSITIVE_MASKS: RwLock<HashMap<Uuid, JobMasks>> =
+        RwLock::new(HashMap::new());
+
+    /// Set of currently running job IDs on this worker process.
+    static ref RUNNING_JOBS: RwLock<HashSet<Uuid>> =
+        RwLock::new(HashSet::new());
+
+}
+
+/// A lock-free snapshot of secrets for a job, taken once per log batch.
+pub struct MaskSnapshot {
+    compiled: Arc<CompiledMasks>,
+    /// Whether the security notice has already been appended for this snapshot.
+    /// Tracked locally to avoid a global write lock on every masked line.
+    notice_shown: std::cell::Cell<bool>,
+}
+
+impl MaskSnapshot {
+    /// Mask all secrets in `text`. Returns `Cow::Borrowed` when no match (zero allocation).
+    /// The Aho-Corasick scan is O(text_len) regardless of how many secrets are registered.
+    pub fn mask<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if text.is_empty() {
+            return Cow::Borrowed(text);
+        }
+
+        // Single-pass check + replace using the pre-built automaton
+        if !self.compiled.ac.is_match(text) {
+            return Cow::Borrowed(text);
+        }
+
+        let mut result = self
+            .compiled
+            .ac
+            .replace_all(text, &self.compiled.replacements);
+
+        // Append the notice only once per snapshot (i.e. per batch), as its own line.
+        // Callers pass either a bare line (`handle_child`) or a chunk that already ends
+        // in a newline (nativets), and the sinks concatenate what they get verbatim:
+        // assuming either shape welds the notice onto a neighbouring line.
+        if !self.notice_shown.get() {
+            self.notice_shown.set(true);
+            if result.ends_with('\n') {
+                result.push_str(MASKED_NOTICE);
+                result.push('\n');
+            } else {
+                result.push('\n');
+                result.push_str(MASKED_NOTICE);
+            }
+        }
+
+        Cow::Owned(result)
+    }
+}
+
+/// A masker for sinks that mask line by line rather than in batches, like nativets
+/// masking each `console.log` chunk as V8 produces it. `snapshot` per line would
+/// re-arm the security notice on every one; this keeps it to once per distinct set
+/// of secrets while still picking up secrets registered mid-run.
+///
+/// Masks by job id alone — the caller is the one that knows the text it passes
+/// belongs to that job.
+pub struct JobMasker {
+    job_id: Uuid,
+    snapshot: Option<MaskSnapshot>,
+}
+
+impl JobMasker {
+    pub fn new(job_id: Uuid) -> Self {
+        JobMasker { job_id, snapshot: snapshot(&job_id) }
+    }
+
+    /// Mask every secret registered for the job. Returns `Cow::Borrowed` when no match.
+    /// Falls back to the masks it last saw once the job is unregistered, so a sink
+    /// still draining past the end of a run does not start emitting secrets.
+    pub fn mask<'a>(&mut self, text: &'a str) -> Cow<'a, str> {
+        if let Some(fresh) = snapshot(&self.job_id) {
+            // Replacing an equivalent snapshot would re-arm the notice, so only take
+            // one built from a secret set we have not seen.
+            let unchanged = self
+                .snapshot
+                .as_ref()
+                .is_some_and(|cur| Arc::ptr_eq(&cur.compiled, &fresh.compiled));
+            if !unchanged {
+                self.snapshot = Some(fresh);
+            }
+        }
+        match self.snapshot.as_ref() {
+            Some(snapshot) => snapshot.mask(text),
+            None => Cow::Borrowed(text),
+        }
+    }
+}
+
+/// Take a snapshot of the current secrets for a job. Returns `None` if no secrets
+/// are registered (the caller can then skip masking entirely for the whole batch).
+///
+/// Call this once per log batch in `write_lines`, not per line.
+pub fn snapshot(job_id: &Uuid) -> Option<MaskSnapshot> {
+    {
+        let masks = SENSITIVE_MASKS.read().unwrap_or_else(|e| e.into_inner());
+        let job = masks.get(job_id)?;
+        if job.secrets.is_empty() {
+            return None;
+        }
+        if let Some(compiled) = job.compiled.as_ref() {
+            return Some(MaskSnapshot {
+                compiled: compiled.clone(),
+                notice_shown: std::cell::Cell::new(false),
+            });
+        }
+    }
+
+    let mut masks = SENSITIVE_MASKS.write().unwrap_or_else(|e| e.into_inner());
+    let job = masks.get_mut(job_id)?;
+    if job.secrets.is_empty() {
+        return None;
+    }
+    let compiled = job
+        .compiled
+        .get_or_insert_with(|| Arc::new(compile(&job.secrets)));
+    Some(MaskSnapshot { compiled: compiled.clone(), notice_shown: std::cell::Cell::new(false) })
+}
+
+fn compile(secrets: &HashSet<String>) -> CompiledMasks {
+    // Sort longest-first so longer secrets are matched before shorter substrings
+    let mut sorted: Vec<&String> = secrets.iter().collect();
+    sorted.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    let replacements: Vec<String> = sorted
+        .iter()
+        .map(|s| {
+            let char_count = s.chars().count();
+            if char_count > 20 {
+                let prefix: String = s.chars().take(3).collect();
+                let suffix: String = s.chars().skip(char_count - 3).collect();
+                format!("{}*****{}", prefix, suffix)
+            } else {
+                let first: String = s.chars().take(1).collect();
+                let last: String = s.chars().skip(char_count - 1).collect();
+                format!("{}*****{}", first, last)
+            }
+        })
+        .collect();
+
+    // Built once per job (its token is always a secret) and searched over little log text, so
+    // the default DFA's build cost dominates; a contiguous NFA searches as fast here since
+    // the literal prefilter does the scanning.
+    let ac = aho_corasick::AhoCorasickBuilder::new()
+        .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+        .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+        .build(sorted.iter().map(|s| s.as_str()))
+        .expect("failed to build aho-corasick automaton");
+
+    CompiledMasks { ac, replacements }
+}
+
+/// Register a job as currently running. Call this before `handle_queued_job`.
+pub fn register_running_job(job_id: Uuid) {
+    {
+        let mut jobs = RUNNING_JOBS.write().unwrap_or_else(|e| e.into_inner());
+        jobs.insert(job_id);
+    }
+    {
+        let mut masks = SENSITIVE_MASKS.write().unwrap_or_else(|e| e.into_inner());
+        masks.entry(job_id).or_default();
+    }
+}
+
+/// Unregister a job when it completes. Removes both the running job entry and its mask set.
+pub fn unregister_running_job(job_id: Uuid) {
+    {
+        let mut jobs = RUNNING_JOBS.write().unwrap_or_else(|e| e.into_inner());
+        jobs.remove(&job_id);
+    }
+    {
+        let mut masks = SENSITIVE_MASKS.write().unwrap_or_else(|e| e.into_inner());
+        masks.remove(&job_id);
+    }
+}
+
+/// `secret` and, when it spans several lines, each of them: `handle_child` masks a log
+/// line by line, so a multi-line secret such as a PEM key never matches as a whole. Masks
+/// apply to every running job, so lines any job may print are left out: PEM armor, and the
+/// lines of a JSON document (`"type": "service_account",`).
+fn mask_patterns(secret: &str) -> impl Iterator<Item = &str> {
+    let split = secret.contains('\n') && !secret.trim_start().starts_with(['{', '[']);
+    let lines = split.then(|| {
+        secret
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("-----"))
+    });
+    std::iter::once(secret)
+        .chain(lines.into_iter().flatten())
+        .filter(|s| s.len() >= MIN_SECRET_LENGTH)
+}
+
+fn insert_masks(job: &mut JobMasks, secret: &str) {
+    for pattern in mask_patterns(secret) {
+        if job.secrets.insert(pattern.to_string()) {
+            job.compiled = None;
+        }
+    }
+}
+
+/// Register a secret value for ALL currently running jobs.
+/// Used when a secret is fetched via the embedded server (we don't know which job triggered it).
+pub fn register_secret_for_all_running_jobs(secret: &str) {
+    if secret.len() < MIN_SECRET_LENGTH {
+        return;
+    }
+    let jobs = RUNNING_JOBS.read().unwrap_or_else(|e| e.into_inner());
+    if jobs.is_empty() {
+        return;
+    }
+    let job_ids: Vec<Uuid> = jobs.iter().copied().collect();
+    drop(jobs);
+
+    let mut masks = SENSITIVE_MASKS.write().unwrap_or_else(|e| e.into_inner());
+    for job_id in job_ids {
+        if let Some(job) = masks.get_mut(&job_id) {
+            insert_masks(job, secret);
+        }
+    }
+}
+
+/// Like [`register_secret_for_all_running_jobs`], and when `secret` is a JSON object or
+/// array also each string in it: `$jsonvar:` hands a job the parsed value, which can then
+/// print one field on its own. Only for values whose every field is secret, such as a whole
+/// Vault secret: masks apply to every running job, and a JSON variable's other fields
+/// (`"user": "postgres"`) would mask unrelated logs.
+pub fn register_secret_and_fields_for_all_running_jobs(secret: &str) {
+    register_secret_for_all_running_jobs(secret);
+    for field in json_strings(secret) {
+        register_secret_for_all_running_jobs(&field);
+    }
+}
+
+/// Every string inside `secret` when it is a JSON object or array.
+fn json_strings(secret: &str) -> Vec<String> {
+    fn walk(v: serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s),
+            serde_json::Value::Array(a) => a.into_iter().for_each(|v| walk(v, out)),
+            serde_json::Value::Object(o) => o.into_iter().for_each(|(_, v)| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    if secret.trim_start().starts_with(['{', '[']) {
+        if let Ok(v) = serde_json::from_str(secret) {
+            walk(v, &mut out);
+        }
+    }
+    out
+}
+
+/// Register a secret value for a specific job.
+/// Used for the job's own token and for `$encrypted:` args, where we know the job ID.
+pub fn register_secret_for_job(job_id: Uuid, secret: &str) {
+    if secret.len() < MIN_SECRET_LENGTH {
+        return;
+    }
+    let mut masks = SENSITIVE_MASKS.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(job) = masks.get_mut(&job_id) {
+        insert_masks(job, secret);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compiled automaton is cached per job, so a secret registered after the
+    /// first snapshot only gets masked if the cache is invalidated.
+    #[test]
+    fn snapshot_rebuilds_after_a_new_secret_is_registered() {
+        let job_id = Uuid::new_v4();
+        register_running_job(job_id);
+        register_secret_for_job(job_id, "firstsecretvalue");
+        let _ = snapshot(&job_id)
+            .expect("secret registered")
+            .mask("firstsecretvalue");
+
+        register_secret_for_job(job_id, "secondsecretvalue");
+
+        let snap = snapshot(&job_id).expect("secrets registered");
+        let masked = snap.mask("firstsecretvalue then secondsecretvalue");
+        assert!(!masked.contains("firstsecretvalue"), "{masked}");
+        assert!(!masked.contains("secondsecretvalue"), "{masked}");
+        unregister_running_job(job_id);
+    }
+
+    /// Logs are masked line by line, so a multi-line secret must be masked one line at a time.
+    #[test]
+    fn masks_each_line_of_a_multi_line_secret() {
+        let job_id = Uuid::new_v4();
+        register_running_job(job_id);
+        register_secret_for_job(
+            job_id,
+            "-----BEGIN KEY-----\nfirstlineofkey\nsecondlineofkey\n",
+        );
+        let snap = snapshot(&job_id).expect("secret registered");
+        for line in ["firstlineofkey", "secondlineofkey"] {
+            assert!(!snap.mask(line).contains(line), "{line}");
+        }
+        assert_eq!(snap.mask("-----BEGIN KEY-----"), "-----BEGIN KEY-----");
+        unregister_running_job(job_id);
+    }
+
+    #[test]
+    fn finds_each_string_of_a_whole_secret() {
+        assert_eq!(
+            json_strings(r#"{"a":"secretvalue1","b":["secretvalue2"],"n":12345678}"#),
+            ["secretvalue1", "secretvalue2"]
+        );
+        assert!(json_strings("not json").is_empty());
+    }
+
+    /// A line-by-line sink must not repeat the notice on every line, and must still
+    /// pick up a secret registered after the masker was built.
+    #[test]
+    fn job_masker_notices_once_per_secret_set() {
+        let job_id = Uuid::new_v4();
+        register_running_job(job_id);
+        register_secret_for_job(job_id, "firstsecretvalue");
+        let mut masker = JobMasker::new(job_id);
+
+        let first = masker.mask("saw firstsecretvalue").into_owned();
+        assert!(!first.contains("firstsecretvalue"), "{first}");
+        assert!(first.contains(MASKED_NOTICE), "{first}");
+
+        let second = masker.mask("saw firstsecretvalue again").into_owned();
+        assert!(!second.contains("firstsecretvalue"), "{second}");
+        assert!(!second.contains(MASKED_NOTICE), "{second}");
+
+        register_secret_for_job(job_id, "secondsecretvalue");
+        let third = masker.mask("saw secondsecretvalue").into_owned();
+        assert!(!third.contains("secondsecretvalue"), "{third}");
+        unregister_running_job(job_id);
+    }
+
+    /// Unregistration must not turn masking off under a sink that is still emitting:
+    /// the masker keeps working off the masks it last saw rather than going quiet.
+    #[test]
+    fn job_masker_masks_after_the_job_is_unregistered() {
+        let job_id = Uuid::new_v4();
+        register_running_job(job_id);
+        register_secret_for_job(job_id, "supersecretvalue");
+        let mut masker = JobMasker::new(job_id);
+
+        unregister_running_job(job_id);
+
+        let masked = masker.mask("logged supersecretvalue here");
+        assert!(!masked.contains("supersecretvalue"), "{masked}");
+    }
+
+    /// The notice has to end up on a line of its own for both shapes callers pass:
+    /// a bare line (`handle_child`) and a newline-terminated chunk (nativets). The
+    /// sinks concatenate what they are given verbatim, so getting this wrong welds
+    /// the notice onto whichever line follows it.
+    #[test]
+    fn notice_lands_on_its_own_line_for_both_caller_shapes() {
+        let job_id = Uuid::new_v4();
+        register_running_job(job_id);
+        register_secret_for_job(job_id, "supersecretvalue");
+
+        let line = snapshot(&job_id)
+            .expect("secret registered")
+            .mask("tok supersecretvalue");
+        assert_eq!(line, format!("tok s*****e\n{MASKED_NOTICE}"));
+
+        let chunk = snapshot(&job_id)
+            .expect("secret registered")
+            .mask("tok supersecretvalue\n");
+        assert_eq!(chunk, format!("tok s*****e\n{MASKED_NOTICE}\n"));
+
+        unregister_running_job(job_id);
+    }
+
+    /// A secret containing another must be masked whole (`LeftmostLongest`), or its
+    /// tail leaks; the kept prefix/suffix must be cut by char, or multi-byte secrets panic.
+    #[test]
+    fn overlapping_and_multibyte_secrets_are_masked_whole() {
+        let job_id = Uuid::new_v4();
+        register_running_job(job_id);
+        register_secret_for_job(job_id, "password");
+        register_secret_for_job(job_id, "password-and-more");
+        register_secret_for_job(job_id, "🔑éàü-secret-value-ñ€😀");
+
+        let masked = snapshot(&job_id)
+            .expect("secrets registered")
+            .mask("password-and-more 🔑éàü-secret-value-ñ€😀");
+        assert_eq!(masked, format!("p*****e 🔑éà*****ñ€😀\n{MASKED_NOTICE}"));
+
+        unregister_running_job(job_id);
+    }
+}

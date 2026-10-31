@@ -1,0 +1,28 @@
+[package]
+name = "windmill-jseval"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+name = "windmill_jseval"
+path = "src/lib.rs"
+# src/ has no doctests: remove this line before adding one, or cargo test never runs it.
+doctest = false
+
+[features]
+default = []
+quickjs = ["dep:rquickjs"]
+
+[dependencies]
+windmill-common = { workspace = true, default-features = false }
+rquickjs = { workspace = true, optional = true }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+regex.workspace = true
+lazy_static.workspace = true
+mappable-rc.workspace = true
+futures.workspace = true
+uuid.workspace = true

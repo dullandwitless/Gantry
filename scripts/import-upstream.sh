@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Imports the AGPLv3 backend from an upstream Windmill checkout into this repo,
+# removing every piece of code the upstream LICENSE marks as proprietary
+# (anything gated on the "enterprise"/"private" Cargo features).
+#
+# Usage: scripts/import-upstream.sh <path-to-upstream-checkout>
+#
+# The frontend is deliberately NOT imported: Gantry's UI is a clean-room
+# implementation. Never copy anything from upstream frontend/ into this repo.
+set -euo pipefail
+
+upstream=${1:?usage: $0 <path-to-upstream-checkout>}
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+backend="$repo_root/backend"
+
+# Features whose code is proprietary under upstream's LICENSE.
+disabled_features=(enterprise private enterprise_saml)
+
+# Paths (relative to backend/) not imported:
+not_imported=(
+  # Tooling that only exists to manage the proprietary code.
+  substitute_ee_code.sh
+  write_latest_ee_ref.sh
+  ee-repo-ref.txt
+  check_no_symlink.sh
+  # sqlx's offline query cache holds the SQL text of proprietary queries.
+  # It is regenerated from the stripped sources (scripts/prepare-sqlx.sh).
+  .sqlx
+  # Upstream contributor instructions built around the proprietary workflow.
+  AGENTS.md
+  CLAUDE.md
+  run_until_fail.sh
+  update_sqlx.sh
+  # States that it reproduces queries from the proprietary repository.
+  windmill-queue/tests/native_retry_test.rs
+)
+
+if [[ ! -f "$upstream/LICENSE" || ! -d "$upstream/backend" ]]; then
+  echo "error: $upstream does not look like an upstream checkout" >&2
+  exit 1
+fi
+if find "$upstream/backend" -name '*_ee.rs' -not -path '*/target/*' | grep -q .; then
+  echo "error: upstream contains *_ee.rs files (proprietary); use a clean checkout" >&2
+  exit 1
+fi
+
+commit=$(git -C "$upstream" rev-parse HEAD)
+
+rm -rf "$backend"
+cp -r "$upstream/backend" "$backend"
+rm -rf "$backend/target"
+for path in "${not_imported[@]}"; do rm -rf "${backend:?}/$path"; done
+
+cp "$upstream/openflow.openapi.yaml" "$repo_root/openflow.openapi.yaml"
+
+cargo build --release --quiet --manifest-path "$repo_root/tools/cfg-strip/Cargo.toml"
+strip_args=()
+for f in "${disabled_features[@]}"; do strip_args+=(--disable "$f"); done
+
+# Exits non-zero while anything still needs manual review.
+status=0
+"$repo_root/tools/cfg-strip/target/release/cfg-strip" "${strip_args[@]}" "$backend" || status=$?
+
+echo "$commit" > "$repo_root/UPSTREAM_COMMIT"
+echo "Imported upstream $commit"
+if (( status != 0 )); then
+  echo "Review the locations above, then run scripts/check-no-ee.sh" >&2
+fi
+exit "$status"

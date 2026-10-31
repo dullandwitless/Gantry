@@ -1,0 +1,27 @@
+name: provenance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  no-proprietary-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No proprietary feature gates remain
+        run: scripts/check-no-ee.sh
+
+  cfg-strip:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/cfg-strip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

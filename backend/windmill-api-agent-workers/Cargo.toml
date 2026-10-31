@@ -1,0 +1,36 @@
+[package]
+name = "windmill-api-agent-workers"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+name = "windmill_api_agent_workers"
+path = "src/lib.rs"
+# src/ has no doctests: remove this line before adding one, or cargo test never runs it.
+doctest = false
+
+[features]
+default = []
+python = ["dep:windmill-parser-py-imports"]
+benchmark = ["windmill-queue/benchmark"]
+
+[dependencies]
+windmill-api-auth.workspace = true
+windmill-common = { workspace = true, default-features = false }
+windmill-audit.workspace = true
+windmill-queue.workspace = true
+windmill-worker.workspace = true
+axum.workspace = true
+lazy_static.workspace = true
+chrono.workspace = true
+http.workspace = true
+hyper.workspace = true
+quick_cache.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+windmill-parser-py-imports = { workspace = true, optional = true }

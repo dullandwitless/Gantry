@@ -1,0 +1,19 @@
+[package]
+name = "windmill-parser-nu"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+name = "windmill_parser_nu"
+path = "./src/lib.rs"
+# src/ has no unit tests or doctests: remove both lines before adding one, or cargo test never runs it.
+test = false
+doctest = false
+
+[dependencies]
+windmill-parser.workspace = true
+anyhow.workspace = true
+nu-parser.workspace = true
+wasm-bindgen.workspace = true
+serde_json.workspace = true

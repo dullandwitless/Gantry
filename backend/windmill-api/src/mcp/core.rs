@@ -1,0 +1,905 @@
+//! Windmill MCP Backend implementation
+//!
+//! This module provides the concrete implementation of the McpBackend trait
+//! for the Windmill platform.
+
+use async_trait::async_trait;
+use serde_json::Value;
+use std::collections::HashMap;
+use windmill_common::{db::UserDB, utils::StripPath, DB};
+use windmill_mcp::common::schema::enrich_resource_schemas;
+use windmill_mcp::common::transform::transform_property_keys;
+use windmill_mcp::common::types::{
+    FlowInfo, HubScriptInfo, ResourceInfo, ResourceType, SchemaType, ScriptInfo, WorkspaceInfo,
+};
+use windmill_mcp::server::{
+    BackendResult, CallToolResult, EndpointTool, ErrorData, McpBackend, McpRequest, PathFilter,
+    SessionAccess, Tool,
+};
+
+use crate::auth::AuthCache;
+use crate::db::ApiAuthed;
+use crate::jobs::{
+    run_wait_result_flow_by_path_internal, run_wait_result_script_by_path_internal, RunJobQuery,
+};
+
+use super::auto_generated_endpoints::all_tools;
+use super::session;
+use super::utils::{
+    build_query_string, build_request_body, create_http_request, get_hub_script_schema,
+    get_item_paths, get_item_schema, get_items, get_resources, get_resources_types,
+    get_scripts_from_hub, parse_response_body, prepare_push_args, substitute_path_params,
+};
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
+use windmill_mcp::common::SESSION_SCOPE;
+use windmill_mcp::server::{
+    LocalSessionManager, McpToken, MultiWorkspaceMcp, NoEndpointTools, Runner, SessionRunner,
+    StreamableHttpServerConfig, StreamableHttpService,
+};
+use windmill_mcp::WorkspaceId;
+
+use axum::{
+    extract::{Extension, Path},
+    http::Request,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
+use windmill_common::{
+    auth::hash_token, db::GatewayWorkspaceId, error::JsonResult,
+    global_settings::MCP_DISABLE_TOKEN_QUERY_PARAM,
+};
+
+// McpAuth impl for ApiAuthed is in windmill-api-auth (same crate as the type)
+
+/// Windmill's MCP backend implementation
+#[derive(Clone)]
+pub struct WindmillBackend {
+    pub db: DB,
+    pub user_db: UserDB,
+    pub base_internal_url: String,
+    pub auth_cache: Arc<AuthCache>,
+}
+
+impl WindmillBackend {
+    /// The instructions only read, so they are built at the token's own read-only flag.
+    fn session_ctx<'a>(&'a self, auth: &'a ApiAuthed, w_id: &'a str) -> session::Ctx<'a> {
+        let access = if auth.read_only {
+            SessionAccess::ReadOnly
+        } else {
+            SessionAccess::Full
+        };
+        self.session_ctx_with(auth, w_id, access)
+    }
+
+    fn session_ctx_with<'a>(
+        &'a self,
+        auth: &'a ApiAuthed,
+        w_id: &'a str,
+        access: SessionAccess,
+    ) -> session::Ctx<'a> {
+        session::Ctx {
+            auth,
+            w_id,
+            base_internal_url: &self.base_internal_url,
+            access,
+            origin: None,
+            jwt: Default::default(),
+            view: Default::default(),
+        }
+    }
+
+    pub fn new(
+        db: DB,
+        user_db: UserDB,
+        base_internal_url: String,
+        auth_cache: Arc<AuthCache>,
+    ) -> Self {
+        Self { db, user_db, base_internal_url, auth_cache }
+    }
+}
+
+#[async_trait]
+impl McpBackend for WindmillBackend {
+    type Auth = ApiAuthed;
+
+    async fn after_tool_call(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        tool: &str,
+        refusal: Option<&str>,
+    ) {
+        super::external_idp::audit_tool_call(&self.db, auth, workspace_id, tool, refusal).await;
+    }
+
+    async fn list_scripts(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        favorites_only: bool,
+        path_filter: Option<PathFilter<'_>>,
+    ) -> BackendResult<Vec<ScriptInfo>> {
+        let scope_type = if favorites_only { "favorites" } else { "all" };
+        get_items::<ScriptInfo>(
+            &self.user_db,
+            auth,
+            workspace_id,
+            scope_type,
+            "script",
+            path_filter,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.message, None))
+    }
+
+    async fn list_flows(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        favorites_only: bool,
+        path_filter: Option<PathFilter<'_>>,
+    ) -> BackendResult<Vec<FlowInfo>> {
+        let scope_type = if favorites_only { "favorites" } else { "all" };
+        get_items::<FlowInfo>(
+            &self.user_db,
+            auth,
+            workspace_id,
+            scope_type,
+            "flow",
+            path_filter,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.message, None))
+    }
+
+    async fn list_runnable_paths(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        item_type: &str,
+        favorites_only: bool,
+        path_filter: Option<PathFilter<'_>>,
+    ) -> BackendResult<Vec<String>> {
+        let scope_type = if favorites_only { "favorites" } else { "all" };
+        get_item_paths(
+            &self.user_db,
+            auth,
+            workspace_id,
+            scope_type,
+            item_type,
+            path_filter,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.message, None))
+    }
+
+    async fn list_resource_types(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+    ) -> BackendResult<Vec<ResourceType>> {
+        get_resources_types(&self.user_db, auth, workspace_id)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.message, None))
+    }
+
+    async fn list_resources(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        resource_type: &str,
+    ) -> BackendResult<Vec<ResourceInfo>> {
+        get_resources(&self.user_db, auth, workspace_id, resource_type)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.message, None))
+    }
+
+    async fn list_hub_scripts(
+        &self,
+        app_filter: Option<&str>,
+    ) -> BackendResult<Vec<HubScriptInfo>> {
+        get_scripts_from_hub(&self.db, app_filter)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.message, None))
+    }
+
+    async fn get_item_schema(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        path: &str,
+        item_type: &str,
+    ) -> BackendResult<Option<SchemaType>> {
+        let schema = get_item_schema(path, &self.user_db, auth, workspace_id, item_type)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.message, None))?;
+
+        if let Some(ref s) = schema {
+            match serde_json::from_str::<SchemaType>(s.0.get()) {
+                Ok(val) => Ok(Some(val)),
+                Err(e) => {
+                    tracing::warn!("Failed to parse schema: {}", e);
+                    Ok(None)
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_hub_script_schema(&self, path: &str) -> BackendResult<Option<SchemaType>> {
+        let schema = get_hub_script_schema(path, &self.db)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.message, None))?;
+
+        if let Some(ref s) = schema {
+            match serde_json::from_str::<SchemaType>(s.0.get()) {
+                Ok(val) => Ok(Some(val)),
+                Err(e) => {
+                    tracing::warn!("Failed to parse hub schema: {}", e);
+                    Ok(None)
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn transform_schema_for_resources(
+        &self,
+        schema: &SchemaType,
+        resources_cache: &HashMap<String, Vec<ResourceInfo>>,
+        resources_types: &[ResourceType],
+    ) -> SchemaType {
+        let mut schema_obj = schema.clone();
+
+        // Replace invalid char in property key with underscore
+        transform_property_keys(&mut schema_obj);
+
+        // Enrich every resource reference in the schema — including those
+        // inside `items`, nested `properties`, etc. — with a description
+        // listing the available resources. Both shapes are handled:
+        //   { type: "object", format: "resource-<name>" }   (top-level scalar)
+        //   { type: "resource", resourceType: "<name>" }    (inside list items)
+        for prop_value in schema_obj.properties.values_mut() {
+            enrich_resource_schemas(prop_value, resources_cache, resources_types);
+        }
+
+        schema_obj
+    }
+
+    async fn run_script(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        path: &str,
+        args: Value,
+        request: &McpRequest<'_>,
+    ) -> BackendResult<Value> {
+        windmill_common::feature_usage::log_feature_usage("mcp", "runnable_tool_call", "script");
+        let push_args = prepare_push_args(&self.db, workspace_id, path, false, args, request)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let result = run_wait_result_script_by_path_internal(
+            self.db.clone(),
+            RunJobQuery::default(),
+            StripPath(path.to_string()),
+            auth.clone(),
+            self.user_db.clone(),
+            workspace_id.to_string(),
+            push_args,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        parse_response_body(result).await
+    }
+
+    async fn run_flow(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        path: &str,
+        args: Value,
+        request: &McpRequest<'_>,
+    ) -> BackendResult<Value> {
+        windmill_common::feature_usage::log_feature_usage("mcp", "runnable_tool_call", "flow");
+        let push_args = prepare_push_args(&self.db, workspace_id, path, true, args, request)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let result = run_wait_result_flow_by_path_internal(
+            self.db.clone(),
+            RunJobQuery::default(),
+            StripPath(path.to_string()),
+            auth.clone(),
+            self.user_db.clone(),
+            push_args,
+            workspace_id.to_string(),
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        parse_response_body(result).await
+    }
+
+    async fn call_endpoint(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        endpoint_tool: &EndpointTool,
+        args: Value,
+    ) -> BackendResult<Value> {
+        // Whether the generated endpoint tools are used at all, and which ones.
+        windmill_common::feature_usage::log_feature_usage(
+            "mcp",
+            "endpoint_tool_call",
+            &endpoint_tool.name,
+        );
+        let args_map = match &args {
+            Value::Object(map) => map,
+            _ => {
+                return Err(ErrorData::invalid_params(
+                    "Arguments must be an object",
+                    None,
+                ));
+            }
+        };
+
+        // Build URL with path substitutions
+        let path_template = substitute_path_params(
+            &endpoint_tool.path,
+            workspace_id,
+            args_map,
+            &endpoint_tool.path_params_schema,
+        )?;
+        let query_string = build_query_string(
+            args_map,
+            &endpoint_tool.query_params_schema,
+            &endpoint_tool.query_field_renames,
+        );
+        let full_url = format!(
+            "{}/api{}{}",
+            self.base_internal_url, path_template, query_string
+        );
+
+        // Prepare request body
+        let body_json = build_request_body(endpoint_tool, args_map)?;
+
+        // Create and execute request
+        let response = create_http_request(
+            &endpoint_tool.method,
+            &full_url,
+            workspace_id,
+            auth,
+            body_json,
+        )
+        .await?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            ErrorData::internal_error(format!("Failed to read response text: {}", e), None)
+        })?;
+
+        if status.is_success() {
+            Ok(serde_json::from_str(&response_text)
+                .unwrap_or_else(|_| Value::String(response_text)))
+        } else {
+            Err(ErrorData::internal_error(
+                format!(
+                    "HTTP {} {}: {}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
+                    response_text
+                ),
+                None,
+            ))
+        }
+    }
+
+    async fn list_accessible_workspaces(
+        &self,
+        auth: &ApiAuthed,
+    ) -> BackendResult<Vec<WorkspaceInfo>> {
+        // A superadmin can act in every workspace and often has no explicit `usr`
+        // membership row (matching resolve_workspace_auth, which authorizes any
+        // workspace for a superadmin), so list them all. Everyone else is limited
+        // to the workspaces they are a member of.
+        let workspaces = if auth.is_admin {
+            sqlx::query_as!(
+                WorkspaceInfo,
+                "SELECT id, name FROM workspace WHERE deleted = false ORDER BY name",
+            )
+            .fetch_all(&self.db)
+            .await
+        } else {
+            sqlx::query_as!(
+                WorkspaceInfo,
+                "SELECT workspace.id, workspace.name
+                 FROM workspace
+                 JOIN usr ON usr.workspace_id = workspace.id
+                 WHERE usr.email = $1 AND usr.disabled = false AND workspace.deleted = false
+                 ORDER BY workspace.name",
+                auth.email,
+            )
+            .fetch_all(&self.db)
+            .await
+        };
+
+        workspaces.map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
+
+    async fn resolve_workspace_auth(
+        &self,
+        token: &str,
+        workspace_id: &str,
+    ) -> BackendResult<ApiAuthed> {
+        let authed = self
+            .auth_cache
+            .get_authed(Some(workspace_id.to_string()), token)
+            .await
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "Access denied: token owner is not a member of workspace '{}'",
+                        workspace_id
+                    ),
+                    None,
+                )
+            })?;
+        // Job token scopes never include MCP scopes, so a restricted job token gets none.
+        windmill_api_auth::check_job_token_scope(&authed, || "mcp:all".to_string())
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(authed)
+    }
+
+    async fn runnable_list_fingerprint(&self, workspace_id: &str) -> BackendResult<String> {
+        windmill_common::runnables::runnable_list_fingerprint(&self.db, workspace_id)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
+
+    fn all_endpoint_tools(&self) -> Vec<EndpointTool> {
+        all_tools()
+    }
+
+    async fn session_instructions(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+    ) -> BackendResult<String> {
+        Ok(session::session_instructions(&self.session_ctx(auth, workspace_id)).await)
+    }
+
+    fn generic_session_instructions(&self) -> String {
+        session::generic_session_instructions()
+    }
+
+    async fn workspace_context(&self, auth: &ApiAuthed, workspace_id: &str) -> String {
+        session::workspace_context(&self.session_ctx(auth, workspace_id)).await
+    }
+
+    fn session_tools(&self, access: SessionAccess) -> Vec<Tool> {
+        session::session_tools(access)
+    }
+
+    fn session_views(&self) -> &'static [(&'static str, &'static str)] {
+        session::session_views()
+    }
+
+    async fn call_session_tool(
+        &self,
+        auth: &ApiAuthed,
+        workspace_id: &str,
+        name: &str,
+        args: Value,
+        access: SessionAccess,
+        origin: Option<&str>,
+    ) -> BackendResult<CallToolResult> {
+        let ctx = session::Ctx { origin, ..self.session_ctx_with(auth, workspace_id, access) };
+        session::call_session_tool(&ctx, name, args).await
+    }
+}
+
+/// Set on a request whose token is scoped to a selection of scripts, flows and endpoints
+/// rather than `mcp:all`: on `/api/mcp`, the tools server answers it.
+#[derive(Clone, Copy)]
+pub struct McpSelection;
+
+/// MCP scopes without `mcp:all`: favorites, chosen scripts, flows, endpoints or hub apps.
+fn scoped_to_selection(scopes: &[String]) -> bool {
+    let mut mcp = scopes.iter().filter(|scope| scope.starts_with("mcp:"));
+    mcp.clone().next().is_some() && !mcp.any(|scope| scope == "mcp:all")
+}
+
+/// Whether the tools server's URLs (`/api/mcp/gateway`, `/api/mcp/w/{workspace}/mcp`) serve
+/// a token the session's toolset: an `mcp:all` grant marked `mcp:session`, or narrowed by
+/// `mcp:read_only` / `mcp:read_run`, which the consent page describes as session access.
+/// Every other token there keeps the tools server it was issued for.
+fn serves_session_toolset(scopes: &[String]) -> bool {
+    scopes.iter().any(|scope| scope == "mcp:all")
+        && scopes
+            .iter()
+            .any(|scope| [SESSION_SCOPE, "mcp:read_only", "mcp:read_run"].contains(&scope.as_str()))
+}
+
+/// The path of a workspace-less MCP URL, when it is not the tools server's
+/// `/api/mcp/gateway`: each URL is its own OAuth protected resource.
+#[derive(Clone, Copy)]
+pub struct McpEndpoint(pub &'static str);
+
+/// Extract workspace ID from path and store it in request extensions
+pub async fn extract_and_store_workspace_id(
+    Path(params): Path<String>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let workspace_id = params;
+    request.extensions_mut().insert(WorkspaceId(workspace_id));
+    next.run(request).await
+}
+
+/// RFC 9728 challenge pointing at the endpoint's protected resource metadata. `scope` is what
+/// a client requests: without it, Claude requests every scope the metadata lists, read-only
+/// included, and the consent page would then default to read-only access.
+fn www_authenticate_value(base_url: &str, endpoint: &str) -> String {
+    let scope = if super::external_idp::configured().is_some() {
+        super::external_idp::REQUESTED_SCOPES
+    } else {
+        "mcp:all"
+    };
+    format!(
+        "Bearer resource_metadata=\"{base_url}/.well-known/oauth-protected-resource{endpoint}\", \
+         scope=\"{scope}\""
+    )
+}
+
+/// Middleware that adds WWW-Authenticate header to 401 responses
+/// This helps MCP clients discover the OAuth authorization server (RFC 9728)
+pub async fn add_www_authenticate_header(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    use axum::http::StatusCode;
+    use windmill_common::BASE_URL;
+
+    // Extract workspace_id before consuming the request
+    let Some(workspace_id) = request
+        .extensions()
+        .get::<WorkspaceId>()
+        .map(|w| w.0.clone())
+    else {
+        return Response::builder()
+            .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(axum::body::Body::from("Missing workspace_id in request"))
+            .unwrap();
+    };
+    let response = next.run(request).await;
+
+    // Only add header to 401 Unauthorized responses
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let base_url = BASE_URL.load();
+
+        let www_authenticate =
+            www_authenticate_value(&base_url, &format!("/api/mcp/w/{}/mcp", workspace_id));
+
+        // Reconstruct response with the new header
+        let (mut parts, body) = response.into_parts();
+        parts.headers.insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            www_authenticate
+                .parse()
+                .unwrap_or_else(|_| "Bearer".parse().unwrap()),
+        );
+        Response::from_parts(parts, body)
+    } else {
+        response
+    }
+}
+
+/// Middleware refusing a credential carried in the MCP URL once the instance sets
+/// `mcp_disable_token_query_param`. Sits outside everything that reads the token, so neither
+/// the gateway lookup nor `ApiAuthed` ever sees it, and inside the `WWW-Authenticate` layer,
+/// whose header is what sends the client into the OAuth flow instead. Refused rather than
+/// ignored: the URL leaked the token whether or not the request used it.
+pub async fn reject_token_query_param(request: Request<axum::body::Body>, next: Next) -> Response {
+    let carries_token = MCP_DISABLE_TOKEN_QUERY_PARAM.load(std::sync::atomic::Ordering::Relaxed)
+        && request
+            .uri()
+            .query()
+            .is_some_and(|q| url::form_urlencoded::parse(q.as_bytes()).any(|(k, _)| k == "token"));
+    if carries_token {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "This instance does not accept a token in the MCP URL. Remove the token query \
+             parameter and let your client sign in through OAuth, or send the token in an \
+             Authorization header.",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Extract the bearer token from either the `Authorization` header or the
+/// `?token=` query parameter (MCP clients commonly pass it in the URL).
+fn extract_gateway_token(request: &Request<axum::body::Body>) -> Option<String> {
+    if let Some(token) = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+    {
+        return Some(token.to_string());
+    }
+    request.uri().query().and_then(|q| {
+        url::form_urlencoded::parse(q.as_bytes())
+            .find(|(k, _)| k == "token")
+            .map(|(_, v)| v.into_owned())
+    })
+}
+
+/// Middleware for gateway: resolve the MCP session mode from the Bearer token in
+/// the DB. A token bound to a workspace injects `WorkspaceId` (single-workspace
+/// mode). A workspace-less MCP token (`workspace_id IS NULL` with an `mcp:` scope)
+/// injects `MultiWorkspaceMcp` + `McpToken`, putting the runner in
+/// multi-workspace mode where tools take an explicit `workspace_id` argument.
+pub async fn extract_workspace_from_token(
+    Extension(db): Extension<DB>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(token) = extract_gateway_token(&request) {
+        let t_hash = hash_token(&token);
+        match sqlx::query!(
+            "SELECT workspace_id, scopes FROM token WHERE token_hash = $1 AND (expiration > NOW() OR expiration IS NULL)",
+            t_hash
+        )
+        .fetch_optional(&db)
+        .await
+        {
+            Ok(Some(row)) => {
+                if scoped_to_selection(row.scopes.as_deref().unwrap_or_default()) {
+                    request.extensions_mut().insert(McpSelection);
+                }
+                match row.workspace_id {
+                    Some(workspace_id) => {
+                        request
+                            .extensions_mut()
+                            .insert(GatewayWorkspaceId(workspace_id.clone()));
+                        request.extensions_mut().insert(WorkspaceId(workspace_id));
+                    }
+                    None => {
+                        // Only enter multi-workspace mode for genuine MCP tokens; a
+                        // full-privilege global token without mcp scope is rejected
+                        // by the runner's mcp-scope check anyway.
+                        let is_mcp = row
+                            .scopes
+                            .as_deref()
+                            .is_some_and(|s| s.iter().any(|scope| scope.starts_with("mcp:")));
+                        if is_mcp {
+                            request.extensions_mut().insert(MultiWorkspaceMcp);
+                            request.extensions_mut().insert(McpToken(token));
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("Gateway token workspace lookup failed: {}", e);
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
+/// Middleware that adds WWW-Authenticate header for gateway 401 responses
+pub async fn add_www_authenticate_header_gateway(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    use axum::http::StatusCode;
+
+    let endpoint = request
+        .extensions()
+        .get::<McpEndpoint>()
+        .map_or("/api/mcp/gateway", |e| e.0);
+
+    let response = next.run(request).await;
+
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let www_authenticate =
+            www_authenticate_value(&windmill_common::global_settings::mcp_base_url(), endpoint);
+
+        let (mut parts, body) = response.into_parts();
+        parts.headers.insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            www_authenticate
+                .parse()
+                .unwrap_or_else(|_| "Bearer".parse().unwrap()),
+        );
+        Response::from_parts(parts, body)
+    } else {
+        response
+    }
+}
+
+/// Setup the MCP server with HTTP transport
+pub async fn setup_mcp_server(
+    db: DB,
+    user_db: UserDB,
+    base_internal_url: String,
+    auth_cache: Arc<AuthCache>,
+) -> anyhow::Result<(Router, Router, CancellationToken)> {
+    let cancellation_token = CancellationToken::new();
+    let session_manager = Arc::new(LocalSessionManager::default());
+
+    let backend = WindmillBackend::new(db, user_db, base_internal_url, auth_cache);
+    let session_runner = SessionRunner::new(backend.clone());
+    let runner = Runner::new(backend);
+
+    let service_config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(Some(Duration::from_secs(15)))
+        .with_sse_retry(Some(Duration::from_secs(15)))
+        .with_cancellation_token(cancellation_token.clone())
+        // Sessionless: every request re-resolves auth from its own bearer token, so
+        // there is no session to bind. This also makes legacy `initialize` clients
+        // take the same stateless path as 2026-07-28 ones.
+        .with_legacy_session_mode(false)
+        // rmcp's Host allowlist defaults to localhost, which guards an unauthenticated
+        // locally-bound server against DNS rebinding. This endpoint instead sits behind
+        // Windmill's own authentication, and is reached under whatever hostname the
+        // instance is served on, so keeping that default would reject every remote MCP
+        // client while adding nothing.
+        .disable_allowed_hosts()
+        // MCP bodies are ordinary API payloads — `createApp`/`updateApp` carry whole app
+        // sources — so they follow the instance's request size limit rather than rmcp's
+        // much smaller default, which would 413 them with no way to raise it.
+        .with_max_request_body_bytes(*crate::REQUEST_SIZE_LIMIT.read().await);
+
+    let session_service = StreamableHttpService::new(
+        move || Ok(session_runner.clone()),
+        session_manager.clone(),
+        service_config.clone(),
+    );
+    let service =
+        StreamableHttpService::new(move || Ok(runner.clone()), session_manager, service_config);
+
+    let router = Router::new().route(
+        "/",
+        axum::routing::any({
+            let (service, session_service) = (service.clone(), session_service.clone());
+            move |request: Request<axum::body::Body>| {
+                let (service, session_service) = (service.clone(), session_service.clone());
+                async move {
+                    use tower::ServiceExt;
+                    let session = request.extensions().get::<ApiAuthed>().is_some_and(|a| {
+                        serves_session_toolset(a.scopes.as_deref().unwrap_or_default())
+                    });
+                    let response = if session {
+                        session_service.oneshot(request).await
+                    } else {
+                        service.oneshot(request).await
+                    };
+                    match response {
+                        Ok(response) => response.into_response(),
+                        Err(never) => match never {},
+                    }
+                }
+            }
+        }),
+    );
+    // `/api/mcp` serves both servers: a token scoped to a selection of scripts, flows and
+    // endpoints gets the tools server, any other the session's toolset. At `/mcp` itself,
+    // beside the `/mcp/...` routes, so it is merged rather than nested.
+    let session_router = Router::new().route(
+        "/mcp",
+        axum::routing::any(move |mut request: Request<axum::body::Body>| {
+            let (service, session_service) = (service.clone(), session_service.clone());
+            async move {
+                use tower::ServiceExt;
+                let response = if request.extensions().get::<McpSelection>().is_some() {
+                    request.extensions_mut().insert(NoEndpointTools);
+                    service.oneshot(request).await
+                } else {
+                    session_service.oneshot(request).await
+                };
+                match response {
+                    Ok(response) => response.into_response(),
+                    Err(never) => match never {},
+                }
+            }
+        }),
+    );
+    Ok((router, session_router, cancellation_token))
+}
+
+/// HTTP handler to list MCP tools as JSON
+async fn list_mcp_tools_handler() -> JsonResult<Vec<EndpointTool>> {
+    let endpoint_tools = all_tools();
+    Ok(Json(endpoint_tools))
+}
+
+/// Creates a router service for listing MCP tools
+pub fn list_tools_service() -> Router {
+    Router::new().route("/", get(list_mcp_tools_handler))
+}
+
+#[derive(serde::Deserialize)]
+struct ToolsetQuery {
+    access: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ToolsetEntry {
+    name: String,
+    description: String,
+}
+
+/// The tools `/api/mcp` offers an `mcp:all` token at each access level, for the token
+/// form to show: the server's own filter, so the list cannot drift from it.
+async fn list_toolset_handler(
+    axum::extract::Query(query): axum::extract::Query<ToolsetQuery>,
+) -> JsonResult<Vec<ToolsetEntry>> {
+    let access = match query.access.as_deref() {
+        Some("read") => SessionAccess::ReadOnly,
+        Some("read_run") => SessionAccess::ReadAndRun,
+        _ => SessionAccess::Full,
+    };
+    Ok(Json(
+        session::session_tools(access)
+            .into_iter()
+            .map(|tool| ToolsetEntry {
+                name: tool.name.to_string(),
+                description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
+            })
+            .collect(),
+    ))
+}
+
+pub fn toolset_service() -> Router {
+    Router::new().route("/", get(list_toolset_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scoped_to_selection, serves_session_toolset};
+
+    #[test]
+    fn only_a_token_without_mcp_all_is_a_selection() {
+        let selection = |scopes: &[&str]| {
+            scoped_to_selection(&scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert!(selection(&["mcp:favorites"]));
+        assert!(selection(&["mcp:scripts:f/x/*", "mcp:endpoints:listJobs"]));
+        assert!(selection(&["mcp:all:f/x/*"]));
+        assert!(!selection(&["mcp:all"]));
+        assert!(!selection(&[
+            "mcp:all",
+            "mcp:read_run",
+            "mcp:workspaces:a,b"
+        ]));
+        assert!(!selection(&[]));
+        assert!(!selection(&["variables:read"]));
+    }
+
+    #[test]
+    fn tools_server_urls_keep_unmarked_tokens() {
+        let session = |scopes: &[&str]| {
+            serves_session_toolset(&scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert!(session(&["mcp:all", "mcp:session"]));
+        assert!(session(&["mcp:all", "mcp:read_only"]));
+        assert!(session(&["mcp:all", "mcp:read_run", "mcp:workspaces:a,b"]));
+        assert!(!session(&["mcp:all"]));
+        assert!(!session(&["mcp:favorites", "mcp:session"]));
+        assert!(!session(&["mcp:all:f/x/*", "mcp:read_only"]));
+    }
+}

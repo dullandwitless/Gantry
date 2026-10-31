@@ -1,0 +1,7506 @@
+#[cfg(feature = "oauth2")]
+use std::collections::HashMap;
+use std::{
+    fmt::Display,
+    ops::Mul,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
+
+use chrono::{DateTime, NaiveDateTime, Utc};
+use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+use serde::{de::DeserializeOwned, Deserialize};
+use sqlx::{Pool, Postgres};
+use tokio::{
+    join,
+    sync::{mpsc, RwLock},
+    time::timeout,
+};
+use uuid::Uuid;
+
+#[cfg(feature = "embedding")]
+use windmill_api::embeddings::update_embeddings_db;
+use windmill_api::{
+    jobs::TIMEOUT_WAIT_RESULT, DEFAULT_BODY_LIMIT, IS_SECURE, REQUEST_SIZE_LIMIT, SAML_METADATA,
+    SCIM_TOKEN,
+};
+
+#[cfg(feature = "native_trigger")]
+use windmill_api::native_triggers::sync::sync_all_triggers;
+
+
+use windmill_common::global_settings::OAUTH_SETTING;
+use windmill_common::otel_oss::{
+    otel_incr_zombie_delete_count, otel_incr_zombie_restart_count, otel_set_db_pool,
+    otel_set_queue_count, otel_set_queue_delay, otel_set_queue_running_count,
+};
+use windmill_common::{
+    agent_workers::DECODED_AGENT_TOKEN,
+    apps::APP_WORKSPACED_ROUTE,
+    auth::{
+        create_token_for_owner, ephemeral_script_token_label, job_token_expiry_secs,
+        TOKEN_EXPIRY_WARNING_DAYS,
+    },
+    ee_oss::CriticalErrorChannel,
+    email_oss::send_email_if_possible,
+    error,
+    flow_status::{FlowStatus, FlowStatusModule},
+    global_settings::{
+        get_or_create_jwt_secret, load_value_from_global_settings, API_BASE_URL,
+        API_BASE_URL_APPLIES_TO_MCP, API_BASE_URL_APPLIES_TO_SETTING, API_BASE_URL_SETTING,
+        AUDIT_LOG_RETENTION_DAYS_SETTING, BASE_URL_SETTING, BUNFIG_INSTALL_SCOPES_SETTING,
+        BUN_INSTALL_MIN_RELEASE_AGE_SETTING, CONCURRENCY_KEY_MAX_QUEUED_SETTING,
+        CRITICAL_ALERTS_ON_DB_OVERSIZE_SETTING, CRITICAL_ALERTS_ON_TOKEN_EXPIRY_SETTING,
+        CRITICAL_ALERT_MUTE_UI_SETTING, CRITICAL_ALERT_MUTE_ZOMBIE_JOB_RESTART_SETTING,
+        CRITICAL_ERROR_CHANNELS_SETTING, CUSTOM_TAGS_SETTING, DEFAULT_TAGS_PER_WORKSPACE_SETTING,
+        DEFAULT_TAGS_WORKSPACES_SETTING, DEPENDENCY_JOB_TAG_SETTING,
+        DEV_WORKSPACE_ISOLATION_SETTING, DEV_WORKSPACE_ISOLATION_SKIP_NON_DEV_FORKS_SETTING,
+        DEV_WORKSPACE_TAG_SUFFIX_SETTING, DISABLE_PASSWORD_LOGIN, DISABLE_PASSWORD_LOGIN_SETTING,
+        EXPOSE_DEBUG_METRICS_SETTING, EXPOSE_METRICS_SETTING, EXTRA_PIP_INDEX_URL_SETTING,
+        FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX_SETTING, HUB_API_SECRET_SETTING,
+        HUB_BASE_URL_SETTING, INSTANCE_PYTHON_VERSION_SETTING, JOB_DEFAULT_TIMEOUT_SECS_SETTING,
+        JOB_ISOLATION_SETTING, JWT_SECRET_SETTING, KEEP_JOB_DIR_SETTING, LICENSE_KEY_SETTING,
+        MCP_DISABLE_TOKEN_QUERY_PARAM, MCP_DISABLE_TOKEN_QUERY_PARAM_SETTING,
+        MONITOR_LOGS_ON_OBJECT_STORE_SETTING, NPMRC_SETTING, NPM_CONFIG_REGISTRY_SETTING,
+        NSJAIL_TMPFS_SIZE_MB_SETTING, NSJAIL_TMP_BACKING_SETTING, NUGET_CONFIG_SETTING,
+        OTEL_SETTING, OTEL_TRACES_RETENTION_SECS_SETTING, OTEL_TRACING_PROXY_SETTING,
+        PIP_INDEX_URL_SETTING, POWERSHELL_REPO_PAT_SETTING, POWERSHELL_REPO_URL_SETTING,
+        PREVIEW_TAGS_OVERRIDE_SETTING, REQUEST_SIZE_LIMIT_SETTING,
+        REQUIRE_PREEXISTING_USER_FOR_OAUTH_SETTING, RETENTION_PERIOD_SECS_SETTING,
+        SAML_METADATA_SETTING, SANDBOX_IMAGE_CACHE_MAX_MB_SETTING,
+        SANDBOX_IMAGE_DEFAULT_REGISTRY_SETTING, SANDBOX_IMAGE_MAX_SIZE_MB_SETTING,
+        SANDBOX_IMAGE_PULL_POLICY_SETTING, SANDBOX_REGISTRY_AUTH_SETTING, SCIM_TOKEN_SETTING,
+        SERVICE_LOG_RETENTION_SECS_SETTING, SMTP_SETTING, STORE_AUDIT_LOGS_S3_SETTING,
+        TIMEOUT_WAIT_RESULT_SETTING, UV_EXCLUDE_NEWER_SETTING, UV_INDEX_STRATEGY_SETTING,
+        UV_PYTHON_INSTALL_MIRROR_SETTING, WORKSPACE_FAIRNESS_DURATION_SECS_SETTING,
+        WORKSPACE_FAIRNESS_ENABLED_SETTING, WORKSPACE_FAIRNESS_MAX_PERCENT_SETTING,
+        WORKSPACE_FAIRNESS_MIN_TOTAL_SETTING, WORKSPACE_MAX_QUEUED_JOBS_SETTING,
+    },
+    indexer::load_indexer_config,
+    jobs::delete_jobs,
+    jwt::JWT_SECRET,
+    oauth2::REQUIRE_PREEXISTING_USER_FOR_OAUTH,
+    server::load_smtp_config,
+    users::truncate_token,
+    utils::{empty_as_none, now_from_db, report_critical_error, Mode, HUB_API_SECRET},
+    worker::{
+        is_valid_dev_workspace_tag_suffix, load_env_vars, load_init_bash_from_env,
+        load_periodic_bash_script_from_env, load_periodic_bash_script_interval_from_env,
+        load_whitelist_env_vars_from_env, load_worker_config, store_pull_query,
+        store_suspended_pull_query, Connection, WorkerConfig, CLOUD_HOSTED,
+        CONCURRENCY_KEY_MAX_QUEUED, CONCURRENCY_KEY_MAX_QUEUED_DEFAULT,
+        DEFAULT_DEV_WORKSPACE_TAG_SUFFIX, DEFAULT_TAGS_PER_WORKSPACE, DEFAULT_TAGS_WORKSPACES,
+        DEPENDENCY_JOB_TAG, DEV_WORKSPACE_ISOLATION, DEV_WORKSPACE_ISOLATION_SKIP_NON_DEV_FORKS,
+        DEV_WORKSPACE_TAG_SUFFIX, FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX, INDEXER_CONFIG,
+        PREVIEW_TAGS_OVERRIDE, SMTP_CONFIG, WINDMILL_DIR, WORKER_CONFIG, WORKER_GROUP,
+        WORKSPACE_FAIRNESS_DURATION_SECS, WORKSPACE_FAIRNESS_ENABLED,
+        WORKSPACE_FAIRNESS_MAX_PERCENT, WORKSPACE_FAIRNESS_MIN_TOTAL, WORKSPACE_MAX_QUEUED_JOBS,
+        WORKSPACE_MAX_QUEUED_JOBS_DEFAULT,
+    },
+    KillpillSender, AUDIT_LOG_RETENTION_DAYS, BASE_URL, CRITICAL_ALERTS_ON_DB_OVERSIZE,
+    CRITICAL_ALERTS_ON_TOKEN_EXPIRY, CRITICAL_ALERT_MUTE_UI_ENABLED,
+    CRITICAL_ALERT_MUTE_ZOMBIE_JOB_RESTART, CRITICAL_ERROR_CHANNELS, DB, DEFAULT_HUB_BASE_URL,
+    DEFAULT_OTEL_TRACES_RETENTION_SECS, DEFAULT_SERVICE_LOG_RETENTION_SECS, HUB_BASE_URL,
+    JOB_RETENTION_SECS, JOB_RETENTION_SECS_OVERRIDES, JOB_RETENTION_SECS_OVERRIDES_LOADED,
+    METRICS_DEBUG_ENABLED, METRICS_ENABLED, MONITOR_LOGS_ON_OBJECT_STORE, OTEL_LOGS_ENABLED,
+    OTEL_METRICS_ENABLED, OTEL_TRACING_ENABLED, STORE_AUDIT_LOGS_S3,
+};
+use windmill_common::{
+    client::AuthedClient,
+    global_settings::{
+        parse_allowed_origins_setting, APP_WORKSPACED_ROUTE_SETTING,
+        HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS, HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING,
+        HTTP_ROUTE_WORKSPACED_ROUTE, HTTP_ROUTE_WORKSPACED_ROUTE_SETTING,
+    },
+    queue_metrics::{
+        QueueSample, QUEUE_COUNT_PREFIX, QUEUE_DELAY_PREFIX, QUEUE_DELAY_SAME_HEAD_SECS,
+        QUEUE_METRIC_HEARTBEAT_SECS, QUEUE_METRIC_STALE_SECS,
+    },
+};
+#[cfg(feature = "parquet")]
+use windmill_object_store::reload_object_store_setting;
+use windmill_queue::{
+    add_completed_job_error, cancel_job, canceled_result, get_queued_job_v2,
+    schedule::{find_unarmed_schedules, rearm_schedule, RearmOutcome},
+    variable_expiration::dispatch_expiring_variables,
+    CanceledBy, MiniCompletedJob, SameWorkerPayload,
+};
+use windmill_store::resources::MAX_RESOURCE_VERSIONS;
+use windmill_worker::{
+    result_processor::handle_job_error, JobCompletedSender, JobIsolationLevel,
+    OtelTracingProxySettings, SameWorkerSender, StepFailureKind, WorkspaceRegistryMap,
+    BUNFIG_INSTALL_SCOPES, BUN_INSTALL_MIN_RELEASE_AGE, CARGO_REGISTRIES, INSTANCE_PYTHON_VERSION,
+    JAVA_HOME_DIR, JOB_DEFAULT_TIMEOUT, JOB_ISOLATION, KEEP_JOB_DIR, MAVEN_REPOS,
+    MAVEN_SETTINGS_XML, NO_DEFAULT_MAVEN, NPMRC, NPM_CONFIG_REGISTRY, NSJAIL_AVAILABLE,
+    NSJAIL_TMPFS_SIZE_MB, NSJAIL_TMP_BACKING, NUGET_CONFIG, OTEL_TRACING_PROXY_SETTINGS,
+    PIP_EXTRA_INDEX_URL, PIP_INDEX_URL, POWERSHELL_REPO_PAT, POWERSHELL_REPO_URL,
+    SANDBOX_IMAGE_CACHE_MAX_MB, SANDBOX_IMAGE_DEFAULT_REGISTRY, SANDBOX_IMAGE_MAX_SIZE_MB,
+    SANDBOX_IMAGE_PULL_POLICY, SANDBOX_REGISTRY_AUTH, UNSHARE_PATH, UV_EXCLUDE_NEWER,
+    UV_INDEX_STRATEGY, UV_PYTHON_INSTALL_MIRROR, WORKSPACE_REGISTRIES,
+};
+
+#[cfg(feature = "parquet")]
+use windmill_object_store::ObjectStoreReload;
+
+use crate::ee_oss::set_license_key;
+
+#[cfg(feature = "prometheus")]
+lazy_static::lazy_static! {
+
+    static ref QUEUE_ZOMBIE_RESTART_COUNT: prometheus::IntCounter = prometheus::register_int_counter!(
+        "queue_zombie_restart_count",
+        "Total number of jobs restarted due to ping timeout."
+    )
+    .unwrap();
+    static ref QUEUE_ZOMBIE_DELETE_COUNT: prometheus::IntCounter = prometheus::register_int_counter!(
+        "queue_zombie_delete_count",
+        "Total number of jobs deleted due to their ping timing out in an unrecoverable state."
+    )
+    .unwrap();
+
+    static ref QUEUE_COUNT: prometheus::IntGaugeVec = prometheus::register_int_gauge_vec!(
+        "queue_count",
+        "Number of jobs in the queue",
+        &["tag"]
+    ).unwrap();
+
+    static ref QUEUE_DELAY_SECONDS: prometheus::GaugeVec = prometheus::register_gauge_vec!(
+        "queue_delay_seconds",
+        "How long the next job to be picked up has been waiting, in seconds",
+        &["tag"]
+    ).unwrap();
+
+    static ref QUEUE_RUNNING_COUNT: prometheus::IntGaugeVec = prometheus::register_int_gauge_vec!(
+        "queue_running_count",
+        "Number of running jobs in the queue",
+        &["tag"]
+    ).unwrap();
+
+}
+lazy_static::lazy_static! {
+    static ref ZOMBIE_JOB_TIMEOUT: String = std::env::var("ZOMBIE_JOB_TIMEOUT")
+    .ok()
+    .and_then(|x| x.parse::<String>().ok())
+    .unwrap_or_else(|| "60".to_string());
+
+    static ref FLOW_ZOMBIE_TRANSITION_TIMEOUT: String = std::env::var("FLOW_ZOMBIE_TRANSITION_TIMEOUT")
+    .ok()
+    .and_then(|x| x.parse::<String>().ok())
+    .unwrap_or_else(|| "60".to_string());
+
+
+    pub static ref RESTART_ZOMBIE_JOBS: bool = std::env::var("RESTART_ZOMBIE_JOBS")
+    .ok()
+    .and_then(|x| x.parse::<bool>().ok())
+    .unwrap_or(true);
+
+    pub static ref DISABLE_ZOMBIE_JOBS_MONITORING: bool = std::env::var("DISABLE_ZOMBIE_JOBS_MONITORING")
+    .ok()
+    .and_then(|x| x.parse::<bool>().ok())
+    .unwrap_or(false);
+
+    // Ops kill switch for the pipeline freshness watchdog (a background
+    // pusher — being able to stop it without a redeploy matters more than
+    // for read-only monitors).
+    pub static ref DISABLE_FRESHNESS_WATCHDOG: bool = std::env::var("DISABLE_FRESHNESS_WATCHDOG")
+    .ok()
+    .and_then(|x| x.parse::<bool>().ok())
+    .unwrap_or(false);
+
+    pub static ref WORKERS_NAMES: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+
+    static ref QUEUE_COUNT_TAGS: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref QUEUE_RUNNING_COUNT_TAGS: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref OTEL_QUEUE_COUNT_TAGS: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref OTEL_QUEUE_RUNNING_COUNT_TAGS: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+    static ref DISABLE_CONCURRENCY_LIMIT: bool = std::env::var("DISABLE_CONCURRENCY_LIMIT").is_ok_and(|s| s == "true");
+
+    //legacy typo
+    static ref STALE_JOB_THRESHOLD_MINUTES: Option<u64> = std::env::var("STALE_JOB_THRESHOLD_MINUTES").or_else(|_| std::env::var("STALE_JOB_THRESHOLD_MINUTES"))
+
+    .ok()
+    .and_then(|x| x.parse::<u64>().ok());
+
+    /// Batch size for job cleanup deletion queries. Default: 10000.
+    /// Larger values delete more jobs per batch but hold locks longer.
+    static ref JOB_CLEANUP_BATCH_SIZE: i64 = std::env::var("JOB_CLEANUP_BATCH_SIZE")
+        .ok()
+        .and_then(|x| x.parse::<i64>().ok())
+        .unwrap_or(20000);
+
+    /// Maximum number of batches to process per cleanup iteration. Default: 10.
+    /// Set to 0 for unlimited (process until no expired jobs remain).
+    static ref JOB_CLEANUP_MAX_BATCHES: i32 = std::env::var("JOB_CLEANUP_MAX_BATCHES")
+        .ok()
+        .and_then(|x| x.parse::<i32>().ok())
+        .unwrap_or(20);
+}
+
+/// Load every setting this process cares about, at startup and on every full-reload tick.
+///
+/// Reads are declared into a [`SettingsPass`] rather than issued one at a time, so the dozens
+/// this pass makes cost a single fetch. See [`SettingsPass`] for what declaring buys and what
+/// it requires of the order things are declared in.
+pub async fn initial_load(
+    conn: &Connection,
+    tx: KillpillSender,
+    worker_mode: bool,
+    server_mode: bool,
+    #[cfg(feature = "parquet")] disable_s3_store: bool,
+) {
+    let mut pass = SettingsPass::new();
+
+    pass.settings(
+        &[OAUTH_SETTING, BASE_URL_SETTING],
+        false,
+        move |mut v| async move {
+            if let Err(e) = apply_base_url_setting(
+                conn,
+                v.remove(OAUTH_SETTING).flatten(),
+                v.remove(BASE_URL_SETTING).flatten(),
+            )
+            .await
+            {
+                tracing::error!("Error loading base url: {:?}", e)
+            }
+        },
+    );
+
+    pass.setting(CRITICAL_ERROR_CHANNELS_SETTING, false, |v| async move {
+        apply_critical_error_channels_setting(v)
+    });
+
+    pass.setting(EXPOSE_METRICS_SETTING, true, |v| async move {
+        apply_metrics_enabled(v)
+    });
+    pass.setting(EXPOSE_DEBUG_METRICS_SETTING, true, |v| async move {
+        apply_metrics_debug_enabled(v)
+    });
+    pass.setting(CRITICAL_ALERT_MUTE_UI_SETTING, true, |v| async move {
+        apply_critical_alert_mute_ui_setting(v)
+    });
+    pass.setting(
+        CRITICAL_ALERTS_ON_TOKEN_EXPIRY_SETTING,
+        true,
+        |v| async move { apply_critical_alerts_on_token_expiry_setting(v) },
+    );
+    pass.setting(
+        CRITICAL_ALERT_MUTE_ZOMBIE_JOB_RESTART_SETTING,
+        true,
+        |v| async move { apply_critical_alert_mute_zombie_job_restart_setting(v) },
+    );
+
+    if let Some(db) = conn.as_sql() {
+        // Outside the `server_mode` block below: a `MODE=mcp` process serves the MCP routes
+        // with `server_mode` false and would otherwise never read this at all. That mode
+        // joins no monitor loop, so there — as for every global setting, `base_url`
+        // included — this pass is the only read, and a change lands on restart.
+        pass.setting(
+            MCP_DISABLE_TOKEN_QUERY_PARAM_SETTING,
+            false,
+            |v| async move { apply_mcp_disable_token_query_param(v) },
+        );
+        pass.setting(
+            windmill_common::global_settings::MCP_EXTERNAL_IDP_SETTING,
+            false,
+            |v| async move { apply_mcp_external_idp(v) },
+        );
+        pass.setting(API_BASE_URL_SETTING, false, |v| async move {
+            apply_api_base_url(v)
+        });
+        pass.setting(API_BASE_URL_APPLIES_TO_SETTING, false, |v| async move {
+            apply_api_base_url_applies_to(v)
+        });
+        pass.setting(DEFAULT_TAGS_PER_WORKSPACE_SETTING, false, |v| async move {
+            apply_tag_per_workspace_enabled(v)
+        });
+        pass.setting(DEFAULT_TAGS_WORKSPACES_SETTING, false, |v| async move {
+            apply_tag_per_workspace_workspaces(v)
+        });
+        pass.setting(
+            FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX_SETTING,
+            false,
+            |v| async move { apply_fork_workspace_tag_append_fork_suffix(v) },
+        );
+        pass.setting(PREVIEW_TAGS_OVERRIDE_SETTING, false, |v| async move {
+            apply_preview_tags_override(v)
+        });
+        pass.setting(DEPENDENCY_JOB_TAG_SETTING, false, |v| async move {
+            apply_dependency_job_tag(v)
+        });
+        // Ahead of the worker config reload below, which expands the tags with it.
+        pass.setting(DEV_WORKSPACE_TAG_SUFFIX_SETTING, false, |v| async move {
+            apply_dev_workspace_tag_suffix(v);
+        });
+        pass.setting(DEV_WORKSPACE_ISOLATION_SETTING, false, |v| async move {
+            apply_dev_workspace_isolation(v)
+        });
+        pass.setting(
+            DEV_WORKSPACE_ISOLATION_SKIP_NON_DEV_FORKS_SETTING,
+            false,
+            |v| async move { apply_dev_workspace_isolation_skip_non_dev_forks(v) },
+        );
+
+        // Load per-workspace retention overrides before the first cleanup tick so a fresh server
+        // never sweeps globally without honoring configured longer-retention workspaces.
+        pass.action(async move {
+            if let Err(e) = load_retention_period_overrides(db).await {
+                tracing::error!("Error loading per-workspace retention overrides: {e:#}");
+            }
+        });
+
+        // Workspace fairness (cloud-only). The percentage/duration/min knobs apply
+        // *before* the enabled flag so that `apply_workspace_fairness_enabled` reads
+        // current values when re-storing the pull queries, which declaration order gives us.
+        pass.setting(
+            WORKSPACE_FAIRNESS_MAX_PERCENT_SETTING,
+            false,
+            |v| async move { apply_workspace_fairness_max_percent(v) },
+        );
+        pass.setting(
+            WORKSPACE_FAIRNESS_DURATION_SECS_SETTING,
+            false,
+            |v| async move { apply_workspace_fairness_duration_secs(v) },
+        );
+        pass.setting(
+            WORKSPACE_FAIRNESS_MIN_TOTAL_SETTING,
+            false,
+            |v| async move { apply_workspace_fairness_min_total(v) },
+        );
+        pass.setting(WORKSPACE_FAIRNESS_ENABLED_SETTING, false, |v| {
+            apply_workspace_fairness_enabled(v)
+        });
+
+        // Only the cloud reads these caps, so don't ask for them anywhere else.
+        if *CLOUD_HOSTED {
+            pass.setting(CONCURRENCY_KEY_MAX_QUEUED_SETTING, false, |v| async move {
+                apply_concurrency_key_max_queued(v)
+            });
+            pass.setting(WORKSPACE_MAX_QUEUED_JOBS_SETTING, false, |v| async move {
+                apply_workspace_max_queued_jobs(v)
+            });
+        }
+    }
+
+    if server_mode {
+        if let Some(db) = conn.as_sql() {
+            pass.setting(
+                REQUIRE_PREEXISTING_USER_FOR_OAUTH_SETTING,
+                false,
+                |v| async move { apply_require_preexisting_user(v) },
+            );
+            pass.setting(DISABLE_PASSWORD_LOGIN_SETTING, false, |v| async move {
+                apply_disable_password_login(v)
+            });
+            pass.action(async move {
+                if let Err(e) = reload_critical_alerts_on_db_oversize(db).await {
+                    tracing::error!(
+                        "Error reloading critical alerts on db oversize setting: {:?}",
+                        e
+                    )
+                }
+            });
+            pass.action(windmill_common::min_version::store_min_keep_alive_version(
+                db,
+            ));
+            pass.setting(
+                windmill_common::global_settings::INSTANCE_EVENTS_WEBHOOK_SETTING,
+                false,
+                |v| async move { apply_instance_events_webhook_setting(v) },
+            );
+        }
+    }
+
+    if worker_mode {
+        pass.setting(KEEP_JOB_DIR_SETTING, true, |v| async move {
+            apply_keep_job_dir(v)
+        });
+        match conn {
+            Connection::Sql(db) => {
+                pass.action(reload_worker_config(&db, tx, false));
+            }
+            Connection::Http(_) => {
+                // TODO: reload worker config from http
+                let worker_tags = DECODED_AGENT_TOKEN
+                    .as_ref()
+                    .map(|x| x.tags.clone())
+                    .unwrap_or_default();
+                // we only check from env as native_mode is not stored in the token
+                // NATIVE_MODE_RESOLVED is already set in main.rs during startup
+                let native_mode = windmill_common::worker::is_native_mode_from_env();
+                WORKER_CONFIG.store(std::sync::Arc::new(WorkerConfig {
+                    worker_tags,
+                    env_vars: load_env_vars(
+                        load_whitelist_env_vars_from_env(),
+                        &std::collections::HashMap::new(),
+                    ),
+                    priority_tags_sorted: vec![],
+                    dedicated_worker: None,
+                    dedicated_workers: None,
+                    init_bash: load_init_bash_from_env(),
+                    periodic_script_bash: load_periodic_bash_script_from_env(),
+                    periodic_script_interval_seconds: load_periodic_bash_script_interval_from_env(),
+                    cache_clear: None,
+                    additional_python_paths: None,
+                    pip_local_dependencies: None,
+                    disable_job_proxy: false,
+                    native_mode,
+                    // an agent worker never reads its group's config, only its token
+                    object_store_cache_config: None,
+                    // nor whether it is paused: the server refuses it jobs instead
+                    paused: false,
+                }));
+            }
+        }
+    }
+
+    pass.setting(HUB_BASE_URL_SETTING, true, move |v| async move {
+        if let Err(e) = apply_hub_base_url_setting(conn, server_mode, v).await {
+            tracing::error!("Error reloading hub base url: {:?}", e)
+        }
+    });
+
+    if let Some(db) = conn.as_sql() {
+        pass.setting(JWT_SECRET_SETTING, false, move |v| async move {
+            if let Err(e) = apply_jwt_secret_setting(db, v).await {
+                tracing::error!("Could not reload jwt secret setting: {:?}", e);
+            }
+        });
+
+        pass.setting(CUSTOM_TAGS_SETTING, false, |v| async move {
+            windmill_common::worker::apply_custom_tags_setting(v)
+        });
+        pass.setting(APP_WORKSPACED_ROUTE_SETTING, false, |v| async move {
+            apply_app_workspaced_route_setting(v)
+        });
+        pass.setting(
+            HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING,
+            false,
+            |v| async move {
+                if let Err(e) = apply_http_route_default_allowed_origins_setting(v) {
+                    tracing::error!(
+                        "Error reloading http route default allowed origins: {:?}",
+                        e
+                    )
+                }
+            },
+        );
+        pass.setting(
+            HTTP_ROUTE_WORKSPACED_ROUTE_SETTING,
+            false,
+            move |v| async move {
+                if let Err(e) = apply_http_route_workspaced_route_setting(db, v).await {
+                    tracing::error!("Error reloading http route workspaced route: {:?}", e)
+                }
+            },
+        );
+    }
+
+    // A step rather than a plain await: an AWS OIDC store mints its first token against an
+    // issuer built from `BASE_URL` (`oidc_ee.rs`), and with `OTEL_ENVIRONMENT` set nothing
+    // loads that before this pass does, so running ahead of the applier would sign with the
+    // unset default and fall back to the 10s retry.
+    #[cfg(feature = "parquet")]
+    if !disable_s3_store {
+        if let Some(db) = conn.as_sql() {
+            let db2 = db.clone();
+            pass.action(async move {
+                match reload_object_store_setting(db).await {
+                    ObjectStoreReload::Later => {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            match reload_object_store_setting(&db2).await {
+                                ObjectStoreReload::Later => {
+                                    tracing::error!("Giving up on loading object store setting");
+                                }
+                                ObjectStoreReload::Never => {
+                                    tracing::info!("Object store setting successfully loaded");
+                                }
+                            }
+                        });
+                    }
+                    ObjectStoreReload::Never => (),
+                }
+            });
+        }
+    }
+
+    if let Some(db) = conn.as_sql() {
+        let _ = db;
+        pass.setting(SMTP_SETTING, false, |v| async move {
+            tracing::info!("Reloading smtp config...");
+            SMTP_CONFIG.store(std::sync::Arc::new(
+                windmill_common::server::parse_smtp_config(v),
+            ));
+        });
+    }
+
+    pass.option_setting_with(
+        HUB_API_SECRET_SETTING,
+        "HUB_API_SECRET",
+        |v: Option<String>| async move { HUB_API_SECRET.store(std::sync::Arc::new(v)) },
+    );
+
+    // Outside the `server_mode` guard below: every mode reads this. A worker registers its
+    // rotated log files against the cutoff, and a dedicated indexer trims the search index to a
+    // window derived from it — neither is a server.
+    pass.setting(SERVICE_LOG_RETENTION_SECS_SETTING, true, |v| async move {
+        windmill_common::set_service_log_retention_secs(parse_setting_value::<i64>(
+            v,
+            SERVICE_LOG_RETENTION_SECS_SETTING,
+            "SERVICE_LOG_RETENTION_SECS",
+            DEFAULT_SERVICE_LOG_RETENTION_SECS,
+            |x| x,
+        ))
+    });
+
+    if server_mode {
+        pass.setting(RETENTION_PERIOD_SECS_SETTING, true, |v| async move {
+            JOB_RETENTION_SECS.store(
+                parse_setting_value::<i64>(
+                    v,
+                    RETENTION_PERIOD_SECS_SETTING,
+                    "JOB_RETENTION_SECS",
+                    60 * 60 * 24 * 30,
+                    |x| x,
+                ),
+                Ordering::Relaxed,
+            )
+        });
+        pass.setting(AUDIT_LOG_RETENTION_DAYS_SETTING, true, |v| async move {
+            AUDIT_LOG_RETENTION_DAYS.store(
+                // 0 means use default: 365 for EE, 14 for CE
+                parse_setting_value::<i64>(
+                    v,
+                    AUDIT_LOG_RETENTION_DAYS_SETTING,
+                    "AUDIT_LOG_RETENTION_DAYS",
+                    0,
+                    |x| x,
+                ),
+                Ordering::Relaxed,
+            )
+        });
+        pass.setting(OTEL_TRACES_RETENTION_SECS_SETTING, true, |v| async move {
+            windmill_common::set_otel_traces_retention_secs(parse_setting_value::<i64>(
+                v,
+                OTEL_TRACES_RETENTION_SECS_SETTING,
+                "OTEL_TRACES_RETENTION_SECS",
+                DEFAULT_OTEL_TRACES_RETENTION_SECS,
+                |x| x,
+            ))
+        });
+        pass.setting(STORE_AUDIT_LOGS_S3_SETTING, true, |v| async move {
+            STORE_AUDIT_LOGS_S3.store(
+                parse_setting_value::<bool>(
+                    v,
+                    STORE_AUDIT_LOGS_S3_SETTING,
+                    "STORE_AUDIT_LOGS_S3",
+                    false,
+                    |x| x,
+                ),
+                Ordering::Relaxed,
+            )
+        });
+        // Env-var enable has no settings-row xmin and no runtime enable event;
+        // anchor the export cursor at startup so rows committed before the
+        // first export tick are not skipped (no-op when a settings row exists
+        // or a checkpoint is already present). Audit-log S3 export is an
+        // Enterprise feature; the core logic lives in `crate::ee` (OSS gets a
+        // no-op), gated here on a valid Enterprise license.
+        #[cfg(feature = "parquet")]
+        if let Some(db) = conn.as_sql() {
+            pass.action(async move {
+                if STORE_AUDIT_LOGS_S3.load(std::sync::atomic::Ordering::Relaxed)
+                    && matches!(
+                        windmill_common::ee_oss::get_license_plan().await,
+                        windmill_common::ee_oss::LicensePlan::Enterprise
+                    )
+                {
+                    crate::ee_oss::anchor_audit_logs_s3_checkpoint_env_var(&db).await;
+                }
+            });
+        }
+        pass.required_setting(
+            REQUEST_SIZE_LIMIT_SETTING,
+            "REQUEST_SIZE_LIMIT",
+            DEFAULT_BODY_LIMIT,
+            REQUEST_SIZE_LIMIT.clone(),
+            |x| x.mul(1024 * 1024),
+        );
+        pass.option_setting(
+            SAML_METADATA_SETTING,
+            "SAML_METADATA",
+            SAML_METADATA.clone(),
+        );
+        pass.option_setting(SCIM_TOKEN_SETTING, "SCIM_TOKEN", SCIM_TOKEN.clone());
+
+        // Ensure audit partitions exist before any requests arrive. A step rather than a
+        // plain await: it drops partitions past `audit_log_retention_days`, so running it
+        // before that setting is applied would sweep with the compile-time default.
+        if let Some(db) = conn.as_sql() {
+            pass.action(async move {
+                manage_audit_partitions(&db, audit_log_retention_days().await).await
+            });
+        }
+    }
+
+    if worker_mode {
+        use windmill_common::global_settings as gs;
+        pass.option_setting(
+            JOB_DEFAULT_TIMEOUT_SECS_SETTING,
+            "JOB_DEFAULT_TIMEOUT_SECS",
+            JOB_DEFAULT_TIMEOUT.clone(),
+        );
+        pass.setting(JOB_ISOLATION_SETTING, true, apply_job_isolation_setting);
+        pass.option_setting(
+            NSJAIL_TMPFS_SIZE_MB_SETTING,
+            "NSJAIL_TMPFS_SIZE_MB",
+            NSJAIL_TMPFS_SIZE_MB.clone(),
+        );
+        pass.option_setting(
+            NSJAIL_TMP_BACKING_SETTING,
+            "NSJAIL_TMP_BACKING",
+            NSJAIL_TMP_BACKING.clone(),
+        );
+        pass.option_setting(
+            SANDBOX_IMAGE_MAX_SIZE_MB_SETTING,
+            "SANDBOX_IMAGE_MAX_SIZE_MB",
+            SANDBOX_IMAGE_MAX_SIZE_MB.clone(),
+        );
+        pass.option_setting(
+            SANDBOX_IMAGE_CACHE_MAX_MB_SETTING,
+            "SANDBOX_IMAGE_CACHE_MAX_MB",
+            SANDBOX_IMAGE_CACHE_MAX_MB.clone(),
+        );
+        pass.option_setting(
+            SANDBOX_IMAGE_PULL_POLICY_SETTING,
+            "SANDBOX_IMAGE_PULL_POLICY",
+            SANDBOX_IMAGE_PULL_POLICY.clone(),
+        );
+        pass.option_setting(
+            SANDBOX_IMAGE_DEFAULT_REGISTRY_SETTING,
+            "SANDBOX_IMAGE_DEFAULT_REGISTRY",
+            SANDBOX_IMAGE_DEFAULT_REGISTRY.clone(),
+        );
+        pass.setting(
+            SANDBOX_REGISTRY_AUTH_SETTING,
+            true,
+            apply_sandbox_registry_auth_setting,
+        );
+        pass.option_setting(
+            EXTRA_PIP_INDEX_URL_SETTING,
+            "PIP_EXTRA_INDEX_URL",
+            PIP_EXTRA_INDEX_URL.clone(),
+        );
+        pass.option_setting(
+            PIP_INDEX_URL_SETTING,
+            "PIP_INDEX_URL",
+            PIP_INDEX_URL.clone(),
+        );
+        pass.option_setting(
+            UV_INDEX_STRATEGY_SETTING,
+            "UV_INDEX_STRATEGY",
+            UV_INDEX_STRATEGY.clone(),
+        );
+        pass.option_setting(
+            UV_EXCLUDE_NEWER_SETTING,
+            "UV_EXCLUDE_NEWER",
+            UV_EXCLUDE_NEWER.clone(),
+        );
+        pass.option_setting(
+            UV_PYTHON_INSTALL_MIRROR_SETTING,
+            "UV_PYTHON_INSTALL_MIRROR",
+            UV_PYTHON_INSTALL_MIRROR.clone(),
+        );
+        pass.option_setting(
+            BUN_INSTALL_MIN_RELEASE_AGE_SETTING,
+            "BUN_INSTALL_MIN_RELEASE_AGE",
+            BUN_INSTALL_MIN_RELEASE_AGE.clone(),
+        );
+        pass.option_setting(
+            NPM_CONFIG_REGISTRY_SETTING,
+            "NPM_CONFIG_REGISTRY",
+            NPM_CONFIG_REGISTRY.clone(),
+        );
+        pass.option_setting(
+            BUNFIG_INSTALL_SCOPES_SETTING,
+            "BUNFIG_INSTALL_SCOPES",
+            BUNFIG_INSTALL_SCOPES.clone(),
+        );
+        pass.option_setting(NPMRC_SETTING, "NPMRC", NPMRC.clone());
+        pass.option_setting(
+            INSTANCE_PYTHON_VERSION_SETTING,
+            "INSTANCE_PYTHON_VERSION",
+            INSTANCE_PYTHON_VERSION.clone(),
+        );
+        pass.option_setting(NUGET_CONFIG_SETTING, "NUGET_CONFIG", NUGET_CONFIG.clone());
+        pass.option_setting(
+            POWERSHELL_REPO_URL_SETTING,
+            "POWERSHELL_REPO_URL",
+            POWERSHELL_REPO_URL.clone(),
+        );
+        pass.option_setting(
+            POWERSHELL_REPO_PAT_SETTING,
+            "POWERSHELL_REPO_PAT",
+            POWERSHELL_REPO_PAT.clone(),
+        );
+        pass.option_setting(gs::MAVEN_REPOS_SETTING, "MAVEN_REPOS", MAVEN_REPOS.clone());
+        pass.option_setting(
+            gs::MAVEN_SETTINGS_XML_SETTING,
+            "MAVEN_SETTINGS_XML",
+            MAVEN_SETTINGS_XML.clone(),
+        );
+        pass.action(write_maven_settings_xml());
+        pass.setting(gs::NO_DEFAULT_MAVEN_SETTING, true, |v| async move {
+            apply_no_default_maven_setting(v)
+        });
+        pass.url_list_setting(
+            gs::RUBY_REPOS_SETTING,
+            "RUBY_REPOS",
+            windmill_worker::RUBY_REPOS.clone(),
+        );
+        pass.option_setting(
+            gs::CARGO_REGISTRIES_SETTING,
+            "CARGO_REGISTRIES",
+            CARGO_REGISTRIES.clone(),
+        );
+        pass.setting(
+            gs::WORKSPACE_REGISTRIES_SETTING,
+            true,
+            apply_workspace_registries_setting,
+        );
+    }
+
+    pass.run(conn).await;
+}
+
+pub fn apply_metrics_enabled(value: Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Bool(t)) = value {
+        METRICS_ENABLED.store(t, Ordering::Relaxed)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OtelSetting {
+    metrics_enabled: Option<bool>,
+    logs_enabled: Option<bool>,
+    tracing_enabled: Option<bool>,
+    #[serde(default, deserialize_with = "empty_as_none")]
+    otel_exporter_otlp_endpoint: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_none")]
+    otel_exporter_otlp_headers: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_none")]
+    otel_exporter_otlp_protocol: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_none")]
+    otel_exporter_otlp_compression: Option<String>,
+}
+
+pub async fn load_otel(db: &DB) {
+    let otel = load_value_from_global_settings(db, OTEL_SETTING).await;
+    if let Ok(v) = otel {
+        if let Some(v) = v {
+            let deser = serde_json::from_value::<OtelSetting>(v);
+            if let Ok(o) = deser {
+                let metrics_enabled = o.metrics_enabled.unwrap_or_else(|| {
+                    std::env::var("OTEL_METRICS_ENABLED")
+                        .map(|x| x.parse::<bool>().unwrap_or(false))
+                        .unwrap_or(false)
+                });
+                let logs_enabled = o.logs_enabled.unwrap_or_else(|| {
+                    std::env::var("OTEL_LOGS_ENABLED")
+                        .map(|x| x.parse::<bool>().unwrap_or(false))
+                        .unwrap_or(false)
+                });
+                let tracing_enabled = o.tracing_enabled.unwrap_or_else(|| {
+                    std::env::var("OTEL_TRACING_ENABLED")
+                        .map(|x| x.parse::<bool>().unwrap_or(false))
+                        .unwrap_or(false)
+                });
+
+                OTEL_METRICS_ENABLED.store(metrics_enabled, Ordering::Relaxed);
+                OTEL_LOGS_ENABLED.store(logs_enabled, Ordering::Relaxed);
+                OTEL_TRACING_ENABLED.store(tracing_enabled, Ordering::Relaxed);
+
+                let endpoint = if let Some(endpoint) = o.otel_exporter_otlp_endpoint {
+                    unsafe {
+                        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.clone());
+                    }
+                    Some(endpoint.clone())
+                } else {
+                    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()
+                };
+
+                let headers = if let Some(headers) = o.otel_exporter_otlp_headers {
+                    unsafe {
+                        std::env::set_var("OTEL_EXPORTER_OTLP_HEADERS", headers.clone());
+                    }
+                    Some(headers.clone())
+                } else {
+                    std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok()
+                };
+
+                if let Some(protocol) = o.otel_exporter_otlp_protocol {
+                    unsafe {
+                        std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", protocol);
+                    }
+                }
+                if let Some(compression) = o.otel_exporter_otlp_compression {
+                    unsafe {
+                        std::env::set_var("OTEL_EXPORTER_OTLP_COMPRESSION", compression);
+                    }
+                }
+                println!("OTEL settings loaded: tracing ({tracing_enabled}), logs ({logs_enabled}), metrics ({metrics_enabled}), endpoint ({:?}), headers defined: ({})",
+                endpoint, headers.is_some());
+            } else {
+                tracing::error!("Error deserializing otel settings");
+            }
+        }
+    } else {
+        tracing::error!("Error loading otel settings: {}", otel.unwrap_err());
+    }
+}
+
+pub async fn load_tag_per_workspace_enabled(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, DEFAULT_TAGS_PER_WORKSPACE_SETTING).await?;
+    apply_tag_per_workspace_enabled(v);
+    Ok(())
+}
+
+pub fn apply_tag_per_workspace_enabled(value: Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Bool(t)) = value {
+        DEFAULT_TAGS_PER_WORKSPACE.store(t, Ordering::Relaxed)
+    }
+}
+
+pub async fn load_tag_per_workspace_workspaces(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, DEFAULT_TAGS_WORKSPACES_SETTING).await?;
+    apply_tag_per_workspace_workspaces(v);
+    Ok(())
+}
+
+pub fn apply_tag_per_workspace_workspaces(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Array(t)) => {
+            let workspaces = t
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            DEFAULT_TAGS_WORKSPACES.store(std::sync::Arc::new(Some(workspaces)));
+        }
+        None => {
+            DEFAULT_TAGS_WORKSPACES.store(std::sync::Arc::new(None));
+        }
+        _ => (),
+    };
+}
+
+pub async fn load_preview_tags_override(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, PREVIEW_TAGS_OVERRIDE_SETTING).await?;
+    apply_preview_tags_override(v);
+    Ok(())
+}
+
+pub fn apply_preview_tags_override(value: Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Bool(t)) = value {
+        PREVIEW_TAGS_OVERRIDE.store(t, Ordering::Relaxed)
+    }
+}
+
+pub async fn load_dependency_job_tag(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, DEPENDENCY_JOB_TAG_SETTING).await?;
+    apply_dependency_job_tag(v);
+    Ok(())
+}
+
+pub fn apply_dependency_job_tag(value: Option<serde_json::Value>) {
+    let tag = match value {
+        Some(serde_json::Value::String(t)) if !t.trim().is_empty() => Some(t.trim().to_string()),
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => None,
+        Some(other) => {
+            tracing::error!("{DEPENDENCY_JOB_TAG_SETTING} is not a string: {other}, ignoring");
+            return;
+        }
+    };
+    DEPENDENCY_JOB_TAG.store(std::sync::Arc::new(tag));
+}
+
+// Upper bound on the duration window. Postgres `make_interval(secs => $1::int4)` is the consumer
+// downstream, so this stays comfortably below `i32::MAX` and the subsequent `u32 -> i32` cast in
+// `workspace_fairness::refresh_overloaded` cannot wrap into a negative interval (which would
+// silently turn `now() - interval` into a future timestamp and disable the completed-jobs half
+// of the activity signal). A day is the practical ceiling for a "rolling window" knob.
+const WORKSPACE_FAIRNESS_DURATION_SECS_MAX: u64 = 86_400;
+
+/// Min-total floor is a counting threshold; cap at `u32::MAX` to make wraparound impossible
+/// while still leaving more headroom than any realistic cluster will need.
+const WORKSPACE_FAIRNESS_MIN_TOTAL_MAX: u64 = u32::MAX as u64;
+
+// Defaults used when a fairness knob is unset (row missing or row deleted via NULL/empty value).
+// Must stay in sync with the `AtomicU32::new(...)` initialisers in `windmill-common/src/worker.rs`
+// so a process that has never seen the setting reads the same value as one that just saw it
+// cleared.
+const WORKSPACE_FAIRNESS_MAX_PERCENT_DEFAULT: u32 = 50;
+const WORKSPACE_FAIRNESS_DURATION_SECS_DEFAULT: u32 = 10;
+const WORKSPACE_FAIRNESS_MIN_TOTAL_DEFAULT: u32 = 4;
+
+/// The cap is used as a SQL `LIMIT`, so it must survive the `u32 -> i64` widening without
+/// becoming absurd; `u32::MAX` is already far beyond any queue depth worth allowing.
+const CONCURRENCY_KEY_MAX_QUEUED_MAX: u64 = u32::MAX as u64;
+
+pub async fn load_workspace_fairness_enabled(db: &DB) -> error::Result<()> {
+    // Match the convention used by `load_preview_tags_override` /
+    // `load_fork_workspace_tag_append_fork_suffix`: on transient DB errors, leave the in-memory
+    // atomic untouched rather than silently toggling the feature off across the whole cluster
+    // (which would also trigger an unnecessary `store_pull_query` rebuild — exactly when DB load
+    // is probably highest).
+    let v = load_value_from_global_settings(db, WORKSPACE_FAIRNESS_ENABLED_SETTING).await?;
+    apply_workspace_fairness_enabled(v).await;
+    Ok(())
+}
+
+pub async fn apply_workspace_fairness_enabled(value: Option<serde_json::Value>) {
+    let new_enabled = match value {
+        Some(serde_json::Value::Bool(t)) => t,
+        // Setting unset / non-bool → explicit off.
+        _ => false,
+    };
+    let prev = WORKSPACE_FAIRNESS_ENABLED.swap(new_enabled, Ordering::Relaxed);
+    // Re-store the pull queries so the fairness variants appear/disappear in
+    // lockstep with the toggle.
+    if prev != new_enabled {
+        let wc = windmill_common::worker::WORKER_CONFIG.load_full();
+        store_pull_query(&wc).await;
+    }
+}
+
+pub async fn load_workspace_fairness_max_percent(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, WORKSPACE_FAIRNESS_MAX_PERCENT_SETTING).await?;
+    apply_workspace_fairness_max_percent(v);
+    Ok(())
+}
+
+// Distinguish three outcomes:
+//   - `Err(_)`: transient DB issue. Leave the atomic alone (don't clobber a known-good value
+//     because of a network blip during a notify-event propagation).
+//   - `Ok(None)` or `Ok(Some(invalid))`: setting is unset / explicitly cleared / corrupt.
+//     Restore the default so a deletion via the admin UI actually takes effect at runtime
+//     instead of leaving the stale in-memory value pinned until restart.
+//   - `Ok(Some(valid))`: clamp and store.
+pub fn apply_workspace_fairness_max_percent(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Number(n)) => {
+            let v = n
+                .as_u64()
+                .map(|u| u.clamp(1, 100) as u32)
+                .unwrap_or(WORKSPACE_FAIRNESS_MAX_PERCENT_DEFAULT);
+            WORKSPACE_FAIRNESS_MAX_PERCENT.store(v, Ordering::Relaxed);
+        }
+        _ => {
+            WORKSPACE_FAIRNESS_MAX_PERCENT
+                .store(WORKSPACE_FAIRNESS_MAX_PERCENT_DEFAULT, Ordering::Relaxed);
+        }
+    }
+}
+
+pub async fn load_workspace_fairness_duration_secs(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, WORKSPACE_FAIRNESS_DURATION_SECS_SETTING).await?;
+    apply_workspace_fairness_duration_secs(v);
+    Ok(())
+}
+
+// See `load_workspace_fairness_max_percent` for the Err / None / invalid policy.
+pub fn apply_workspace_fairness_duration_secs(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Number(n)) => {
+            // Clamp to the safe range before narrowing. The downstream `u32 -> i32` cast in
+            // `workspace_fairness::refresh_overloaded` makes any value above `i32::MAX` toxic
+            // (sign flip → negative interval → silent disable of the completed-jobs scan).
+            let v = n
+                .as_u64()
+                .map(|u| u.clamp(1, WORKSPACE_FAIRNESS_DURATION_SECS_MAX) as u32)
+                .unwrap_or(WORKSPACE_FAIRNESS_DURATION_SECS_DEFAULT);
+            WORKSPACE_FAIRNESS_DURATION_SECS.store(v, Ordering::Relaxed);
+        }
+        _ => {
+            WORKSPACE_FAIRNESS_DURATION_SECS
+                .store(WORKSPACE_FAIRNESS_DURATION_SECS_DEFAULT, Ordering::Relaxed);
+        }
+    }
+}
+
+pub async fn load_workspace_fairness_min_total(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, WORKSPACE_FAIRNESS_MIN_TOTAL_SETTING).await?;
+    apply_workspace_fairness_min_total(v);
+    Ok(())
+}
+
+// See `load_workspace_fairness_max_percent` for the Err / None / invalid policy.
+pub fn apply_workspace_fairness_min_total(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Number(n)) => {
+            // Clamp before narrowing — same reasoning as `_duration_secs`, just for the
+            // counting threshold rather than the interval.
+            let v = n
+                .as_u64()
+                .map(|u| u.min(WORKSPACE_FAIRNESS_MIN_TOTAL_MAX) as u32)
+                .unwrap_or(WORKSPACE_FAIRNESS_MIN_TOTAL_DEFAULT);
+            WORKSPACE_FAIRNESS_MIN_TOTAL.store(v, Ordering::Relaxed);
+        }
+        _ => {
+            WORKSPACE_FAIRNESS_MIN_TOTAL
+                .store(WORKSPACE_FAIRNESS_MIN_TOTAL_DEFAULT, Ordering::Relaxed);
+        }
+    }
+}
+
+pub async fn load_concurrency_key_max_queued(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, CONCURRENCY_KEY_MAX_QUEUED_SETTING).await?;
+    apply_concurrency_key_max_queued(v);
+    Ok(())
+}
+
+// See `load_workspace_fairness_max_percent` for the Err / None / invalid policy.
+pub fn apply_concurrency_key_max_queued(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Number(n)) => {
+            // `0` is a meaningful value here (disable the cap), so unlike the fairness knobs
+            // the lower bound is 0 rather than 1.
+            let v = n
+                .as_u64()
+                .map(|u| u.min(CONCURRENCY_KEY_MAX_QUEUED_MAX) as u32)
+                .unwrap_or_else(|| {
+                    // Warn rather than silently defaulting: `-1` and `"0"` are plausible
+                    // attempts to disable the cap, and both would otherwise land on 10000.
+                    tracing::warn!(
+                        "{CONCURRENCY_KEY_MAX_QUEUED_SETTING}={n} is not a non-negative integer, \
+                         falling back to {CONCURRENCY_KEY_MAX_QUEUED_DEFAULT}. Set 0 to disable."
+                    );
+                    CONCURRENCY_KEY_MAX_QUEUED_DEFAULT
+                });
+            CONCURRENCY_KEY_MAX_QUEUED.store(v, Ordering::Relaxed);
+        }
+        other => {
+            if let Some(v) = other {
+                tracing::warn!(
+                    "{CONCURRENCY_KEY_MAX_QUEUED_SETTING}={v} is not a number, falling back to \
+                     {CONCURRENCY_KEY_MAX_QUEUED_DEFAULT}. Set 0 to disable."
+                );
+            }
+            CONCURRENCY_KEY_MAX_QUEUED.store(CONCURRENCY_KEY_MAX_QUEUED_DEFAULT, Ordering::Relaxed);
+        }
+    }
+}
+
+pub async fn load_workspace_max_queued_jobs(db: &DB) -> error::Result<()> {
+    // Only the cloud enforces this cap, so never spend the query off-cloud, from any call site.
+    if !*CLOUD_HOSTED {
+        return Ok(());
+    }
+    let v = load_value_from_global_settings(db, WORKSPACE_MAX_QUEUED_JOBS_SETTING).await?;
+    apply_workspace_max_queued_jobs(v);
+    Ok(())
+}
+
+/// Same Err / None / invalid policy as [`apply_concurrency_key_max_queued`]: 0 disables.
+pub fn apply_workspace_max_queued_jobs(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Number(n)) => {
+            let v = n
+                .as_u64()
+                .map(|u| u.min(CONCURRENCY_KEY_MAX_QUEUED_MAX) as u32)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "{WORKSPACE_MAX_QUEUED_JOBS_SETTING}={n} is not a non-negative integer, \
+                         falling back to {WORKSPACE_MAX_QUEUED_JOBS_DEFAULT}. Set 0 to disable."
+                    );
+                    WORKSPACE_MAX_QUEUED_JOBS_DEFAULT
+                });
+            WORKSPACE_MAX_QUEUED_JOBS.store(v, Ordering::Relaxed);
+        }
+        other => {
+            if let Some(v) = other {
+                tracing::warn!(
+                    "{WORKSPACE_MAX_QUEUED_JOBS_SETTING}={v} is not a number, falling back to \
+                     {WORKSPACE_MAX_QUEUED_JOBS_DEFAULT}. Set 0 to disable."
+                );
+            }
+            WORKSPACE_MAX_QUEUED_JOBS.store(WORKSPACE_MAX_QUEUED_JOBS_DEFAULT, Ordering::Relaxed);
+        }
+    }
+}
+
+pub async fn load_fork_workspace_tag_append_fork_suffix(db: &DB) -> error::Result<()> {
+    let v =
+        load_value_from_global_settings(db, FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX_SETTING).await?;
+    apply_fork_workspace_tag_append_fork_suffix(v);
+    Ok(())
+}
+
+pub fn apply_fork_workspace_tag_append_fork_suffix(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Bool(t)) => {
+            FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX.store(t, Ordering::Relaxed)
+        }
+        None => FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX.store(false, Ordering::Relaxed),
+        _ => (),
+    };
+}
+
+/// Returns whether the suffix changed, in which case a worker must reload its config: a group
+/// serving dev workspaces listens to its tags expanded with it.
+pub async fn load_dev_workspace_tag_suffix(db: &DB) -> error::Result<bool> {
+    let v = load_value_from_global_settings(db, DEV_WORKSPACE_TAG_SUFFIX_SETTING).await?;
+    Ok(apply_dev_workspace_tag_suffix(v))
+}
+
+pub fn apply_dev_workspace_tag_suffix(value: Option<serde_json::Value>) -> bool {
+    let suffix = match value {
+        Some(serde_json::Value::String(t)) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => DEFAULT_DEV_WORKSPACE_TAG_SUFFIX.to_string(),
+    };
+    if !is_valid_dev_workspace_tag_suffix(&suffix) {
+        tracing::error!("Ignoring invalid dev workspace tag suffix {suffix:?}");
+        return false;
+    }
+    let prev = DEV_WORKSPACE_TAG_SUFFIX.swap(std::sync::Arc::new(suffix.clone()));
+    *prev != suffix
+}
+
+pub async fn load_dev_workspace_isolation(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, DEV_WORKSPACE_ISOLATION_SETTING).await?;
+    apply_dev_workspace_isolation(v);
+    Ok(())
+}
+
+pub fn apply_dev_workspace_isolation(value: Option<serde_json::Value>) {
+    DEV_WORKSPACE_ISOLATION.store(
+        matches!(value, Some(serde_json::Value::Bool(true))),
+        Ordering::Relaxed,
+    );
+}
+
+pub async fn load_dev_workspace_isolation_skip_non_dev_forks(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, DEV_WORKSPACE_ISOLATION_SKIP_NON_DEV_FORKS_SETTING)
+        .await?;
+    apply_dev_workspace_isolation_skip_non_dev_forks(v);
+    Ok(())
+}
+
+pub fn apply_dev_workspace_isolation_skip_non_dev_forks(value: Option<serde_json::Value>) {
+    DEV_WORKSPACE_ISOLATION_SKIP_NON_DEV_FORKS.store(
+        matches!(value, Some(serde_json::Value::Bool(true))),
+        Ordering::Relaxed,
+    );
+}
+
+pub async fn reload_critical_alert_mute_ui_setting(conn: &Connection) -> error::Result<()> {
+    let v = load_value_from_global_settings_with_conn(conn, CRITICAL_ALERT_MUTE_UI_SETTING, true)
+        .await?;
+    apply_critical_alert_mute_ui_setting(v);
+    Ok(())
+}
+
+pub fn apply_critical_alert_mute_ui_setting(value: Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Bool(t)) = value {
+        CRITICAL_ALERT_MUTE_UI_ENABLED.store(t, Ordering::Relaxed);
+    }
+}
+
+pub async fn reload_critical_alerts_on_token_expiry_setting(
+    conn: &Connection,
+) -> error::Result<()> {
+    let v = load_value_from_global_settings_with_conn(
+        conn,
+        CRITICAL_ALERTS_ON_TOKEN_EXPIRY_SETTING,
+        true,
+    )
+    .await?;
+    apply_critical_alerts_on_token_expiry_setting(v);
+    Ok(())
+}
+
+pub fn apply_critical_alerts_on_token_expiry_setting(value: Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Bool(t)) = value {
+        CRITICAL_ALERTS_ON_TOKEN_EXPIRY.store(t, Ordering::Relaxed);
+    }
+}
+
+pub async fn reload_critical_alert_mute_zombie_job_restart_setting(
+    conn: &Connection,
+) -> error::Result<()> {
+    let v = load_value_from_global_settings_with_conn(
+        conn,
+        CRITICAL_ALERT_MUTE_ZOMBIE_JOB_RESTART_SETTING,
+        true,
+    )
+    .await?;
+    apply_critical_alert_mute_zombie_job_restart_setting(v);
+    Ok(())
+}
+
+pub fn apply_critical_alert_mute_zombie_job_restart_setting(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Bool(t)) => {
+            CRITICAL_ALERT_MUTE_ZOMBIE_JOB_RESTART.store(t, Ordering::Relaxed)
+        }
+        // Deleting the row must un-mute: keeping the last value would leave an instance
+        // silently muted until the next restart.
+        None => CRITICAL_ALERT_MUTE_ZOMBIE_JOB_RESTART.store(false, Ordering::Relaxed),
+        _ => (),
+    };
+}
+
+pub async fn load_metrics_debug_enabled(conn: &Connection) -> error::Result<()> {
+    let v =
+        load_value_from_global_settings_with_conn(conn, EXPOSE_DEBUG_METRICS_SETTING, true).await?;
+    apply_metrics_debug_enabled(v);
+    Ok(())
+}
+
+pub fn apply_metrics_debug_enabled(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Bool(t)) => {
+            METRICS_DEBUG_ENABLED.store(t, Ordering::Relaxed);
+            //_RJEM_MALLOC_CONF=prof:true,prof_active:false,lg_prof_interval:30,lg_prof_sample:21,prof_prefix:/tmp/jeprof
+            #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+            if std::env::var("_RJEM_MALLOC_CONF").is_ok() {
+                if let Err(e) = set_prof_active(t) {
+                    tracing::error!("Error setting jemalloc prof_active: {e:?}");
+                }
+            }
+        }
+        _ => (),
+    };
+}
+
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+#[derive(Debug, Clone)]
+pub struct MallctlError {
+    #[allow(unused)]
+    pub code: i32,
+}
+
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+fn set_prof_active(new_value: bool) -> Result<(), MallctlError> {
+    let option_name = std::ffi::CString::new("prof.active").unwrap();
+
+    tracing::info!("Setting jemalloc prof_active to {}", new_value);
+    let result = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            option_name.as_ptr(),              // const char *name
+            std::ptr::null_mut(),              // void *oldp
+            std::ptr::null_mut(),              // size_t *oldlenp
+            &new_value as *const _ as *mut _,  // void *newp
+            std::mem::size_of_val(&new_value), // size_t newlen
+        )
+    };
+
+    if result != 0 {
+        return Err(MallctlError { code: result });
+    }
+
+    Ok(())
+}
+
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+pub fn bytes_to_mb(bytes: u64) -> f64 {
+    const BYTES_PER_MB: f64 = 1_048_576.0;
+    bytes as f64 / BYTES_PER_MB
+}
+
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+pub async fn monitor_mem() {
+    use std::time::Duration;
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    tokio::spawn(async move {
+        // Obtain a MIB for the `epoch`, `stats.allocated`, and
+        // `atats.resident` keys:
+        let e = match epoch::mib() {
+            Ok(mib) => mib,
+            Err(e) => {
+                tracing::error!("Error getting jemalloc epoch mib: {:?}", e);
+                return;
+            }
+        };
+        let allocated = match stats::allocated::mib() {
+            Ok(mib) => mib,
+            Err(e) => {
+                tracing::error!("Error getting jemalloc allocated mib: {:?}", e);
+                return;
+            }
+        };
+        let resident = match stats::resident::mib() {
+            Ok(mib) => mib,
+            Err(e) => {
+                tracing::error!("Error getting jemalloc resident mib: {:?}", e);
+                return;
+            }
+        };
+
+        loop {
+            // Many statistics are cached and only updated
+            // when the epoch is advanced:
+            match e.advance() {
+                Ok(_) => {
+                    // Read statistics using MIB key:
+                    let allocated = allocated.read().unwrap_or_default();
+                    let resident = resident.read().unwrap_or_default();
+                    tracing::info!(
+                        "{} mb allocated/{} mb resident",
+                        bytes_to_mb(allocated as u64),
+                        bytes_to_mb(resident as u64)
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Error advancing jemalloc epoch: {:?}", e);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+}
+
+async fn sleep_until_next_minute_start_plus_one_s() {
+    let now = Utc::now();
+    let next_minute = now + Duration::from_secs(60 - now.timestamp() as u64 % 60 + 1);
+    tokio::time::sleep(tokio::time::Duration::from_secs(
+        next_minute.timestamp() as u64 - now.timestamp() as u64,
+    ))
+    .await;
+}
+
+use windmill_common::tracing_init::TMP_WINDMILL_LOGS_SERVICE;
+
+/// The minutely rolling appender names each file `<hostname>.log.<%Y-%m-%d-%H-%M>`;
+/// anything else in the directory is not a rotated log file.
+fn parse_log_file_ts(file_name: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(
+        file_name.rsplit('.').next()?,
+        windmill_common::tracing_init::LOG_TIMESTAMP_FMT,
+    )
+    .ok()
+}
+
+/// Oldest first. Readdir order is filesystem-dependent — tmpfs hands back the
+/// newest entry first, ext4 hashes the names — so the listing has to be sorted
+/// before anything picks a file out of it.
+fn sorted_log_files(file_names: impl Iterator<Item = String>) -> Vec<(NaiveDateTime, String)> {
+    let mut files = file_names
+        .filter_map(|name| parse_log_file_ts(&name).map(|ts| (ts, name)))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+/// Every log file but the newest one: that one is still being appended to, every
+/// older one is final.
+fn rotated_log_files(file_names: impl Iterator<Item = String>) -> Vec<(NaiveDateTime, String)> {
+    let mut files = sorted_log_files(file_names);
+    files.pop();
+    files
+}
+
+async fn read_log_file_names(hostname: &str) -> Vec<String> {
+    let log_dir = format!("{}/{}/", *TMP_WINDMILL_LOGS_SERVICE, hostname);
+    let mut rd_dir = match tokio::fs::read_dir(&log_dir).await {
+        Ok(rd_dir) => rd_dir,
+        Err(e) => {
+            tracing::error!("Error reading log files: {}, {:#?}", log_dir, e);
+            return vec![];
+        }
+    };
+    let mut file_names = vec![];
+    while let Ok(Some(file)) = rd_dir.next_entry().await {
+        if let Some(file_name) = file.file_name().to_str() {
+            file_names.push(file_name.to_string());
+        }
+    }
+    file_names
+}
+
+async fn list_log_files(hostname: &str) -> Vec<(NaiveDateTime, String)> {
+    sorted_log_files(read_log_file_names(hostname).await.into_iter())
+}
+
+async fn list_rotated_log_files(hostname: &str) -> Vec<(NaiveDateTime, String)> {
+    rotated_log_files(read_log_file_names(hostname).await.into_iter())
+}
+
+fn get_worker_group(mode: &Mode) -> Option<String> {
+    let worker_group = WORKER_GROUP.clone();
+    if worker_group.is_empty() || mode == &Mode::Server || mode == &Mode::Indexer {
+        None
+    } else {
+        Some(worker_group)
+    }
+}
+
+pub fn send_logs_to_object_store(conn: &Connection, hostname: &str, mode: &Mode) {
+    let conn = conn.clone();
+    let hostname = hostname.to_string();
+    let mode = mode.clone();
+    let worker_group = get_worker_group(&mode);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        init_last_log_file_sent(&conn, &hostname).await;
+        sleep_until_next_minute_start_plus_one_s().await;
+        loop {
+            interval.tick().await;
+            let files = list_rotated_log_files(&hostname).await;
+            send_log_files_to_object_store(&hostname, &mode, &worker_group, &conn, files).await;
+        }
+    });
+}
+
+pub async fn flush_pending_log_files_to_object_store(
+    conn: &Connection,
+    hostname: &str,
+    mode: &Mode,
+) {
+    tracing::info!("Sending pending log files to object store");
+    let worker_group = get_worker_group(&mode);
+    // Nothing rotates after this, so the file still being appended to is registered
+    // here, along with any rotated one the loop had not reached yet. Bounded like the
+    // pool close that follows: a backlog against a slow object store would otherwise
+    // hold the process past its termination grace period. Whatever is left over is
+    // registered by the next run's catch-up.
+    let flush = async {
+        let files = list_log_files(hostname).await;
+        send_log_files_to_object_store(hostname, mode, &worker_group, conn, files).await;
+    };
+    if timeout(Duration::from_secs(15), flush).await.is_err() {
+        tracing::warn!("Could not send all pending log files in time (15s). Exiting anyway.");
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref LAST_LOG_FILE_SENT: Arc<Mutex<Option<NaiveDateTime>>> = Arc::new(Mutex::new(None));
+    /// Serializes the periodic uploader against the shutdown flush. The uploader is a
+    /// detached task that keeps ticking while the flush runs and both walk the same
+    /// files, so without this both can clear the watermark for one file and count its
+    /// lines twice through the additive upsert.
+    static ref SENDING_LOG_FILES: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+}
+
+fn last_log_file_sent() -> Option<NaiveDateTime> {
+    LAST_LOG_FILE_SENT.lock().ok().and_then(|ts| *ts)
+}
+
+/// Resume from what this host already registered, so a previous run's leftovers reach
+/// the object store rather than being dropped. Their line counts come out zero, this
+/// run having counted none of them, which only flattens their bars in the UI.
+///
+/// The newest registered minute is left out on purpose: the shutdown flush registers
+/// the file that was still open and the appender reopens that minute in append mode,
+/// so a restart inside it would otherwise strand everything written afterwards.
+///
+/// A row rewritten this way restores the object and sums the counters, but it keeps the
+/// `indexed_at` it already had, so one the indexers have taken is not offered again and
+/// the lines added by the rewrite stay out of search.
+async fn init_last_log_file_sent(conn: &Connection, hostname: &str) {
+    let Some(db) = conn.as_sql() else {
+        return;
+    };
+    match sqlx::query_scalar!(
+        "SELECT max(log_ts) FROM log_file
+         WHERE hostname = $1 AND log_ts < (SELECT max(log_ts) FROM log_file WHERE hostname = $1)",
+        hostname
+    )
+    .fetch_one(db)
+    .await
+    {
+        Ok(Some(ts)) => {
+            if let Err(e) = LAST_LOG_FILE_SENT.lock().map(|mut last_log_file_sent| {
+                last_log_file_sent.replace(ts);
+            }) {
+                tracing::error!("Error initializing last log file sent: {:?}", e);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::error!("Error loading last log file sent: {:?}", e),
+    }
+}
+
+async fn send_log_files_to_object_store(
+    hostname: &str,
+    mode: &Mode,
+    worker_group: &Option<String>,
+    conn: &Connection,
+    files: Vec<(NaiveDateTime, String)>,
+) {
+    let _guard = SENDING_LOG_FILES.lock().await;
+    let retention_cutoff = Utc::now().naive_utc()
+        - chrono::Duration::seconds(windmill_common::service_log_retention_secs());
+    for (ts, file_name) in files {
+        if last_log_file_sent().is_some_and(|last| last >= ts) {
+            continue;
+        }
+        // A run coming back from a long outage still finds its predecessor's files on
+        // disk. Registering one past the retention cutoff inserts a row
+        // `delete_expired_items` drops on its next pass, once the indexers have already
+        // paid to parse it.
+        if ts < retention_cutoff {
+            continue;
+        }
+        // Stop at the first failure rather than moving on, so a file is never
+        // registered before an older one that has not made it to the store yet.
+        // The indexers do not depend on that ordering — every row is offered until
+        // it is marked — but a gap here would still be visible while it lasts.
+        if !send_log_file_to_object_store(hostname, mode, worker_group, conn, &file_name, ts).await
+        {
+            break;
+        }
+    }
+}
+
+/// Returns whether the file ended up registered in `log_file`.
+async fn send_log_file_to_object_store(
+    hostname: &str,
+    mode: &Mode,
+    worker_group: &Option<String>,
+    conn: &Connection,
+    file_name: &str,
+    ts: NaiveDateTime,
+) -> bool {
+    #[cfg(feature = "parquet")]
+    if let Some(s3_client) = windmill_object_store::get_object_store().await {
+        let path = std::path::Path::new(&*TMP_WINDMILL_LOGS_SERVICE)
+            .join(hostname)
+            .join(file_name);
+
+        //read file as byte stream
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("Error reading log file: {:?}", e);
+                return false;
+            }
+        };
+        let path = windmill_object_store::object_store_reexports::Path::from_url_path(format!(
+            "{}{hostname}/{file_name}",
+            windmill_common::tracing_init::LOGS_SERVICE
+        ));
+        let path = match path {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Error creating log file path: {:?}", e);
+                return false;
+            }
+        };
+        if let Err(e) = s3_client.put(&path, bytes.into()).await {
+            tracing::error!("Error sending logs to object store: {:?}", e);
+            return false;
+        }
+    }
+
+    let ts_str = ts
+        .format(windmill_common::tracing_init::LOG_TIMESTAMP_FMT)
+        .to_string();
+    let (ok_lines, err_lines) = read_log_counters(ts_str);
+
+    let Some(db) = conn.as_sql() else {
+        // not sending log file to object store in agent mode
+        return false;
+    };
+
+    match timeout(Duration::from_secs(10), sqlx::query!("INSERT INTO log_file (hostname, mode, worker_group, log_ts, file_path, ok_lines, err_lines, json_fmt)
+     VALUES ($1, $2::text::LOG_MODE, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (hostname, log_ts) DO UPDATE SET ok_lines = log_file.ok_lines + $6, err_lines = log_file.err_lines + $7",
+        hostname, mode.to_string(), worker_group.clone(), ts, file_name, ok_lines as i64, err_lines as i64, true)
+        .execute(db)).await {
+        Ok(Ok(_)) => {
+            if let Err(e) = LAST_LOG_FILE_SENT.lock().map(|mut last_log_file_sent| {
+                last_log_file_sent.replace(ts);
+            }) {
+                tracing::error!("Error updating last log file sent: {:?}", e);
+            }
+            tracing::info!("Log file sent: {}", file_name);
+            true
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Error inserting log file: {:?}", e);
+            false
+        }
+        Err(e) => {
+            tracing::error!("Error inserting log file, timeout elapsed: {:?}", e);
+            false
+        }
+    }
+}
+
+fn read_log_counters(ts_str: String) -> (usize, usize) {
+    let counters = windmill_common::tracing_init::LOG_COUNTING_BY_MIN.read();
+    let mut ok_lines = 0;
+    let mut err_lines = 0;
+    if let Ok(ref c) = counters {
+        let counter = c.get(&ts_str);
+        if let Some(counter) = counter {
+            ok_lines = counter.non_error_count;
+            err_lines = counter.error_count;
+        } else {
+            // println!("no counter found for {ts_str}");
+        }
+    } else {
+        println!("Error reading log counters 2");
+    }
+    (ok_lines, err_lines)
+}
+
+pub async fn load_keep_job_dir(conn: &Connection) {
+    match load_value_from_global_settings_with_conn(conn, KEEP_JOB_DIR_SETTING, true).await {
+        Ok(v) => apply_keep_job_dir(v),
+        Err(e) => tracing::error!("Error loading keep job dir metrics: {e:#}"),
+    };
+}
+
+pub fn apply_keep_job_dir(value: Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Bool(t)) = value {
+        KEEP_JOB_DIR.store(t, Ordering::Relaxed)
+    }
+}
+
+pub async fn reload_otel_tracing_proxy_setting(conn: &Connection) {
+    match load_value_from_global_settings_with_conn(conn, OTEL_TRACING_PROXY_SETTING, true).await {
+        Ok(Some(settings)) => match serde_json::from_value::<OtelTracingProxySettings>(settings) {
+            Ok(new_settings) => {
+                let mut current = OTEL_TRACING_PROXY_SETTINGS.write().await;
+                if current.enabled != new_settings.enabled
+                    || current.enabled_languages != new_settings.enabled_languages
+                    || current.no_proxy_hosts != new_settings.no_proxy_hosts
+                    || current.insecure_upstream_hosts != new_settings.insecure_upstream_hosts
+                    || current.upstream_ca_certs != new_settings.upstream_ca_certs
+                {
+                    tracing::info!(
+                        "OTEL tracing proxy settings changed: enabled={}, languages={:?}, no_proxy_hosts={:?}, insecure_upstream_hosts={:?}, upstream_ca_certs={}",
+                        new_settings.enabled,
+                        new_settings.enabled_languages,
+                        new_settings.no_proxy_hosts,
+                        new_settings.insecure_upstream_hosts,
+                        if new_settings.upstream_ca_certs.as_deref().unwrap_or("").trim().is_empty() { "unset" } else { "set" },
+                    );
+                    *current = new_settings;
+                }
+            }
+            Err(e) => {
+                tracing::error!("Error parsing OTEL tracing proxy settings: {e:#}");
+            }
+        },
+        Err(e) => {
+            tracing::error!("Error loading OTEL tracing proxy setting: {e:#}");
+        }
+        _ => (),
+    };
+}
+
+pub async fn load_require_preexisting_user(db: &DB) {
+    match load_value_from_global_settings(db, REQUIRE_PREEXISTING_USER_FOR_OAUTH_SETTING).await {
+        Ok(v) => apply_require_preexisting_user(v),
+        Err(e) => tracing::error!("Error loading require_preexisting_user setting: {e:#}"),
+    };
+}
+
+pub fn apply_require_preexisting_user(value: Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Bool(t)) = value {
+        REQUIRE_PREEXISTING_USER_FOR_OAUTH.store(t, Ordering::Relaxed)
+    }
+}
+
+pub async fn load_disable_password_login(db: &DB) {
+    match load_value_from_global_settings(db, DISABLE_PASSWORD_LOGIN_SETTING).await {
+        Ok(v) => apply_disable_password_login(v),
+        Err(e) => tracing::error!("Error loading disable_password_login setting: {e:#}"),
+    };
+}
+
+pub fn apply_disable_password_login(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Bool(t)) => DISABLE_PASSWORD_LOGIN.store(t, Ordering::Relaxed),
+        None => DISABLE_PASSWORD_LOGIN.store(false, Ordering::Relaxed),
+        _ => (),
+    };
+}
+
+pub async fn load_mcp_disable_token_query_param(db: &DB) {
+    match load_value_from_global_settings(db, MCP_DISABLE_TOKEN_QUERY_PARAM_SETTING).await {
+        Ok(v) => apply_mcp_disable_token_query_param(v),
+        Err(e) => tracing::error!("Error loading mcp_disable_token_query_param setting: {e:#}"),
+    };
+}
+
+pub fn apply_mcp_disable_token_query_param(value: Option<serde_json::Value>) {
+    match value {
+        Some(serde_json::Value::Bool(t)) => {
+            MCP_DISABLE_TOKEN_QUERY_PARAM.store(t, Ordering::Relaxed)
+        }
+        None => MCP_DISABLE_TOKEN_QUERY_PARAM.store(false, Ordering::Relaxed),
+        _ => (),
+    };
+}
+
+pub async fn load_mcp_external_idp(db: &DB) {
+    match load_value_from_global_settings(
+        db,
+        windmill_common::global_settings::MCP_EXTERNAL_IDP_SETTING,
+    )
+    .await
+    {
+        Ok(v) => apply_mcp_external_idp(v),
+        Err(e) => tracing::error!("Error loading mcp_external_idp setting: {e:#}"),
+    };
+}
+
+pub fn apply_mcp_external_idp(value: Option<serde_json::Value>) {
+    use windmill_common::global_settings::{parse_mcp_external_idp, MCP_EXTERNAL_IDP};
+    match parse_mcp_external_idp(value.as_ref()) {
+        Ok(idp) => MCP_EXTERNAL_IDP.store(idp.map(std::sync::Arc::new)),
+        // Refused at write time, so only a hand-written row lands here: keep no issuer
+        // rather than one half-read.
+        Err(e) => {
+            tracing::error!("Invalid mcp_external_idp setting, external MCP tokens disabled: {e}");
+            MCP_EXTERNAL_IDP.store(None);
+        }
+    }
+}
+
+pub async fn load_api_base_url(db: &DB) {
+    match load_value_from_global_settings(db, API_BASE_URL_SETTING).await {
+        Ok(v) => apply_api_base_url(v),
+        Err(e) => tracing::error!("Error loading api_base_url setting: {e:#}"),
+    };
+}
+
+pub fn apply_api_base_url(value: Option<serde_json::Value>) {
+    let url = match value {
+        Some(serde_json::Value::String(s)) => s.trim().trim_end_matches('/').to_string(),
+        None => String::new(),
+        _ => return,
+    };
+    API_BASE_URL.store(Arc::new(url));
+}
+
+pub async fn load_api_base_url_applies_to(db: &DB) {
+    match load_value_from_global_settings(db, API_BASE_URL_APPLIES_TO_SETTING).await {
+        Ok(v) => apply_api_base_url_applies_to(v),
+        Err(e) => tracing::error!("Error loading api_base_url_applies_to setting: {e:#}"),
+    };
+}
+
+pub fn apply_api_base_url_applies_to(value: Option<serde_json::Value>) {
+    let mcp = match value {
+        Some(serde_json::Value::Array(items)) => items.iter().any(|i| i.as_str() == Some("mcp")),
+        None => true,
+        _ => return,
+    };
+    API_BASE_URL_APPLIES_TO_MCP.store(mcp, Ordering::Relaxed);
+}
+
+struct LogFile {
+    file_path: String,
+    hostname: String,
+}
+
+struct TokenRow {
+    token_prefix: Option<String>,
+    label: Option<String>,
+    email: Option<String>,
+    workspace_id: Option<String>,
+}
+
+async fn report_token_expiration(db: &DB, token: &TokenRow, expired: bool) {
+    if !windmill_common::auth::is_user_token(token.label.as_deref()) {
+        return;
+    }
+    let prefix = token.token_prefix.as_deref().unwrap_or("??????????");
+    let email_addr = token.email.as_deref().unwrap_or("unknown");
+    let token_desc = match token.label.as_deref() {
+        Some(l) if !l.is_empty() => format!("'{l}' ({prefix}****)"),
+        _ => format!("{prefix}****"),
+    };
+
+    let (alert_message, email_subject, email_body) = if expired {
+        (
+            format!(
+                "API token {token_desc} of '{email_addr}' has expired and been deleted"
+            ),
+            "Windmill: Your API token has expired",
+            format!(
+                "Your API token {token_desc} has expired and been deleted.\n\nPlease create a new token if you still need API access."
+            ),
+        )
+    } else {
+        (
+            format!("API token {token_desc} of '{email_addr}' is expiring soon"),
+            "Windmill: Your API token is expiring soon",
+            format!(
+                "Your API token {token_desc} is expiring soon.\n\nPlease rotate or renew your token to avoid service disruption."
+            ),
+        )
+    };
+
+    tracing::info!("{}", alert_message);
+    if CRITICAL_ALERTS_ON_TOKEN_EXPIRY.load(Ordering::Relaxed) {
+        report_critical_error(
+            alert_message,
+            db.clone(),
+            token.workspace_id.as_deref(),
+            None,
+        )
+        .await;
+    }
+    if let Some(email) = &token.email {
+        send_email_if_possible(email_subject, &email_body, email);
+    }
+}
+
+/// Trim resource version history down to the per-path cap.
+///
+/// Deliberately not part of `delete_expired_items` (which runs every monitor tick): this is a
+/// full pass over `resource_version`, and the cap only has to hold eventually, so the call site
+/// gates it to the same rare cadence as the other heavy sweeps.
+pub async fn trim_resource_versions(db: &DB) -> () {
+    let trimmed = sqlx::query_scalar!(
+        "DELETE FROM resource_version rv
+         USING (
+             SELECT id FROM (
+                 SELECT id, row_number() OVER (
+                     PARTITION BY workspace_id, path ORDER BY id DESC
+                 ) AS rn
+                 FROM resource_version
+             ) ranked WHERE rn > $1
+         ) over_cap
+         WHERE rv.id = over_cap.id
+         RETURNING rv.id",
+        MAX_RESOURCE_VERSIONS,
+    )
+    .fetch_all(db)
+    .await;
+
+    match trimmed {
+        Ok(ids) => {
+            if ids.len() > 0 {
+                tracing::info!("trimmed {} resource versions past the cap", ids.len())
+            }
+        }
+        Err(e) => tracing::error!("Error trimming resource versions: {}", e.to_string()),
+    }
+}
+
+/// Matches the batch the settings-page cleanup uses for the same table.
+const SERVICE_LOG_DELETE_BATCH: i64 = 2_000;
+/// Batches per pass. `monitor_db` runs under a 600s timeout that cancels every maintenance
+/// future in the same `join!` and reports a critical error, so a large backlog has to drain
+/// across ticks rather than inside one, the way the neighbouring sweeps already do.
+const SERVICE_LOG_DELETE_MAX_BATCHES: usize = 10;
+
+/// One span per HTTP request made from a job script, so the table grows far faster than the
+/// job table it is keyed against; batched for the same reason the service log sweep is.
+const OTEL_TRACES_DELETE_BATCH: i64 = 10_000;
+const OTEL_TRACES_DELETE_MAX_BATCHES: usize = 10;
+
+/// Delete HTTP request tracing spans older than `retention_secs`, returning how many went.
+///
+/// `retention_secs` is a parameter rather than a read of the process-wide setting so a test can
+/// pin a window without writing state the other tests in this binary run against concurrently.
+async fn delete_expired_otel_traces(db: &DB, retention_secs: i64) -> u64 {
+    // `start_time_unix_nano` is the proto field stored verbatim, so the cutoff is built in that
+    // unit rather than compared against `now()`. Truncating the epoch to whole seconds first
+    // keeps the multiplication inside `bigint`.
+    //
+    // Batched on `ctid`, not on the `(trace_id, span_id)` primary key: with the key the planner
+    // hashes the LIMITed subquery and Seq Scans the whole table to probe it, which at the size
+    // this table reaches is the cost the batching exists to avoid. `ctid` plans as a Tid Scan, so
+    // each batch touches only the rows it deletes. Safe because the subquery and the delete share
+    // one snapshot, and spans are never updated after insert.
+    let mut deleted = 0;
+    for _ in 0..OTEL_TRACES_DELETE_MAX_BATCHES {
+        let batch = sqlx::query!(
+            "DELETE FROM otel_traces WHERE ctid IN (
+                 SELECT ctid FROM otel_traces
+                 WHERE start_time_unix_nano < EXTRACT(
+                     EPOCH FROM now() - ($1::bigint::text || ' s')::interval
+                 )::bigint * 1000000000
+                 LIMIT $2
+             )",
+            retention_secs,
+            OTEL_TRACES_DELETE_BATCH,
+        )
+        .execute(db)
+        .await;
+
+        match batch {
+            Ok(res) => {
+                deleted += res.rows_affected();
+                if (res.rows_affected() as i64) < OTEL_TRACES_DELETE_BATCH {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!("Error deleting expired otel trace spans: {:?}", e);
+                break;
+            }
+        }
+    }
+    deleted
+}
+
+pub async fn delete_expired_items(db: &DB) -> () {
+    let expired_tokens_r = sqlx::query_as!(
+        TokenRow,
+        "DELETE FROM token WHERE expiration <= now()
+        RETURNING token_prefix, label, email, workspace_id",
+    )
+    .fetch_all(db)
+    .await;
+
+    match expired_tokens_r {
+        Ok(tokens) => {
+            if !tokens.is_empty() {
+                tracing::info!("deleted {} expired tokens", tokens.len());
+                for t in &tokens {
+                    report_token_expiration(db, t, true).await;
+                }
+            }
+        }
+        Err(e) => tracing::error!("Error deleting token: {}", e.to_string()),
+    }
+
+    let expired_login_links_r: std::result::Result<Vec<String>, _> =
+        // Expired rows stay a day so an open still reports "expired" rather than "invalid".
+        sqlx::query_scalar(
+            "DELETE FROM login_link WHERE expiration <= now() - interval '1 day' RETURNING token_hash",
+        )
+            .fetch_all(db)
+            .await;
+
+    match expired_login_links_r {
+        Ok(hashes) => {
+            if !hashes.is_empty() {
+                tracing::info!("deleted {} expired login links", hashes.len())
+            }
+        }
+        Err(e) => tracing::error!("Error deleting login links: {}", e.to_string()),
+    }
+
+    let pip_resolution_r = sqlx::query_scalar!(
+        "DELETE FROM pip_resolution_cache WHERE expiration <= now() RETURNING hash",
+    )
+    .fetch_all(db)
+    .await;
+
+    match pip_resolution_r {
+        Ok(res) => {
+            if res.len() > 0 {
+                tracing::info!("deleted {} pip_resolution: {:?}", res.len(), res)
+            }
+        }
+        Err(e) => tracing::error!("Error deleting pip_resolution: {}", e.to_string()),
+    }
+
+    // Clean up expired MCP OAuth refresh tokens
+    let mcp_refresh_tokens_r: std::result::Result<Vec<i64>, _> = sqlx::query_scalar(
+        "DELETE FROM mcp_oauth_refresh_token WHERE expires_at <= now() RETURNING id",
+    )
+    .fetch_all(db)
+    .await;
+
+    match mcp_refresh_tokens_r {
+        Ok(ids) => {
+            if ids.len() > 0 {
+                tracing::info!("deleted {} expired MCP OAuth refresh tokens", ids.len())
+            }
+        }
+        Err(e) => tracing::error!("Error deleting MCP OAuth refresh tokens: {}", e.to_string()),
+    }
+
+    let deleted_cache = sqlx::query_scalar!(
+            "DELETE FROM resource WHERE resource_type = 'cache' AND to_timestamp((value->>'expire')::int) < now() RETURNING path",
+        )
+        .fetch_all(db)
+        .await;
+
+    match deleted_cache {
+        Ok(res) => {
+            if res.len() > 0 {
+                tracing::info!("deleted {} cache resource: {:?}", res.len(), res)
+            }
+        }
+        Err(e) => tracing::error!("Error deleting cache resource {}", e.to_string()),
+    }
+
+    let deleted_expired_variables = sqlx::query_scalar!(
+        "DELETE FROM variable WHERE expires_at IS NOT NULL AND expires_at < now() RETURNING path",
+    )
+    .fetch_all(db)
+    .await;
+
+    match deleted_expired_variables {
+        Ok(res) => {
+            if res.len() > 0 {
+                tracing::info!("deleted {} expired variables {:?}", res.len(), res)
+            }
+        }
+        Err(e) => tracing::error!("Error deleting cache resource {}", e.to_string()),
+    }
+
+    // Batched: every process rotates a log file a minute, so lowering the retention makes one
+    // ordinary setting change expire millions of rows at once. An unbounded `DELETE ...
+    // RETURNING` would materialize all of them, and their deletion futures, in this one tick.
+    for _ in 0..SERVICE_LOG_DELETE_MAX_BATCHES {
+        let batch = sqlx::query_as!(
+            LogFile,
+            "DELETE FROM log_file WHERE (hostname, log_ts) IN (
+                 SELECT hostname, log_ts FROM log_file
+                 WHERE log_ts <= now() - ($1::bigint::text || ' s')::interval
+                 LIMIT $2
+             ) RETURNING file_path, hostname",
+            windmill_common::service_log_retention_secs(),
+            SERVICE_LOG_DELETE_BATCH,
+        )
+        .fetch_all(db)
+        .await;
+
+        match batch {
+            Ok(log_files_to_delete) => {
+                if log_files_to_delete.is_empty() {
+                    break;
+                }
+                let n = log_files_to_delete.len();
+                let paths = log_files_to_delete
+                    .iter()
+                    .map(|f| format!("{}/{}", f.hostname, f.file_path))
+                    .collect();
+                delete_log_files_from_disk_and_store(
+                    paths,
+                    &*TMP_WINDMILL_LOGS_SERVICE,
+                    windmill_common::tracing_init::LOGS_SERVICE,
+                )
+                .await;
+                if (n as i64) < SERVICE_LOG_DELETE_BATCH {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!("Error deleting log file: {:?}", e);
+                break;
+            }
+        }
+    }
+
+    let deleted_spans =
+        delete_expired_otel_traces(db, windmill_common::otel_traces_retention_secs()).await;
+    if deleted_spans > 0 {
+        tracing::info!("deleted {} expired otel trace spans", deleted_spans);
+    }
+
+    if let Err(e) = sqlx::query!(
+        "DELETE FROM ai_shared_artifact
+         WHERE shared_at <= now() - ($1::bigint::text || ' s')::interval",
+        windmill_common::ai_shared_artifact_retention_secs(),
+    )
+    .execute(db)
+    .await
+    {
+        tracing::error!("Error deleting expired shared AI artifacts: {:?}", e);
+    }
+
+    if let Err(e) = sqlx::query_scalar!(
+        "DELETE FROM autoscaling_event WHERE applied_at <= now() - ($1::bigint::text || ' s')::interval",
+        30 * 24 * 60 * 60, // 30 days
+    )
+    .fetch_all(db)
+    .await
+    {
+        tracing::error!("Error deleting autoscaling event on CE: {:?}", e);
+    }
+
+    // native_retry_attempt has no FK to v2_job (kept off the hot bulk delete).
+    // Retention sweeps markers alongside the jobs it deletes, but direct job
+    // deletions (workspace/job/schedule clearing) leave markers orphaned — reap
+    // any whose job is gone. The table is sparse, so this anti-join is cheap.
+    if let Err(e) = sqlx::query!(
+        "DELETE FROM native_retry_attempt nra WHERE NOT EXISTS (SELECT 1 FROM v2_job WHERE id = nra.job_id)"
+    )
+    .execute(db)
+    .await
+    {
+        tracing::error!("Error reaping orphaned native retry markers: {:?}", e);
+    }
+
+    // Same story for job_resolution: no FK, so a job deleted outside delete_jobs
+    // would leave its resolution behind.
+    if let Err(e) = sqlx::query!(
+        "DELETE FROM job_resolution jr WHERE NOT EXISTS (SELECT 1 FROM v2_job WHERE id = jr.job_id)"
+    )
+    .execute(db)
+    .await
+    {
+        tracing::error!("Error reaping orphaned job resolutions: {:?}", e);
+    }
+
+    if let Err(e) = windmill_queue::cascade::reap_stale_join_slots(db).await {
+        tracing::error!("Error reaping stale join_pending_inputs slots: {:?}", e);
+    }
+
+    // 60-day retention for anonymous feature-usage counters. Runs here (not only
+    // in the telemetry sender) so rows are pruned even when telemetry is disabled
+    // or the build has no stats scheduler.
+    if let Err(e) = sqlx::query!("DELETE FROM feature_usage WHERE day < CURRENT_DATE - 60")
+        .execute(db)
+        .await
+    {
+        tracing::error!("Error deleting old feature_usage rows: {e}");
+    }
+
+    // Guest sign-ins, kept a month longer than the seat window they feed so a late
+    // telemetry send still sees a whole month.
+    if let Err(e) = sqlx::query!("DELETE FROM guest_activity WHERE day < CURRENT_DATE - 60")
+        .execute(db)
+        .await
+    {
+        tracing::error!("Error deleting old guest_activity rows: {e}");
+    }
+
+    match sqlx::query_scalar!(
+        "DELETE FROM agent_token_blacklist WHERE expires_at <= now() RETURNING token",
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(deleted_tokens) => {
+            if deleted_tokens.len() > 0 {
+                tracing::info!(
+                    "deleted {} expired blacklisted agent tokens: {:?}",
+                    deleted_tokens.len(),
+                    deleted_tokens
+                );
+            }
+        }
+        Err(e) => tracing::error!("Error deleting expired blacklisted agent tokens: {:?}", e),
+    }
+
+    match sqlx::query_scalar!(
+        "DELETE FROM mcp_oauth_server_code WHERE expires_at <= now() RETURNING code",
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(deleted_codes) => {
+            if deleted_codes.len() > 0 {
+                tracing::info!(
+                    "deleted {} expired MCP OAuth authorization codes",
+                    deleted_codes.len()
+                );
+            }
+        }
+        Err(e) => tracing::error!(
+            "Error deleting expired MCP OAuth authorization codes: {:?}",
+            e
+        ),
+    }
+
+    // Per-workspace retention overrides (EE-only; the cache is always empty on CE). A workspace may
+    // keep jobs LONGER or SHORTER than the instance-wide window. Phase 1 sweeps globally on the
+    // instance window but excludes override workspaces; Phase 2 sweeps each override workspace on its
+    // own window (a sargable `workspace_id = $w` scan). The override count is capped small
+    // (`MAX_RETENTION_OVERRIDE_WORKSPACES`), so Phase 2's per-workspace fan-out stays bounded.
+    //
+    // Deliberate simplicity/scale trade-off: a LONGER or keep-forever override lets that workspace's
+    // old rows accumulate at the front of the completed_at index, and Phase 1's first batch each tick
+    // scans past that retained prefix (an index scan, thanks to the sargable floor — not a Seq Scan)
+    // before reaching a deletable row. This is only material at extreme scale (millions of retained
+    // rows on one busy keep-forever workspace); we accept it rather than carrying a cross-tick
+    // watermark, given overrides are a capped, targeted escape hatch.
+    //
+    // Gate the whole sweep on a confirmed-known override set: if the load never succeeded (e.g. a
+    // startup DB hiccup, or malformed data), the empty cache is "unknown", not "no overrides", and
+    // sweeping globally would delete jobs a longer-retention workspace configured. Retry the load
+    // once here (on CE the flag is already set at startup, so this is a no-op), and skip the whole
+    // job-cleanup phase this tick if still unknown — it runs again shortly.
+    if !JOB_RETENTION_SECS_OVERRIDES_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Err(e) = load_retention_period_overrides(db).await {
+            tracing::error!("Error (re)loading per-workspace retention overrides: {e:#}");
+        }
+    }
+    if !JOB_RETENTION_SECS_OVERRIDES_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!(
+            "Skipping job retention cleanup this cycle: per-workspace overrides not yet loaded"
+        );
+    } else {
+        let job_retention_secs = JOB_RETENTION_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        // `load_full` (owned Arc) rather than `load` (Guard): the sweep below holds this across many
+        // `.await`s, and an arc_swap Guard is not meant to be held for long.
+        let retention_overrides = JOB_RETENTION_SECS_OVERRIDES.load_full();
+        let override_workspace_ids: Vec<String> = retention_overrides.keys().cloned().collect();
+
+        // Phase 1: global sweep with the instance window, skipping override workspaces.
+        if job_retention_secs > 0 {
+            run_retention_cleanup(
+                db,
+                job_retention_secs,
+                RetentionScope::GlobalExcluding(&override_workspace_ids),
+            )
+            .await;
+
+            // Clean up concurrency keys separately (not tied to specific job IDs). Kept global on
+            // the instance window — concurrency keys are short-lived and not worth per-workspace
+            // scoping.
+            if let Err(e) = sqlx::query!(
+                "DELETE FROM concurrency_key WHERE ended_at <= now() - ($1::bigint::text || ' s')::interval",
+                job_retention_secs
+            )
+            .execute(db)
+            .await
+            {
+                tracing::error!("Error deleting custom concurrency key: {:?}", e);
+            }
+        }
+
+        // Phase 2: each override workspace swept on its own window. A window of 0 means "keep
+        // forever" for that workspace, so it is excluded from Phase 1 above and skipped here. The
+        // override count is capped at MAX_RETENTION_OVERRIDE_WORKSPACES (enforced at write time), so
+        // this loop runs a bounded number of scoped sweeps per pass.
+        for (w_id, retention_secs) in retention_overrides.iter() {
+            if *retention_secs > 0 {
+                run_retention_cleanup(db, *retention_secs, RetentionScope::OnlyWorkspace(w_id))
+                    .await;
+            }
+        }
+    }
+
+    match windmill_common::trashbin::delete_expired_trash(db).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("deleted {} expired trash items", count);
+            }
+        }
+        Err(e) => tracing::error!("Error deleting expired trash items: {}", e.to_string()),
+    }
+}
+
+pub async fn check_expiring_tokens(db: &DB) {
+    // Find tokens expiring within the warning window that still have a pending notification row.
+    // The notification table stores token_hash (not plaintext) so the join works
+    // even after the hash migration makes token.token nullable.
+    let expiring_tokens_r = sqlx::query_as!(
+        TokenRow,
+        "DELETE FROM token_expiry_notification n
+         USING token t
+         WHERE n.token_hash = t.token_hash
+           AND n.expiration > now()
+           AND n.expiration <= now() + make_interval(days => $1)
+         RETURNING t.token_prefix, t.label, t.email, t.workspace_id",
+        TOKEN_EXPIRY_WARNING_DAYS,
+    )
+    .fetch_all(db)
+    .await;
+
+    match expiring_tokens_r {
+        Ok(tokens) => {
+            for t in &tokens {
+                report_token_expiration(db, t, false).await;
+            }
+            if !tokens.is_empty() {
+                tracing::info!("Sent expiration warnings for {} token(s)", tokens.len());
+            }
+        }
+        Err(e) => tracing::error!("Error checking expiring tokens: {}", e),
+    }
+
+    // Clean up notification rows whose expiration has passed
+    if let Err(e) = sqlx::query!("DELETE FROM token_expiry_notification WHERE expiration <= now()")
+        .execute(db)
+        .await
+    {
+        tracing::error!("Error cleaning up expired token notifications: {}", e);
+    }
+}
+
+/// Delete a batch of expired jobs with LIMIT and SKIP LOCKED for high-scale environments.
+/// Uses a single transaction per batch to minimize lock duration.
+///
+/// `completed_at_floor` is the watermark from the previous batch in the same cleanup run (the
+/// max `completed_at` it deleted); pass `None` for the first batch. It is re-applied as
+/// `completed_at >= floor` so the scan resumes past the rows already processed instead of
+/// re-walking them (see the inline comment on the DELETE for why this matters).
+///
+/// Returns `(jobs deleted in this batch, max completed_at deleted)`. The caller feeds the
+/// returned watermark back in as `completed_at_floor` for the next batch.
+///
+/// `only_workspace` and `exclude_workspaces` implement the per-workspace retention override and are
+/// mutually exclusive: Phase 1 passes `exclude_workspaces` (skip override workspaces, sweep the
+/// rest), Phase 2 passes `only_workspace` (sweep just that workspace on its own window). Both `None`
+/// reproduces the plain global sweep exactly. See `run_retention_cleanup` / `delete_expired_items`.
+async fn delete_expired_jobs_batch(
+    db: &DB,
+    job_retention_secs: i64,
+    batch_size: i64,
+    completed_at_floor: Option<DateTime<Utc>>,
+    only_workspace: Option<&str>,
+    exclude_workspaces: Option<&[String]>,
+) -> error::Result<(usize, Option<DateTime<Utc>>)> {
+    let mut tx = db.begin().await?;
+
+    // Fetch active ROOT job IDs that started before the retention period. We only care about
+    // these because their child jobs could be old enough to be deletion candidates.
+    // Jobs started after the retention period can't have children old enough to delete.
+    let active_root_job_ids: Vec<Uuid> = sqlx::query_scalar!(
+        "SELECT q.id FROM v2_job_queue q
+         JOIN v2_job j ON j.id = q.id
+         WHERE j.parent_job IS NULL
+           AND j.created_at <= now() - ($1::bigint::text || ' s')::interval",
+        job_retention_secs
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    // `completed_at_floor` is a watermark carried across batches within a cleanup run: it is the
+    // max(completed_at) deleted by the previous batch. Re-applying it as `completed_at >= floor`
+    // lets each batch resume after the rows the previous batch already processed instead of
+    // re-scanning them. This matters when the oldest rows are undeletable (children of a
+    // still-active root flow, or override workspaces excluded from the global sweep): without the
+    // floor the `ORDER BY completed_at ASC` scan walks that same protected/retained prefix on every
+    // batch, turning a cleanup run quadratic in prefix size.
+    // Floor only ever skips rows the current run already deleted, was protecting, or skip-locked —
+    // all correctly deferred to the next run, identical to the unbounded scan's semantics.
+    //
+    // It is applied as `completed_at >= COALESCE($floor, '-infinity')`, NOT `$floor IS NULL OR
+    // completed_at >= $floor`: the `OR ... IS NULL` disjunction is non-sargable, so the planner
+    // cannot use the floor as an index lower bound and falls back to a Seq Scan of the whole table —
+    // walking the entire prefix regardless of the floor. The COALESCE sentinel keeps a single cached
+    // query while making the bound a plain range predicate the completed_at / composite index drives.
+    //
+    // Use FOR UPDATE SKIP LOCKED to avoid contention between replicas; ORDER BY completed_at
+    // deletes oldest jobs first.
+    // Two orthogonal choices drive which DELETE we run:
+    //  - `only_workspace`: Some => a single-workspace (Phase 2) sweep. We bind `workspace_id = $n`
+    //    directly (no `OR $n IS NULL` guard) so the composite `(workspace_id, completed_at)` index
+    //    can drive the ordered scan — a sargable equality the OR-form would defeat. `None` => a
+    //    global (Phase 1) sweep that instead excludes override workspaces via a hashed `NOT IN
+    //    (SELECT ... unnest($exclude))` SubPlan (same one-time-hash trick as the active-root
+    //    exclusion below): O(1) membership per candidate, vs `<> ALL($exclude)`'s per-row linear
+    //    array scan which degrades sharply once many workspaces have overrides.
+    //  - `active_root_job_ids.is_empty()`: skip the `v2_job` join entirely when nothing is
+    //    protected (a PK lookup per candidate is pure overhead in the common case).
+    let (deleted_jobs, max_completed_at) = match only_workspace {
+        Some(w_id) if active_root_job_ids.is_empty() => {
+            let rows = sqlx::query!(
+                "DELETE FROM v2_job_completed
+                 WHERE id IN (
+                     SELECT id FROM v2_job_completed
+                     WHERE workspace_id = $4
+                       AND completed_at <= now() - ($1::bigint::text || ' s')::interval
+                       AND completed_at >= COALESCE($3::timestamptz, '-infinity'::timestamptz)
+                     ORDER BY completed_at ASC
+                     LIMIT $2
+                     FOR UPDATE SKIP LOCKED
+                 )
+                 RETURNING id, completed_at",
+                job_retention_secs,
+                batch_size,
+                completed_at_floor,
+                w_id,
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let max = rows.iter().map(|r| r.completed_at).max();
+            (rows.into_iter().map(|r| r.id).collect::<Vec<Uuid>>(), max)
+        }
+        Some(w_id) => {
+            let rows = sqlx::query!(
+                "DELETE FROM v2_job_completed
+                 WHERE id IN (
+                     SELECT jc.id FROM v2_job_completed jc
+                     LEFT JOIN v2_job j ON j.id = jc.id
+                     WHERE jc.workspace_id = $5
+                       AND jc.completed_at <= now() - ($1::bigint::text || ' s')::interval
+                       AND jc.completed_at >= COALESCE($4::timestamptz, '-infinity'::timestamptz)
+                       AND COALESCE(j.root_job, j.flow_innermost_root_job, jc.id) NOT IN (
+                           SELECT u FROM unnest($3::uuid[]) AS u WHERE u IS NOT NULL
+                       )
+                     ORDER BY jc.completed_at ASC
+                     LIMIT $2
+                     FOR UPDATE OF jc SKIP LOCKED
+                 )
+                 RETURNING id, completed_at",
+                job_retention_secs,
+                batch_size,
+                &active_root_job_ids,
+                completed_at_floor,
+                w_id,
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let max = rows.iter().map(|r| r.completed_at).max();
+            (rows.into_iter().map(|r| r.id).collect::<Vec<Uuid>>(), max)
+        }
+        None if active_root_job_ids.is_empty() => {
+            let rows = sqlx::query!(
+                "DELETE FROM v2_job_completed
+                 WHERE id IN (
+                     SELECT id FROM v2_job_completed
+                     WHERE completed_at <= now() - ($1::bigint::text || ' s')::interval
+                       AND completed_at >= COALESCE($3::timestamptz, '-infinity'::timestamptz)
+                       AND ($4::text[] IS NULL OR workspace_id NOT IN (
+                           SELECT u FROM unnest($4::text[]) AS u WHERE u IS NOT NULL
+                       ))
+                     ORDER BY completed_at ASC
+                     LIMIT $2
+                     FOR UPDATE SKIP LOCKED
+                 )
+                 RETURNING id, completed_at",
+                job_retention_secs,
+                batch_size,
+                completed_at_floor,
+                exclude_workspaces,
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let max = rows.iter().map(|r| r.completed_at).max();
+            (rows.into_iter().map(|r| r.id).collect::<Vec<Uuid>>(), max)
+        }
+        None => {
+            // Active-root exclusion uses `NOT IN (SELECT ... unnest($3))` rather than `!= ALL($3)`:
+            // the subquery form lets the planner build a one-time hashed SubPlan and apply it as a
+            // filter on the ordered index scan, giving O(1) membership per candidate instead of a
+            // per-row linear array scan (which degrades sharply when many root jobs are active). The
+            // `u IS NOT NULL` guard sidesteps NOT IN's null-trap semantics ($3 holds non-null PK ids).
+            let rows = sqlx::query!(
+                "DELETE FROM v2_job_completed
+                 WHERE id IN (
+                     SELECT jc.id FROM v2_job_completed jc
+                     LEFT JOIN v2_job j ON j.id = jc.id
+                     WHERE jc.completed_at <= now() - ($1::bigint::text || ' s')::interval
+                       AND jc.completed_at >= COALESCE($4::timestamptz, '-infinity'::timestamptz)
+                       AND ($5::text[] IS NULL OR jc.workspace_id NOT IN (
+                           SELECT u FROM unnest($5::text[]) AS u WHERE u IS NOT NULL
+                       ))
+                       AND COALESCE(j.root_job, j.flow_innermost_root_job, jc.id) NOT IN (
+                           SELECT u FROM unnest($3::uuid[]) AS u WHERE u IS NOT NULL
+                       )
+                     ORDER BY jc.completed_at ASC
+                     LIMIT $2
+                     FOR UPDATE OF jc SKIP LOCKED
+                 )
+                 RETURNING id, completed_at",
+                job_retention_secs,
+                batch_size,
+                &active_root_job_ids,
+                completed_at_floor,
+                exclude_workspaces,
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let max = rows.iter().map(|r| r.completed_at).max();
+            (rows.into_iter().map(|r| r.id).collect::<Vec<Uuid>>(), max)
+        }
+    };
+
+    let deleted_count = deleted_jobs.len();
+
+    if deleted_count > 0 {
+        tracing::debug!(
+            "Deleting batch of {} expired jobs (retention: {}s)",
+            deleted_count,
+            job_retention_secs
+        );
+
+        if let Err(e) = sqlx::query!(
+            "DELETE FROM job_stats WHERE job_id = ANY($1)",
+            &deleted_jobs
+        )
+        .execute(&mut *tx)
+        .await
+        {
+            tracing::error!("Error deleting job stats: {:?}", e);
+        }
+
+        match sqlx::query_scalar!(
+            "DELETE FROM job_logs WHERE job_id = ANY($1) RETURNING log_file_index",
+            &deleted_jobs
+        )
+        .fetch_all(&mut *tx)
+        .await
+        {
+            Ok(log_file_index) => {
+                let paths = log_file_index
+                    .into_iter()
+                    .filter_map(|opt| opt)
+                    .flat_map(|inner_vec| inner_vec.into_iter())
+                    .collect();
+                delete_log_files_from_disk_and_store(paths, &*WINDMILL_DIR, "").await;
+            }
+            Err(e) => tracing::error!("Error deleting job logs: {:?}", e),
+        }
+
+        // Native retry markers have no FK (to keep this bulk delete cheap) — sweep
+        // them with their jobs here too (the periodic retention path), same as the
+        // other side tables. The table is created by a startup migration, so it
+        // always exists by the time cleanup runs.
+        if let Err(e) = sqlx::query!(
+            "DELETE FROM native_retry_attempt WHERE job_id = ANY($1)",
+            &deleted_jobs
+        )
+        .execute(&mut *tx)
+        .await
+        {
+            tracing::error!("Error deleting native retry markers: {:?}", e);
+        }
+
+        if let Err(e) = delete_jobs(&mut *tx, &deleted_jobs).await {
+            tracing::error!("Error deleting job: {:?}", e);
+        }
+
+        // Should already be deleted but just in case
+        if let Err(e) = sqlx::query!(
+            "DELETE FROM job_result_stream_v2 WHERE job_id = ANY($1)",
+            &deleted_jobs
+        )
+        .execute(&mut *tx)
+        .await
+        {
+            tracing::error!("Error deleting job result stream: {:?}", e);
+        }
+    }
+
+    tx.commit().await?;
+
+    Ok((deleted_count, max_completed_at))
+}
+
+/// Which workspaces a retention cleanup run targets.
+#[derive(Debug)]
+enum RetentionScope<'a> {
+    /// Sweep every workspace except the listed ones (they run in their own Phase-2 pass).
+    GlobalExcluding(&'a [String]),
+    /// Sweep only this single workspace, on its own retention window.
+    OnlyWorkspace(&'a str),
+}
+
+/// Drives the batched job-retention delete for a given `retention_secs` window and `scope`.
+/// Preserves the per-run `completed_at_floor` watermark across batches (see
+/// `delete_expired_jobs_batch`). Returns the number of jobs deleted.
+///
+/// `JOB_CLEANUP_MAX_BATCHES` bounds the batches per call, i.e. per scope. A full cleanup cycle can
+/// therefore run up to `(1 + n_override_workspaces) * max_batches` batches; the override count is
+/// capped at `MAX_RETENTION_OVERRIDE_WORKSPACES`, and any residue is picked up on the next tick.
+async fn run_retention_cleanup(db: &DB, retention_secs: i64, scope: RetentionScope<'_>) -> u64 {
+    let (only_workspace, exclude_workspaces): (Option<&str>, Option<&[String]>) = match &scope {
+        // An empty exclusion list binds as NULL so the guard short-circuits to the plain sweep.
+        RetentionScope::GlobalExcluding(ids) => {
+            (None, if ids.is_empty() { None } else { Some(*ids) })
+        }
+        RetentionScope::OnlyWorkspace(w_id) => (Some(*w_id), None),
+    };
+
+    let batch_size = *JOB_CLEANUP_BATCH_SIZE;
+    let max_batches = *JOB_CLEANUP_MAX_BATCHES;
+    let cleanup_start = Instant::now();
+    let mut total_deleted = 0u64;
+    let mut batch_num = 0i32;
+    // Watermark carried across batches so each one resumes after the rows the previous batch
+    // already processed instead of re-scanning the (potentially undeletable) oldest prefix.
+    let mut completed_at_floor: Option<DateTime<Utc>> = None;
+
+    // Process batches until no more expired jobs or max batches reached
+    loop {
+        if max_batches > 0 && batch_num >= max_batches {
+            tracing::debug!(
+                "Job cleanup ({scope:?}): reached max batches limit ({max_batches}), will continue next iteration"
+            );
+            break;
+        }
+
+        // Each batch runs in its own transaction to avoid long-running locks
+        let batch_result = delete_expired_jobs_batch(
+            db,
+            retention_secs,
+            batch_size,
+            completed_at_floor,
+            only_workspace,
+            exclude_workspaces,
+        )
+        .await;
+
+        match batch_result {
+            Ok((deleted_count, max_completed_at)) => {
+                if deleted_count == 0 {
+                    // No more expired jobs to delete
+                    break;
+                }
+                completed_at_floor = max_completed_at.or(completed_at_floor);
+                total_deleted += deleted_count as u64;
+                batch_num += 1;
+            }
+            Err(e) => {
+                tracing::error!("Error in job cleanup batch {batch_num} ({scope:?}): {e:?}");
+                break;
+            }
+        }
+    }
+
+    if total_deleted > 0 {
+        tracing::info!(
+            "Job cleanup completed ({scope:?}): deleted {total_deleted} jobs in {batch_num} batches, took {:?}",
+            cleanup_start.elapsed()
+        );
+    }
+
+    total_deleted
+}
+
+/// Loads the per-workspace retention overrides from the `retention_period_secs_overrides` global
+/// setting (a JSON `{workspace_id: secs}` object) into the in-memory `JOB_RETENTION_SECS_OVERRIDES`
+/// cache, so the cleanup sweep reads them without a per-tick DB query. Enterprise-only — CE leaves
+/// the cache empty so the sweep behaves exactly as before.
+///
+/// On a load error, unexpected value shape, or malformed data the previous map is kept but
+/// `JOB_RETENTION_SECS_OVERRIDES_LOADED` is set to FALSE, marking the cache unknown. Clobbering the
+/// map to empty would let the global sweep delete jobs a workspace asked to keep longer; leaving the
+/// flag TRUE would keep the stale (possibly shorter) policy in force after a lengthened/added
+/// override fails to refresh, deleting those jobs prematurely. Marking it unknown makes the sweep
+/// fail closed — it skips and the monitor retries the load next tick until a confirmed-current state
+/// loads. `LOADED` is set true only on a valid map, explicit unset (`Ok(None)`), or CE's no-op.
+pub async fn load_retention_period_overrides(db: &DB) -> error::Result<()> {
+    {
+        let _ = db;
+        // Overrides are EE-only; empty is the correct, fully-known state on CE.
+        JOB_RETENTION_SECS_OVERRIDES_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+async fn delete_log_files_from_disk_and_store(
+    paths_to_delete: Vec<String>,
+    tmp_dir: &str,
+    _s3_prefix: &str,
+) {
+    // S3 bulk delete (batched via delete_stream — on S3 this uses the DeleteObjects
+    // API, up to 1000 objects per request).
+    #[cfg(feature = "parquet")]
+    {
+        let should_del_from_store =
+            MONITOR_LOGS_ON_OBJECT_STORE.load(std::sync::atomic::Ordering::Relaxed);
+        if should_del_from_store {
+            if let Some(os) = windmill_object_store::get_object_store().await {
+                let s3_paths: Vec<_> = paths_to_delete
+                    .iter()
+                    .map(|p| {
+                        windmill_object_store::object_store_reexports::Path::from(format!(
+                            "{}{}",
+                            _s3_prefix, p
+                        ))
+                    })
+                    .map(Ok)
+                    .collect();
+                let stream = futures::stream::iter(s3_paths).boxed();
+                let mut result = os.delete_stream(stream);
+                let mut deleted = 0u64;
+                let mut not_found = 0u64;
+                let mut failed = 0u64;
+                while let Some(r) = result.next().await {
+                    match r {
+                        Ok(_) => deleted += 1,
+                        // Deleting a non-existent object is a successful no-op. S3's
+                        // DeleteObjects ignores missing keys, but GCS returns 404 per
+                        // delete, surfacing as NotFound — count it separately rather
+                        // than logging it as an error.
+                        Err(windmill_object_store::object_store_reexports::ObjectStoreError::NotFound { .. }) => {
+                            not_found += 1;
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            tracing::error!("Failed to delete from object store: {e}");
+                        }
+                    }
+                }
+                if deleted + not_found + failed > 0 {
+                    tracing::info!(
+                        "object store log cleanup: {deleted} deleted, {not_found} already absent (404), {failed} failed"
+                    );
+                }
+            }
+        }
+    }
+
+    // Disk delete in parallel.
+    let delete_futures = FuturesUnordered::new();
+    for path in paths_to_delete {
+        delete_futures.push(async move {
+            let disk_path = std::path::Path::new(tmp_dir).join(&path);
+            if tokio::fs::metadata(&disk_path).await.is_ok() {
+                if let Err(e) = tokio::fs::remove_file(&disk_path).await {
+                    tracing::error!(
+                        "Failed to delete from disk {}: {e}",
+                        disk_path.to_string_lossy()
+                    );
+                }
+            }
+        });
+    }
+    let _: Vec<_> = delete_futures.collect().await;
+}
+
+pub async fn reload_instance_events_webhook_setting(db: &DB) {
+    use windmill_common::global_settings::INSTANCE_EVENTS_WEBHOOK_SETTING;
+
+    match load_value_from_global_settings(db, INSTANCE_EVENTS_WEBHOOK_SETTING).await {
+        Ok(v) => apply_instance_events_webhook_setting(v),
+        Err(e) => tracing::error!("Error loading instance_events_webhook setting: {e:#}"),
+    }
+}
+
+pub fn apply_instance_events_webhook_setting(value: Option<serde_json::Value>) {
+    use windmill_common::webhook::INSTANCE_EVENTS_WEBHOOK;
+    match value {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            INSTANCE_EVENTS_WEBHOOK.store(std::sync::Arc::new(Some(s)));
+        }
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => {
+            // Fall back to env var if DB has no value
+            INSTANCE_EVENTS_WEBHOOK.store(std::sync::Arc::new(
+                std::env::var("INSTANCE_EVENTS_WEBHOOK").ok(),
+            ));
+        }
+        _ => (),
+    };
+}
+
+pub async fn reload_scim_token_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(conn, SCIM_TOKEN_SETTING, "SCIM_TOKEN", SCIM_TOKEN.clone())
+        .await;
+}
+
+pub async fn reload_timeout_wait_result_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        TIMEOUT_WAIT_RESULT_SETTING,
+        "TIMEOUT_WAIT_RESULT",
+        TIMEOUT_WAIT_RESULT.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_extra_pip_index_url_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        EXTRA_PIP_INDEX_URL_SETTING,
+        "PIP_EXTRA_INDEX_URL",
+        PIP_EXTRA_INDEX_URL.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_pip_index_url_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        PIP_INDEX_URL_SETTING,
+        "PIP_INDEX_URL",
+        PIP_INDEX_URL.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_uv_index_strategy_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        UV_INDEX_STRATEGY_SETTING,
+        "UV_INDEX_STRATEGY",
+        UV_INDEX_STRATEGY.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_uv_exclude_newer_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        UV_EXCLUDE_NEWER_SETTING,
+        "UV_EXCLUDE_NEWER",
+        UV_EXCLUDE_NEWER.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_uv_python_install_mirror_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        UV_PYTHON_INSTALL_MIRROR_SETTING,
+        "UV_PYTHON_INSTALL_MIRROR",
+        UV_PYTHON_INSTALL_MIRROR.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_bun_install_min_release_age_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        BUN_INSTALL_MIN_RELEASE_AGE_SETTING,
+        "BUN_INSTALL_MIN_RELEASE_AGE",
+        BUN_INSTALL_MIN_RELEASE_AGE.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_instance_python_version_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        INSTANCE_PYTHON_VERSION_SETTING,
+        "INSTANCE_PYTHON_VERSION",
+        INSTANCE_PYTHON_VERSION.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_npm_config_registry_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        NPM_CONFIG_REGISTRY_SETTING,
+        "NPM_CONFIG_REGISTRY",
+        NPM_CONFIG_REGISTRY.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_bunfig_install_scopes_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        BUNFIG_INSTALL_SCOPES_SETTING,
+        "BUNFIG_INSTALL_SCOPES",
+        BUNFIG_INSTALL_SCOPES.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_nuget_config_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        NUGET_CONFIG_SETTING,
+        "NUGET_CONFIG",
+        NUGET_CONFIG.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_powershell_repo_url_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        POWERSHELL_REPO_URL_SETTING,
+        "POWERSHELL_REPO_URL",
+        POWERSHELL_REPO_URL.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_powershell_repo_pat_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        POWERSHELL_REPO_PAT_SETTING,
+        "POWERSHELL_REPO_PAT",
+        POWERSHELL_REPO_PAT.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_maven_repos_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        windmill_common::global_settings::MAVEN_REPOS_SETTING,
+        "MAVEN_REPOS",
+        MAVEN_REPOS.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_maven_settings_xml_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        windmill_common::global_settings::MAVEN_SETTINGS_XML_SETTING,
+        "MAVEN_SETTINGS_XML",
+        MAVEN_SETTINGS_XML.clone(),
+    )
+    .await;
+    write_maven_settings_xml().await;
+}
+
+/// The half of [`reload_maven_settings_xml_setting`] after the read: mirrors the loaded value
+/// onto disk, where the Maven CLI looks for it.
+pub async fn write_maven_settings_xml() {
+    {
+        return;
+    }
+
+    let settings_xml = MAVEN_SETTINGS_XML.read().await.clone();
+    match settings_xml {
+        Some(ref content) if !content.trim().is_empty() => {
+            let m2_dir = format!("{}/.m2", *JAVA_HOME_DIR);
+            if let Err(e) = tokio::fs::create_dir_all(&m2_dir).await {
+                tracing::error!("Failed to create .m2 directory: {e:#}");
+                return;
+            }
+            let settings_path = format!("{m2_dir}/settings.xml");
+            if let Err(e) = tokio::fs::write(&settings_path, content).await {
+                tracing::error!("Failed to write Maven settings.xml: {e:#}");
+            }
+        }
+        _ => {
+            let settings_path = format!("{}/.m2/settings.xml", *JAVA_HOME_DIR);
+            let _ = tokio::fs::remove_file(&settings_path).await;
+        }
+    }
+}
+
+pub async fn reload_no_default_maven_setting(conn: &Connection) {
+    match load_value_from_global_settings_with_conn(
+        conn,
+        windmill_common::global_settings::NO_DEFAULT_MAVEN_SETTING,
+        true,
+    )
+    .await
+    {
+        Ok(v) => apply_no_default_maven_setting(v),
+        Err(e) => tracing::error!("Error loading no default maven repository: {e:#}"),
+    };
+}
+
+pub fn apply_no_default_maven_setting(value: Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Bool(t)) = value {
+        NO_DEFAULT_MAVEN.store(t, Ordering::Relaxed)
+    }
+}
+
+pub async fn reload_ruby_repos_setting(conn: &Connection) {
+    reload_url_list_setting_with_tracing(
+        conn,
+        windmill_common::global_settings::RUBY_REPOS_SETTING,
+        "RUBY_REPOS",
+        windmill_worker::RUBY_REPOS.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_workspace_registries_setting(conn: &Connection) {
+    match load_value_from_global_settings_with_conn(
+        conn,
+        windmill_common::global_settings::WORKSPACE_REGISTRIES_SETTING,
+        true,
+    )
+    .await
+    {
+        Ok(v) => apply_workspace_registries_setting(v).await,
+        Err(e) => tracing::error!("Error loading workspace_registries setting: {e:#}"),
+    }
+}
+
+pub async fn apply_workspace_registries_setting(value: Option<serde_json::Value>) {
+    match value {
+        Some(v) => match serde_json::from_value::<WorkspaceRegistryMap>(v) {
+            Ok(parsed) => {
+                tracing::info!(
+                    "Loaded workspace registries for {} workspaces",
+                    parsed.len()
+                );
+                *WORKSPACE_REGISTRIES.write().await = Some(parsed);
+            }
+            Err(e) => {
+                tracing::error!("Error parsing workspace_registries setting: {e:#}");
+            }
+        },
+        None => {
+            *WORKSPACE_REGISTRIES.write().await = None;
+        }
+    }
+}
+
+pub async fn reload_hub_api_secret_setting(conn: &Connection) {
+    match load_option_setting_value::<String>(conn, HUB_API_SECRET_SETTING, "HUB_API_SECRET").await
+    {
+        Ok(v) => HUB_API_SECRET.store(std::sync::Arc::new(v)),
+        Err(e) => tracing::error!("Error reloading setting HUB_API_SECRET: {:?}", e),
+    }
+}
+
+pub async fn reload_retention_period_setting(conn: &Connection) {
+    match load_setting_value::<i64>(
+        conn,
+        RETENTION_PERIOD_SECS_SETTING,
+        "JOB_RETENTION_SECS",
+        60 * 60 * 24 * 30,
+        |x| x,
+    )
+    .await
+    {
+        Ok(v) => JOB_RETENTION_SECS.store(v, Ordering::Relaxed),
+        Err(e) => tracing::error!("Error reloading retention period: {:?}", e),
+    }
+}
+
+pub async fn reload_service_log_retention_secs_setting(conn: &Connection) {
+    match load_setting_value::<i64>(
+        conn,
+        SERVICE_LOG_RETENTION_SECS_SETTING,
+        "SERVICE_LOG_RETENTION_SECS",
+        DEFAULT_SERVICE_LOG_RETENTION_SECS,
+        |x| x,
+    )
+    .await
+    {
+        Ok(v) => windmill_common::set_service_log_retention_secs(v),
+        Err(e) => tracing::error!("Error reloading service log retention period: {:?}", e),
+    }
+}
+
+pub async fn reload_otel_traces_retention_secs_setting(conn: &Connection) {
+    match load_setting_value::<i64>(
+        conn,
+        OTEL_TRACES_RETENTION_SECS_SETTING,
+        "OTEL_TRACES_RETENTION_SECS",
+        DEFAULT_OTEL_TRACES_RETENTION_SECS,
+        |x| x,
+    )
+    .await
+    {
+        Ok(v) => windmill_common::set_otel_traces_retention_secs(v),
+        Err(e) => tracing::error!("Error reloading otel traces retention period: {:?}", e),
+    }
+}
+
+pub async fn reload_audit_log_retention_days_setting(conn: &Connection) {
+    match load_setting_value::<i64>(
+        conn,
+        AUDIT_LOG_RETENTION_DAYS_SETTING,
+        "AUDIT_LOG_RETENTION_DAYS",
+        0, // 0 means use default: 365 for EE, 14 for CE
+        |x| x,
+    )
+    .await
+    {
+        Ok(v) => AUDIT_LOG_RETENTION_DAYS.store(v, Ordering::Relaxed),
+        Err(e) => tracing::error!("Error reloading audit log retention days: {:?}", e),
+    }
+}
+
+pub async fn reload_delete_logs_periodically_setting(conn: &Connection) {
+    match load_setting_value::<bool>(
+        conn,
+        MONITOR_LOGS_ON_OBJECT_STORE_SETTING,
+        "MONITOR_LOGS_ON_OBJECT_STORE",
+        false,
+        |x| x,
+    )
+    .await
+    {
+        Ok(v) => MONITOR_LOGS_ON_OBJECT_STORE.store(v, Ordering::Relaxed),
+        Err(e) => tracing::error!("Error reloading retention period: {:?}", e),
+    }
+}
+
+pub async fn reload_store_audit_logs_s3_setting(conn: &Connection) {
+    match load_setting_value::<bool>(
+        conn,
+        STORE_AUDIT_LOGS_S3_SETTING,
+        "STORE_AUDIT_LOGS_S3",
+        false,
+        |x| x,
+    )
+    .await
+    {
+        Ok(v) => STORE_AUDIT_LOGS_S3.store(v, Ordering::Relaxed),
+        Err(e) => tracing::error!("Error reloading store_audit_logs_s3 setting: {:?}", e),
+    }
+}
+
+pub async fn reload_job_default_timeout_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        JOB_DEFAULT_TIMEOUT_SECS_SETTING,
+        "JOB_DEFAULT_TIMEOUT_SECS",
+        JOB_DEFAULT_TIMEOUT.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_nsjail_tmpfs_size_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        NSJAIL_TMPFS_SIZE_MB_SETTING,
+        "NSJAIL_TMPFS_SIZE_MB",
+        NSJAIL_TMPFS_SIZE_MB.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_nsjail_tmp_backing_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        NSJAIL_TMP_BACKING_SETTING,
+        "NSJAIL_TMP_BACKING",
+        NSJAIL_TMP_BACKING.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_sandbox_image_max_size_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        SANDBOX_IMAGE_MAX_SIZE_MB_SETTING,
+        "SANDBOX_IMAGE_MAX_SIZE_MB",
+        SANDBOX_IMAGE_MAX_SIZE_MB.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_sandbox_image_cache_max_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        SANDBOX_IMAGE_CACHE_MAX_MB_SETTING,
+        "SANDBOX_IMAGE_CACHE_MAX_MB",
+        SANDBOX_IMAGE_CACHE_MAX_MB.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_sandbox_image_pull_policy_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        SANDBOX_IMAGE_PULL_POLICY_SETTING,
+        "SANDBOX_IMAGE_PULL_POLICY",
+        SANDBOX_IMAGE_PULL_POLICY.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_sandbox_image_default_registry_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        SANDBOX_IMAGE_DEFAULT_REGISTRY_SETTING,
+        "SANDBOX_IMAGE_DEFAULT_REGISTRY",
+        SANDBOX_IMAGE_DEFAULT_REGISTRY.clone(),
+    )
+    .await;
+}
+
+pub async fn reload_sandbox_registry_auth_setting(conn: &Connection) {
+    // Secret-aware: the value is a raw docker/podman auth.json with credentials, so
+    // it must never be logged. Load directly (the generic reload_option_setting path
+    // logs the value via load_option_setting_value) and only log a redacted message.
+    match load_value_from_global_settings_with_conn(conn, SANDBOX_REGISTRY_AUTH_SETTING, true).await
+    {
+        Ok(q) => apply_sandbox_registry_auth_setting(q).await,
+        Err(e) => tracing::error!("Error reloading setting SANDBOX_REGISTRY_AUTH: {e:?}"),
+    }
+}
+
+pub async fn apply_sandbox_registry_auth_setting(q: Option<serde_json::Value>) {
+    let value = q.and_then(|q| serde_json::from_value::<String>(q).ok());
+    let configured = value.as_ref().is_some_and(|v| !v.trim().is_empty());
+    *SANDBOX_REGISTRY_AUTH.write().await = value;
+    tracing::info!("Loaded setting SANDBOX_REGISTRY_AUTH (redacted), configured={configured}");
+}
+
+pub async fn reload_job_isolation_setting(conn: &Connection) {
+    match load_value_from_global_settings_with_conn(conn, JOB_ISOLATION_SETTING, true).await {
+        Ok(v) => apply_job_isolation_setting(v).await,
+        Err(e) => tracing::error!("Error reloading job_isolation setting: {:?}", e),
+    }
+}
+
+pub async fn apply_job_isolation_setting(value: Option<serde_json::Value>) {
+    let value = match value {
+        Some(v) => JobIsolationLevel::from_str(v.as_str().unwrap_or("")),
+        None => JobIsolationLevel::Undefined,
+    };
+    let old_value = JobIsolationLevel::from_u8(JOB_ISOLATION.swap(value as u8, Ordering::Relaxed));
+    if old_value != value {
+        tracing::info!(
+            "job_isolation setting changed from {:?} to {:?}",
+            old_value,
+            value
+        );
+    }
+    if value == JobIsolationLevel::NsjailSandboxing && NSJAIL_AVAILABLE.is_none() {
+        tracing::error!(
+            "job_isolation is set to nsjail_sandboxing but nsjail is not available on this worker. \
+            All jobs will fail until nsjail is installed or the setting is changed."
+        );
+    }
+    if value == JobIsolationLevel::Unshare && UNSHARE_PATH.is_none() {
+        tracing::error!(
+            "job_isolation is set to unshare but the unshare binary is not available on this worker. \
+            Jobs will run without isolation until unshare is installed or the setting is changed."
+        );
+    }
+}
+
+async fn resolve_license_key_value(conn: &Connection, quiet: bool) -> anyhow::Result<String> {
+    let q = load_value_from_global_settings_with_conn(conn, LICENSE_KEY_SETTING, true)
+        .await
+        .map_err(|err| anyhow::anyhow!("Error reloading license key: {}", err.to_string()))?;
+
+    let mut value = std::env::var("LICENSE_KEY")
+        .ok()
+        .and_then(|x| x.parse::<String>().ok())
+        .unwrap_or(String::new());
+
+    if let Some(q) = q {
+        if let Ok(v) = serde_json::from_value::<String>(q.clone()) {
+            if !quiet {
+                tracing::info!(
+                    "Loaded setting LICENSE_KEY from db config: {}",
+                    truncate_token(&v)
+                );
+            }
+            value = v;
+        } else {
+            tracing::error!("Could not parse LICENSE_KEY found: {:#?}", &q);
+        }
+    };
+    Ok(value)
+}
+
+pub async fn reload_license_key(conn: &Connection) -> anyhow::Result<()> {
+    let value = resolve_license_key_value(conn, false).await?;
+    apply_license_key(value, conn).await;
+    Ok(())
+}
+
+/// Applies the key and records it as the last accepted value only when
+/// `set_license_key` actually stored it (validation passed, even if expired).
+/// A rejected key is deliberately not recorded: validation can fail transiently
+/// (DB error during the instance-hash check, offline key validated before
+/// base_url is configured), and recording it would stop
+/// `refetch_license_key_if_invalid` from ever retrying an unchanged key.
+async fn apply_license_key(value: String, conn: &Connection) {
+    set_license_key(value.clone(), conn.as_sql()).await;
+}
+
+pub async fn reload_option_setting_with_tracing<T: FromStr + DeserializeOwned>(
+    conn: &Connection,
+    setting_name: &str,
+    std_env_var: &str,
+    lock: Arc<RwLock<Option<T>>>,
+) {
+    if let Err(e) = reload_option_setting(conn, setting_name, std_env_var, lock.clone()).await {
+        tracing::error!("Error reloading setting {}: {:?}", setting_name, e)
+    }
+}
+
+type SettingApplier<'a> =
+    Box<dyn FnOnce(Option<serde_json::Value>) -> BoxFuture<'a, ()> + Send + 'a>;
+
+/// The values a [`PassStep::Settings`] step asked for, keyed by setting name.
+pub type SettingValues = std::collections::HashMap<&'static str, Option<serde_json::Value>>;
+
+type MultiSettingApplier<'a> = Box<dyn FnOnce(SettingValues) -> BoxFuture<'a, ()> + Send + 'a>;
+
+enum PassStep<'a> {
+    /// A setting to read, paired with what to do once its value is in hand.
+    Setting { name: &'static str, http: bool, apply: SettingApplier<'a> },
+    /// Several settings one piece of work needs together.
+    Settings { names: &'static [&'static str], http: bool, apply: MultiSettingApplier<'a> },
+    /// Work that is not a settings read but has to keep its place in the sequence.
+    Action(BoxFuture<'a, ()>),
+}
+
+/// One settings-loading pass: every read it will make, declared up front, then fetched
+/// together and applied in the order they were declared.
+///
+/// A pass that reads several dozen settings costs one round trip instead of one each, which
+/// is invisible against a local database and is the bulk of a worker's startup latency
+/// against a real one. Declaring is what makes the batch exact: the same `if server_mode` /
+/// `if *CLOUD_HOSTED` branches that used to guard a read now guard a [`Self::setting`] call,
+/// so the fetch asks for what this process actually needs and nothing else.
+///
+/// Order is preserved end to end, which is what lets non-setting work sit in the middle of the
+/// sequence via [`Self::action`]: appliers run in declaration order, so a setting whose applier
+/// depends on an earlier one having landed still sees it.
+pub struct SettingsPass<'a> {
+    steps: Vec<PassStep<'a>>,
+}
+
+impl<'a> SettingsPass<'a> {
+    pub fn new() -> Self {
+        SettingsPass { steps: Vec::new() }
+    }
+
+    /// Declare a read. `http` mirrors `load_from_http` in
+    /// [`load_value_from_global_settings_with_conn`]: `false` means an agent worker leaves the
+    /// setting unset rather than asking the server for it.
+    pub fn setting<F, Fut>(&mut self, name: &'static str, http: bool, apply: F)
+    where
+        F: FnOnce(Option<serde_json::Value>) -> Fut + Send + 'a,
+        Fut: std::future::Future<Output = ()> + Send + 'a,
+    {
+        self.steps.push(PassStep::Setting {
+            name,
+            http,
+            apply: Box::new(move |v| Box::pin(apply(v))),
+        });
+    }
+
+    /// Declare a step that needs several settings at once. It is skipped, like a single
+    /// [`Self::setting`], if any of them could not be read.
+    pub fn settings<F, Fut>(&mut self, names: &'static [&'static str], http: bool, apply: F)
+    where
+        F: FnOnce(SettingValues) -> Fut + Send + 'a,
+        Fut: std::future::Future<Output = ()> + Send + 'a,
+    {
+        self.steps.push(PassStep::Settings {
+            names,
+            http,
+            apply: Box::new(move |v| Box::pin(apply(v))),
+        });
+    }
+
+    /// Declare work that is not a settings read, keeping its position in the sequence.
+    pub fn action<Fut>(&mut self, fut: Fut)
+    where
+        Fut: std::future::Future<Output = ()> + Send + 'a,
+    {
+        self.steps.push(PassStep::Action(Box::pin(fut)));
+    }
+
+    /// The batched form of [`reload_option_setting_with_tracing`].
+    pub fn option_setting<T: FromStr + DeserializeOwned + Send + Sync + 'a>(
+        &mut self,
+        name: &'static str,
+        std_env_var: &'static str,
+        lock: Arc<RwLock<Option<T>>>,
+    ) {
+        self.option_setting_with(name, std_env_var, move |v| async move {
+            *lock.write().await = v;
+        });
+    }
+
+    /// [`Self::option_setting`] for a setting held in something other than an
+    /// `Arc<RwLock<Option<T>>>`, such as an `ArcSwap`. Going through here rather than calling
+    /// [`parse_option_setting_value`] from a bare [`Self::setting`] is what applies the
+    /// `FORCE_` rule, which a hand-rolled declaration would silently miss.
+    pub fn option_setting_with<T, F, Fut>(
+        &mut self,
+        name: &'static str,
+        std_env_var: &'static str,
+        store: F,
+    ) where
+        T: FromStr + DeserializeOwned + Send + Sync + 'a,
+        F: FnOnce(Option<T>) -> Fut + Send + 'a,
+        Fut: std::future::Future<Output = ()> + Send + 'a,
+    {
+        if forced_env_value::<T>(std_env_var).is_some() {
+            self.forced(move || async move {
+                store(parse_option_setting_value(None, name, std_env_var)).await
+            });
+            return;
+        }
+        self.setting(name, true, move |v| async move {
+            store(parse_option_setting_value(v, name, std_env_var)).await
+        });
+    }
+
+    /// A setting with a default, the batched counterpart of [`load_setting_value`].
+    pub fn required_setting<T: FromStr + DeserializeOwned + Display + Send + Sync + 'a>(
+        &mut self,
+        name: &'static str,
+        std_env_var: &'static str,
+        default: T,
+        lock: Arc<RwLock<T>>,
+        transformer: fn(T) -> T,
+    ) {
+        self.setting(name, true, move |v| async move {
+            *lock.write().await = parse_setting_value(v, name, std_env_var, default, transformer);
+        });
+    }
+
+    /// The batched form of [`reload_url_list_setting_with_tracing`].
+    pub fn url_list_setting(
+        &mut self,
+        name: &'static str,
+        std_env_var: &'static str,
+        lock: Arc<RwLock<Option<Vec<url::Url>>>>,
+    ) {
+        if std::env::var(format!("FORCE_{}", std_env_var)).is_ok() {
+            self.forced(move || async move {
+                *lock.write().await = parse_url_list_setting_value(None, name, std_env_var);
+            });
+            return;
+        }
+        self.setting(name, true, move |v| async move {
+            *lock.write().await = parse_url_list_setting_value(v, name, std_env_var);
+        });
+    }
+
+    /// Apply a setting whose value comes from a `FORCE_` override.
+    ///
+    /// Declared as a step with no read: the override outranks the database, so fetching is
+    /// pointless, and more importantly a failed fetch must not drop it. A skipped applier is
+    /// how an unreadable setting keeps its current value, which for a forced one would mean
+    /// silently running unforced.
+    fn forced<F, Fut>(&mut self, apply: F)
+    where
+        F: FnOnce() -> Fut + Send + 'a,
+        Fut: std::future::Future<Output = ()> + Send + 'a,
+    {
+        self.action(async move { apply().await });
+    }
+
+    /// Fetch every declared setting in one go, then run the steps in declaration order.
+    pub async fn run(self, conn: &Connection) {
+        let over_http = matches!(conn, Connection::Http(_));
+        let declared: Vec<(&'static str, bool)> = self
+            .steps
+            .iter()
+            .flat_map(|s| match s {
+                PassStep::Setting { name, http, .. } => vec![(*name, *http)],
+                PassStep::Settings { names, http, .. } => {
+                    names.iter().map(|n| (*n, *http)).collect()
+                }
+                PassStep::Action(_) => vec![],
+            })
+            .collect();
+
+        // A setting an agent worker is not allowed to ask the server for reads as unset, which
+        // is what `load_value_from_global_settings_with_conn(.., false)` returned for it. That
+        // is not the same as a read that failed, which is left out and skips its applier.
+        let names: Vec<&str> = declared
+            .iter()
+            .filter_map(|(name, http)| (!over_http || *http).then_some(*name))
+            .collect();
+
+        let mut values = fetch_settings_batch(conn, &names).await;
+        // One failed query took every setting with it. At startup there is no known-good
+        // in-memory state to preserve, so read them individually rather than leave the process
+        // on compile-time defaults until the next full reload. Only the single-query transport
+        // can fail this way; over HTTP the batch already is the per-setting read.
+        if matches!(conn, Connection::Sql(_)) && values.is_empty() && !names.is_empty() {
+            tracing::warn!(
+                "Falling back to per-setting reads for {} settings",
+                names.len()
+            );
+            values = fetch_settings_individually(conn, &names).await;
+        }
+        for (name, http) in &declared {
+            if over_http && !*http {
+                values.insert(name.to_string(), None);
+            }
+        }
+
+        for step in self.steps {
+            match step {
+                // A name missing from `values` is one whose read failed, not one that is
+                // unset. Skipping its applier is what keeps a transient database error from
+                // looking like a cleared setting: several of them reset to a default on
+                // `None`, and would otherwise clobber a known-good value on a blip.
+                PassStep::Setting { name, apply, .. } => {
+                    if let Some(value) = values.remove(name) {
+                        apply(value).await
+                    } else {
+                        tracing::warn!(
+                            "Setting {name} could not be read, leaving its in-memory value unchanged"
+                        );
+                    }
+                }
+                PassStep::Settings { names, apply, .. } => {
+                    let asked: SettingValues = names
+                        .iter()
+                        .filter_map(|n| values.get(*n).map(|v| (*n, v.clone())))
+                        .collect();
+                    if asked.len() == names.len() {
+                        apply(asked).await
+                    } else {
+                        let missing = names
+                            .iter()
+                            .filter(|n| !asked.contains_key(*n))
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        tracing::warn!(
+                            "Settings {missing} could not be read, leaving the in-memory values of {} unchanged",
+                            names.join(", ")
+                        );
+                    }
+                }
+                PassStep::Action(fut) => fut.await,
+            }
+        }
+    }
+}
+
+/// The value of a `FORCE_<VAR>` override, when it is set and parses.
+///
+/// Mirrors the check [`load_option_setting_value`] makes before it reads, so the batched and
+/// per-setting paths agree on when the database is consulted at all.
+fn forced_env_value<T: FromStr>(std_env_var: &str) -> Option<T> {
+    std::env::var(format!("FORCE_{}", std_env_var))
+        .ok()
+        .and_then(|x| x.parse::<T>().ok())
+}
+
+/// Parse whitespace-separated URLs, dropping and reporting the ones that do not parse.
+fn parse_url_list(raw: &str, source: &str) -> Vec<url::Url> {
+    raw.trim()
+        .split_whitespace()
+        .filter_map(|url_str| match url::Url::parse(url_str) {
+            Ok(url) => Some(url),
+            Err(e) => {
+                tracing::error!("Invalid URL in {}: '{}': {}", source, url_str, e);
+                None
+            }
+        })
+        .collect()
+}
+
+/// One read per setting, concurrently. The fallback for a batch that failed as a whole: a
+/// name whose own read also fails is left out, so its applier is skipped rather than told the
+/// setting is unset.
+async fn fetch_settings_individually(
+    conn: &Connection,
+    names: &[&str],
+) -> std::collections::HashMap<String, Option<serde_json::Value>> {
+    futures::future::join_all(names.iter().map(|name| async move {
+        (
+            name.to_string(),
+            load_value_from_global_settings_with_conn(conn, name, true).await,
+        )
+    }))
+    .await
+    .into_iter()
+    .filter_map(|(name, value)| match value {
+        Ok(value) => Some((name, value)),
+        Err(e) => {
+            tracing::error!("Error loading setting {name}: {e:#}");
+            None
+        }
+    })
+    .collect()
+}
+
+/// Read many settings at once: one query over a database connection, and for an agent worker
+/// one concurrent round of the per-setting endpoint rather than a sequential walk of it.
+///
+/// A name whose read failed is left out entirely, which the caller distinguishes from a name
+/// that is present with no value, i.e. genuinely unset.
+async fn fetch_settings_batch(
+    conn: &Connection,
+    names: &[&str],
+) -> std::collections::HashMap<String, Option<serde_json::Value>> {
+    match conn {
+        Connection::Sql(db) => {
+            match windmill_common::global_settings::load_values_from_global_settings(db, names)
+                .await
+            {
+                // Every requested name is accounted for: the ones with no row read as unset.
+                Ok(mut rows) => names
+                    .iter()
+                    .map(|name| (name.to_string(), rows.remove(*name)))
+                    .collect(),
+                Err(e) => {
+                    tracing::error!("Could not load global settings: {e:#}");
+                    std::collections::HashMap::new()
+                }
+            }
+        }
+        // An agent worker has no batch endpoint, but issuing the reads together still costs
+        // one round instead of one per setting.
+        Connection::Http(_) => fetch_settings_individually(conn, names).await,
+    }
+}
+
+pub async fn load_value_from_global_settings_with_conn(
+    conn: &Connection,
+    setting_name: &str,
+    load_from_http: bool,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    match conn {
+        Connection::Sql(db) => Ok(load_value_from_global_settings(db, setting_name).await?),
+        Connection::Http(client) => {
+            if load_from_http {
+                client
+                    .get::<Option<serde_json::Value>>(&format!(
+                        "/api/agent_workers/get_global_setting/{}",
+                        setting_name
+                    ))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Error loading setting {}: {}", setting_name, e))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Load an optional setting value without writing it anywhere.
+///
+/// Extracted from [`reload_option_setting`] so callers that store the value
+/// in something other than `Arc<RwLock<Option<T>>>` (e.g. `ArcSwap<Option<T>>`,
+/// an `AtomicBool`, etc.) can reuse the load pipeline.
+pub async fn load_option_setting_value<T: FromStr + DeserializeOwned>(
+    conn: &Connection,
+    setting_name: &str,
+    std_env_var: &str,
+) -> error::Result<Option<T>> {
+    let force_value = std::env::var(format!("FORCE_{}", std_env_var))
+        .ok()
+        .and_then(|x| x.parse::<T>().ok());
+
+    if let Some(force_value) = force_value {
+        return Ok(Some(force_value));
+    }
+
+    let q = load_value_from_global_settings_with_conn(conn, setting_name, true).await?;
+    Ok(parse_option_setting_value(q, setting_name, std_env_var))
+}
+
+/// The half of [`load_option_setting_value`] after the read, so [`SettingsPass`] can parse a
+/// value it already fetched.
+pub fn parse_option_setting_value<T: FromStr + DeserializeOwned>(
+    q: Option<serde_json::Value>,
+    setting_name: &str,
+    std_env_var: &str,
+) -> Option<T> {
+    if let Some(force_value) = std::env::var(format!("FORCE_{}", std_env_var))
+        .ok()
+        .and_then(|x| x.parse::<T>().ok())
+    {
+        return Some(force_value);
+    }
+
+    let mut value = std::env::var(std_env_var)
+        .ok()
+        .and_then(|x| x.parse::<T>().ok());
+
+    if let Some(q) = q {
+        if let Ok(v) = serde_json::from_value::<T>(q.clone()) {
+            tracing::info!("Loaded setting {setting_name} from db config: {:#?}", &q);
+            value = Some(v)
+        } else {
+            tracing::error!("Could not parse {setting_name} found: {:#?}", &q);
+        }
+    };
+
+    if value.is_none() {
+        tracing::info!("Loaded {setting_name} setting to None");
+    }
+
+    value
+}
+
+pub async fn reload_option_setting<T: FromStr + DeserializeOwned>(
+    conn: &Connection,
+    setting_name: &str,
+    std_env_var: &str,
+    lock: Arc<RwLock<Option<T>>>,
+) -> error::Result<()> {
+    let value = load_option_setting_value::<T>(conn, setting_name, std_env_var).await?;
+    {
+        let mut l = lock.write().await;
+        *l = value;
+    }
+    Ok(())
+}
+
+pub async fn reload_url_list_setting_with_tracing(
+    conn: &Connection,
+    setting_name: &str,
+    std_env_var: &str,
+    lock: Arc<RwLock<Option<Vec<url::Url>>>>,
+) {
+    if let Err(e) = reload_url_list_setting(conn, setting_name, std_env_var, lock.clone()).await {
+        tracing::error!("Error reloading setting {}: {:?}", setting_name, e)
+    }
+}
+
+/// Load an optional URL list setting without writing it anywhere.
+///
+/// Extracted from [`reload_url_list_setting`] so callers that store the
+/// value in something other than `Arc<RwLock<Option<Vec<Url>>>>` (e.g.
+/// `ArcSwap<Option<Vec<Url>>>`) can reuse the parsing pipeline.
+pub async fn load_url_list_setting_value(
+    conn: &Connection,
+    setting_name: &str,
+    std_env_var: &str,
+) -> error::Result<Option<Vec<url::Url>>> {
+    // Check for force environment variable
+    if let Ok(force_value) = std::env::var(format!("FORCE_{}", std_env_var)) {
+        let mut urls = Vec::new();
+        for url_str in force_value.trim().split_whitespace() {
+            match url::Url::parse(url_str) {
+                Ok(url) => urls.push(url),
+                Err(e) => {
+                    return Err(error::Error::BadRequest(format!(
+                        "Invalid URL in FORCE_{}: '{}': {}",
+                        std_env_var, url_str, e
+                    )));
+                }
+            }
+        }
+        return Ok(if urls.is_empty() { None } else { Some(urls) });
+    }
+
+    let q = load_value_from_global_settings_with_conn(conn, setting_name, true).await?;
+    Ok(parse_url_list_setting_value(q, setting_name, std_env_var))
+}
+
+/// The half of [`load_url_list_setting_value`] after the read, so [`SettingsPass`] can parse a
+/// value it already fetched.
+pub fn parse_url_list_setting_value(
+    q: Option<serde_json::Value>,
+    setting_name: &str,
+    std_env_var: &str,
+) -> Option<Vec<url::Url>> {
+    // A FORCE_ override wins over both the database and the ordinary env var. Invalid URLs in
+    // it are dropped with an error here rather than failing the read, since a settings pass
+    // has nowhere to return the failure to.
+    if let Ok(force_value) = std::env::var(format!("FORCE_{}", std_env_var)) {
+        let urls = parse_url_list(&force_value, &format!("FORCE_{}", std_env_var));
+        return if urls.is_empty() { None } else { Some(urls) };
+    }
+
+    // Check regular environment variable
+    let mut value = if let Ok(env_value) = std::env::var(std_env_var) {
+        let mut urls = Vec::new();
+        for url_str in env_value.trim().split_whitespace() {
+            match url::Url::parse(url_str) {
+                Ok(url) => urls.push(url),
+                Err(_) => {
+                    // Log error but continue, similar to force variable handling
+                    tracing::error!("Invalid URL in {}: '{}'", std_env_var, url_str);
+                }
+            }
+        }
+        if urls.is_empty() {
+            None
+        } else {
+            Some(urls)
+        }
+    } else {
+        None
+    };
+
+    // Check database setting
+    if let Some(q) = q {
+        if let Ok(repos_str) = serde_json::from_value::<String>(q.clone()) {
+            let mut urls = Vec::new();
+            for url_str in repos_str.trim().split_whitespace() {
+                match url::Url::parse(url_str) {
+                    Ok(url) => urls.push(url),
+                    Err(e) => {
+                        tracing::error!("Invalid URL in {}: '{}': {}", setting_name, url_str, e);
+                        // Continue with other URLs, just skip invalid ones
+                    }
+                }
+            }
+            tracing::info!(
+                "Loaded setting {} from db config: {} URLs",
+                setting_name,
+                urls.len()
+            );
+            value = if urls.is_empty() { None } else { Some(urls) };
+        } else {
+            tracing::error!("Could not parse {} found: {:#?}", setting_name, &q);
+        }
+    }
+
+    if value.is_none() {
+        tracing::info!("Loaded {} setting to None", setting_name);
+    }
+
+    value
+}
+
+pub async fn reload_url_list_setting(
+    conn: &Connection,
+    setting_name: &str,
+    std_env_var: &str,
+    lock: Arc<RwLock<Option<Vec<url::Url>>>>,
+) -> error::Result<()> {
+    let value = load_url_list_setting_value(conn, setting_name, std_env_var).await?;
+    {
+        let mut l = lock.write().await;
+        *l = value;
+    }
+    Ok(())
+}
+
+/// Load a required setting value without writing it anywhere, so callers that store it in
+/// something other than `Arc<RwLock<T>>` (e.g. `AtomicI64`, `AtomicBool`, `ArcSwap<T>`) can
+/// reuse the load pipeline.
+pub async fn load_setting_value<T: FromStr + DeserializeOwned + Display>(
+    conn: &Connection,
+    setting_name: &str,
+    std_env_var: &str,
+    default: T,
+    transformer: fn(T) -> T,
+) -> error::Result<T> {
+    let q = load_value_from_global_settings_with_conn(conn, setting_name, true).await?;
+    Ok(parse_setting_value(
+        q,
+        setting_name,
+        std_env_var,
+        default,
+        transformer,
+    ))
+}
+
+/// The half of [`load_setting_value`] after the read, so [`SettingsPass`] can parse a value it
+/// already fetched.
+pub fn parse_setting_value<T: FromStr + DeserializeOwned + Display>(
+    q: Option<serde_json::Value>,
+    setting_name: &str,
+    std_env_var: &str,
+    default: T,
+    transformer: fn(T) -> T,
+) -> T {
+    let mut value = std::env::var(std_env_var)
+        .ok()
+        .and_then(|x| x.parse::<T>().ok())
+        .unwrap_or(default);
+
+    if let Some(q) = q {
+        if let Ok(v) = serde_json::from_value::<T>(q.clone()) {
+            tracing::info!("Loaded setting {setting_name} from db config: {:#?}", &q);
+            value = transformer(v);
+        } else {
+            tracing::error!("Could not parse {setting_name} found: {:#?}", &q);
+        }
+    };
+
+    value
+}
+
+#[cfg(feature = "prometheus")]
+pub async fn monitor_pool(db: &DB) {
+    if METRICS_ENABLED.load(Ordering::Relaxed) {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let active_gauge = prometheus::register_int_gauge!(
+                "pool_connections_active",
+                "Number of active postgresql connections in the pool"
+            )
+            .unwrap();
+            let idle_gauge = prometheus::register_int_gauge!(
+                "pool_connections_idle",
+                "Number of idle postgresql connections in the pool"
+            )
+            .unwrap();
+            let max_gauge = prometheus::register_int_gauge!(
+                "pool_connections_max",
+                "Number of max postgresql connections in the pool"
+            )
+            .unwrap();
+
+            max_gauge.set(db.options().get_max_connections() as i64);
+            loop {
+                active_gauge.set(db.size() as i64);
+                idle_gauge.set(db.num_idle() as i64);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+}
+
+pub async fn monitor_pool_otel(db: &DB) {
+    if OTEL_METRICS_ENABLED.load(Ordering::Relaxed) {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let max = db.options().get_max_connections() as i64;
+            loop {
+                otel_set_db_pool(db.size() as i64, db.num_idle() as i64, max);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+}
+
+pub struct MonitorIteration {
+    pub rd_shift: u8,
+    pub iter: u64,
+}
+
+impl MonitorIteration {
+    pub fn should_run(&self, period: u8) -> bool {
+        (self.iter + self.rd_shift as u64) % (period as u64) == 0
+    }
+}
+
+pub async fn monitor_db(
+    conn: &Connection,
+    base_internal_url: &str,
+    server_mode: bool,
+    _worker_mode: bool,
+    initial_load: bool,
+    _killpill_tx: KillpillSender,
+    iteration: Option<MonitorIteration>,
+) {
+    let zombie_jobs_f = async {
+        if server_mode && !initial_load && !*DISABLE_ZOMBIE_JOBS_MONITORING {
+            if let Some(db) = conn.as_sql() {
+                handle_zombie_jobs(db, base_internal_url, "server").await;
+                match handle_zombie_flows(db).await {
+                    Err(err) => {
+                        tracing::error!("Error handling zombie flows: {:?}", err);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    let stale_jobs_f = async {
+        if server_mode && !initial_load {
+            if let Some(db) = conn.as_sql() {
+                stale_job_cancellation(&db).await;
+            }
+        }
+    };
+
+    // run every 5 minutes
+    let cleanup_concurrency_counters_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(10) {
+            if let Some(db) = conn.as_sql() {
+                if let Err(e) = cleanup_concurrency_counters_orphaned_keys(&db).await {
+                    tracing::error!("Error cleaning up concurrency counters: {:?}", e);
+                }
+            }
+        }
+    };
+
+    // run every 10 minutes
+    let cleanup_concurrency_counters_empty_keys_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(20) {
+            if let Some(db) = conn.as_sql() {
+                if let Err(e) = cleanup_concurrency_counters_empty_keys(&db).await {
+                    tracing::error!("Error cleaning up concurrency counters: {:?}", e);
+                }
+            }
+        }
+    };
+
+    let cleanup_debounce_keys_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(10) {
+            if let Some(db) = conn.as_sql() {
+                if let Err(e) = cleanup_debounce_orphaned_keys(&db).await {
+                    tracing::error!("Error cleaning up debounce keys: {:?}", e);
+                }
+                if let Err(e) = cleanup_consumed_debounce_batches(&db).await {
+                    tracing::error!("Error cleaning up consumed debounce batches: {:?}", e);
+                }
+            }
+        }
+    };
+
+    // run every 30s (every iteration)
+    let cleanup_debounce_keys_completed_f = async {
+        if server_mode && !initial_load {
+            if let Some(db) = conn.as_sql() {
+                if let Err(e) = cleanup_debounce_keys_for_completed_jobs(&db).await {
+                    tracing::error!(
+                        "Error cleaning up debounce keys for completed jobs: {:?}",
+                        e
+                    );
+                }
+            }
+        }
+    };
+
+    let cleanup_flow_iterator_data_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(10) {
+            if let Some(db) = conn.as_sql() {
+                if let Err(e) = cleanup_flow_iterator_data_orphaned_jobs(&db).await {
+                    tracing::error!("Error cleaning up flow_iterator_data: {:?}", e);
+                }
+                if let Err(e) = cleanup_ai_agent_checkpoint_orphaned_jobs(&db).await {
+                    tracing::error!("Error cleaning up ai_agent_checkpoint: {:?}", e);
+                }
+            }
+        }
+    };
+
+    let cleanup_job_live_rows_f = async {
+        if server_mode && !initial_load {
+            if let Some(db) = conn.as_sql() {
+                if let Err(e) = cleanup_job_perms_orphaned(&db).await {
+                    tracing::error!("Error cleaning up orphaned job_perms: {:?}", e);
+                }
+                if let Err(e) = cleanup_job_result_stream_orphaned_jobs(&db).await {
+                    tracing::error!("Error cleaning up orphaned job_result_stream_v2: {:?}", e);
+                }
+            }
+        }
+    };
+
+    // run every hour (60 minutes / 30 seconds = 120)
+    let cleanup_worker_group_stats_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(120) {
+            if let Some(db) = conn.as_sql() {
+                match windmill_common::worker_group_job_stats::cleanup_old_stats(db, 60).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Deleted {} old worker group job stats rows", count);
+                    }
+                    Err(e) => {
+                        tracing::error!("Error cleaning up worker group job stats: {:?}", e);
+                    }
+                    _ => {}
+                }
+                match windmill_common::runnable_job_stats::cleanup_old_runnable_job_stats(
+                    db,
+                    windmill_common::runnable_job_stats::RETENTION_DAYS,
+                )
+                .await
+                {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Deleted {} old runnable job stats rows", count);
+                    }
+                    Err(e) => {
+                        tracing::error!("Error cleaning up runnable job stats: {:?}", e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    // run every 120 iterations (~20min at the default LISTEN_NEW_EVENTS_INTERVAL_SEC)
+    let trim_resource_versions_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(120) {
+            if let Some(db) = conn.as_sql() {
+                trim_resource_versions(&db).await;
+            }
+        }
+    };
+
+    // run every hour
+    let vacuum_queue_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(60) {
+            if let Some(db) = conn.as_sql() {
+                let instant = Instant::now();
+                tracing::info!("vacuuming tables");
+                if let Err(e) = vacuuming_tables(&db).await {
+                    tracing::error!("Error vacuuming v2_job: {:?}", e);
+                }
+                tracing::info!("vacuum tables done in {}s", instant.elapsed().as_secs());
+            }
+        }
+    };
+
+    let expired_items_f = async {
+        if server_mode && !initial_load {
+            if let Some(db) = conn.as_sql() {
+                delete_expired_items(&db).await;
+            }
+        }
+    };
+
+    // Not gated on server_mode: feature-usage counters accumulate wherever an
+    // instrumented call site runs, and a worker that never flushed would lose
+    // its counts on shutdown.
+    let feature_usage_f = async {
+        if !initial_load {
+            if let Some(db) = conn.as_sql() {
+                if let Err(e) = windmill_common::feature_usage::flush_feature_usage(db).await {
+                    tracing::error!("Error flushing feature_usage counters: {e}");
+                }
+            }
+        }
+    };
+
+    let verify_license_key_f = async {
+    };
+
+    let enforce_offline_caps_f = async {
+    };
+
+    let expose_queue_metrics_f = async {
+        if !initial_load && server_mode {
+            if let Some(db) = conn.as_sql() {
+                expose_queue_metrics(&db).await;
+            }
+        }
+    };
+
+    let worker_groups_alerts_f = async {
+    };
+
+    let jobs_waiting_alerts_f = async {
+    };
+
+    let low_disk_alerts_f = async {
+        {
+            ()
+        }
+    };
+
+    let apply_autoscaling_f = async {
+    };
+
+    let update_min_worker_version_f = async {
+        windmill_common::min_version::update_min_version(
+            conn,
+            _worker_mode,
+            WORKERS_NAMES.read().await.clone(),
+            initial_load,
+        )
+        .await;
+    };
+
+    // Run every 5 minutes (10 iterations * 30s = 5 minutes)
+    let native_triggers_sync_f = async {
+        #[cfg(feature = "native_trigger")]
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(10) {
+            if let Some(db) = conn.as_sql() {
+                match sync_all_triggers(db).await {
+                    Ok(result) => {
+                        tracing::debug!(
+                            "Native triggers sync completed: {} workspaces, {} synced, {} errors",
+                            result.workspaces_processed,
+                            result.total_synced,
+                            result.total_errors
+                        );
+                        if result.total_errors > 0 {
+                            tracing::warn!(
+                                "Native triggers sync encountered {} errors",
+                                result.total_errors
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Error during native triggers sync: {:#}", e);
+                    }
+                }
+            }
+        }
+    };
+
+    // Run every 5 minutes (10 iterations * 30s = 5 minutes)
+    // Cleanup old notify events (older than 10 minutes)
+    let cleanup_notify_events_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(10) {
+            if let Some(db) = conn.as_sql() {
+                match windmill_common::notify_events::cleanup_old_events(db, 10).await {
+                    Ok(count) if count > 0 => {
+                        tracing::debug!("Cleaned up {} old notify events", count);
+                    }
+                    Err(e) => {
+                        tracing::error!("Error cleaning up notify events: {:?}", e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    // Run every hour (10 iterations * 30s = 5 minutes)
+    // Check for tokens expiring within 7 days and send alerts
+    let check_expiring_tokens_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(10) {
+            if let Some(db) = conn.as_sql() {
+                check_expiring_tokens(&db).await;
+            }
+        }
+    };
+
+    // Run every 5 minutes (10 iterations * 30s)
+    let dispatch_expiring_variables_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(10) {
+            if let Some(db) = conn.as_sql() {
+                dispatch_expiring_variables(&db).await;
+            }
+        }
+    };
+
+    // run every hour (120 iterations * 30s = 3600s)
+    let cleanup_stale_server_heartbeats_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(120) {
+            if let Some(db) = conn.as_sql() {
+                match windmill_api::cleanup_stale_server_heartbeats(db).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(
+                            "Deleted {} stale server_heartbeat background_task_state rows",
+                            count
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Error cleaning up stale server_heartbeat rows: {:?}", e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    // run every hour (120 iterations * 30s = 3600s)
+    let manage_audit_partitions_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(120) {
+            if let Some(db) = conn.as_sql() {
+                manage_audit_partitions(&db, audit_log_retention_days().await).await;
+            }
+        }
+    };
+
+    // run every 2 iterations (~20s at the default LISTEN_NEW_EVENTS_INTERVAL_SEC).
+    // Enterprise feature: core logic is in `crate::ee` (OSS gets a no-op stub);
+    // gated on a valid Enterprise license, mirroring how `audit_log()` itself
+    // is license-aware.
+    let export_audit_logs_to_object_store_f = async {
+        #[cfg(feature = "parquet")]
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(2) {
+            if let Some(db) = conn.as_sql() {
+                if matches!(
+                    windmill_common::ee_oss::get_license_plan().await,
+                    windmill_common::ee_oss::LicensePlan::Enterprise
+                ) {
+                    crate::ee_oss::export_audit_logs_to_object_store(&db).await;
+                }
+            }
+        }
+    };
+
+    let cleanup_scheduled_job_deletions_f = async {
+    };
+
+    // run every 30 iterations (~5min at the default LISTEN_NEW_EVENTS_INTERVAL_SEC).
+    let reconcile_unarmed_schedules_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(30) {
+            if let Some(db) = conn.as_sql() {
+                reconcile_unarmed_schedules(&db).await;
+            }
+        }
+    };
+
+    // run every 30 iterations (~5min at the default LISTEN_NEW_EVENTS_INTERVAL_SEC).
+    let stranded_jobs_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(30) {
+            if let Some(db) = conn.as_sql() {
+                crate::stranded_jobs::check_stranded_jobs(&db).await;
+            }
+        }
+    };
+
+    // Poll git-sync repositories for new commits and pull them into the
+    // workspace (repo → Windmill auto-pull). Runs every 2 iterations.
+    let git_auto_pull_f = async {
+    };
+
+    // Re-check what each git-sync repository's own credential says about its expiry,
+    // and rotate the ones close to it. Every ~40 min: the values move over days, and
+    // `should_run` counts iterations in a u8. Spawned rather than joined: the join
+    // below is cancelled at its deadline, which a long sweep would reach, and a
+    // rotation cut off between GitLab issuing a token and Windmill storing it
+    // loses the token family. Detached, only process shutdown can cut it off,
+    // which a rotation almost never coincides with. The pass's advisory lock
+    // keeps a slow one from overlapping the next.
+    let git_credential_maintenance_f = async {
+    };
+
+    // Drop the data table role set logins nobody has connected with for a month. Every ~40 min,
+    // spawned for the same reason as the credential maintenance above: it opens a connection per
+    // managed database for each login it drops.
+    let datatable_role_set_sweep_f = async {
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(240) {
+            if let Some(db) = conn.as_sql() {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        windmill_common::datatable_roles::sweep_unused_role_set_logins(&db).await
+                    {
+                        tracing::error!("Error sweeping unused data table role set logins: {e}");
+                    }
+                });
+            }
+        }
+    };
+
+    // Re-encrypt the legacy-format secret variables once new values are written in AES-256-GCM.
+    // Every ~5 min until one pass has gone through every workspace; spawned so a large instance
+    // does not hold up the join below. The column widening it starts with is tried every
+    // iteration: a v2 value too long for the narrow column fails to save until it is done.
+    let legacy_secret_upgrade_f = async {
+        if server_mode
+            && iteration.is_some()
+            && (windmill_common::variables::variable_value_widen_pending()
+                || (iteration.as_ref().unwrap().should_run(30)
+                    && windmill_common::variables::legacy_secret_upgrade_pending()))
+        {
+            if let Some(db) = conn.as_sql() {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    windmill_common::variables::upgrade_legacy_secret_variables(&db).await
+                });
+            }
+        }
+    };
+
+    // Delete the AI session backups older than their workspace's retention. Every ~40 min
+    // (240 iterations at the default 10 s, the most a u8 `should_run` counts): the retention
+    // counts in days. Spawned for the same reason as the credential maintenance above, a
+    // sweep of many sessions outlasting the join's deadline; the sweep's own advisory lock
+    // keeps one server at a time at it.
+    let ai_session_retention_f = async {
+        #[cfg(feature = "parquet")]
+        if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(240) {
+            if let Some(db) = conn.as_sql() {
+                let db = db.clone();
+                tokio::spawn(
+                    async move { windmill_api::sweep_expired_ai_session_backups(&db).await },
+                );
+            }
+        }
+    };
+
+    // run every 2 iterations (~20s at the default LISTEN_NEW_EVENTS_INTERVAL_SEC).
+    // Enterprise feature: the active `// freshness` backstop lives in
+    // windmill-queue's `freshness_watchdog` (`private`); OSS gets a no-op stub.
+    // Runtime-gated on an Enterprise license like the audit export above. Safe
+    // on concurrent servers — the watchdog claims per-script state rows
+    // atomically before pushing.
+    let pipeline_freshness_watchdog_f = async {
+        if server_mode
+            && !*DISABLE_FRESHNESS_WATCHDOG
+            && iteration.is_some()
+            && iteration.as_ref().unwrap().should_run(2)
+        {
+            if let Some(db) = conn.as_sql() {
+                if matches!(
+                    windmill_common::ee_oss::get_license_plan().await,
+                    windmill_common::ee_oss::LicensePlan::Enterprise
+                ) {
+                    windmill_queue::freshness_watchdog::tick(db).await;
+                }
+            }
+        }
+    };
+
+    join!(
+        expired_items_f,
+        feature_usage_f,
+        zombie_jobs_f,
+        stale_jobs_f,
+        trim_resource_versions_f,
+        vacuum_queue_f,
+        expose_queue_metrics_f,
+        verify_license_key_f,
+        enforce_offline_caps_f,
+        worker_groups_alerts_f,
+        jobs_waiting_alerts_f,
+        low_disk_alerts_f,
+        apply_autoscaling_f,
+        update_min_worker_version_f,
+        cleanup_concurrency_counters_f,
+        cleanup_concurrency_counters_empty_keys_f,
+        cleanup_debounce_keys_f,
+        cleanup_debounce_keys_completed_f,
+        cleanup_flow_iterator_data_f,
+        cleanup_job_live_rows_f,
+        cleanup_worker_group_stats_f,
+        native_triggers_sync_f,
+        cleanup_notify_events_f,
+        check_expiring_tokens_f,
+        dispatch_expiring_variables_f,
+        cleanup_stale_server_heartbeats_f,
+        manage_audit_partitions_f,
+        export_audit_logs_to_object_store_f,
+        cleanup_scheduled_job_deletions_f,
+        git_auto_pull_f,
+        git_credential_maintenance_f,
+        datatable_role_set_sweep_f,
+        ai_session_retention_f,
+        legacy_secret_upgrade_f,
+        pipeline_freshness_watchdog_f,
+        reconcile_unarmed_schedules_f,
+        stranded_jobs_f,
+    );
+}
+
+/// Advisory lock id ensuring only one server replica reconciles schedules at a
+/// time (adjacent to GIT_AUTO_PULL_LOCK_ID).
+const SCHEDULE_RECONCILE_LOCK_ID: i64 = 737_483_922;
+
+/// Consecutive reconciliation passes an enabled schedule must be observed with no
+/// queued occurrence before it is re-armed. The next occurrence is pushed in the
+/// same transaction that completes the previous one (or, for flows, on entry to
+/// step 0), so an unarmed schedule is normally only ever a mid-flight push or a
+/// push being retried. Requiring two passes keeps the reconciler from racing
+/// those and double-pushing an occurrence.
+const SCHEDULE_RECONCILE_STRIKES: u8 = 2;
+
+/// Most schedules re-armed in one pass, so a large first-pass backlog is drained
+/// over several passes instead of enqueuing every occurrence at once.
+const SCHEDULE_RECONCILE_MAX_PER_PASS: usize = 50;
+
+/// Consecutive failed re-arm attempts after which a schedule's persistent failure
+/// is surfaced once (its `error` recorded + a critical alert). Most re-arm
+/// failures are a transient blip that clears on the next attempt; a schedule that
+/// keeps failing has a real cause (bad stored cron/timezone/args, lapsed license)
+/// and would otherwise be enabled-yet-silently-dead.
+const SCHEDULE_REARM_ALERT_THRESHOLD: u32 = 3;
+
+/// Cap on the exponential back-off (in reconcile passes) between re-arm retries of
+/// a schedule that keeps failing. Without a back-off a permanently-failing push
+/// retries every pass forever; the delay grows 2, 4, 8 and holds at this cap, and
+/// resets the moment the schedule re-arms. Kept small so a schedule fixed out of
+/// band (the UI/API re-arms immediately) still auto-recovers within a few passes.
+const SCHEDULE_REARM_MAX_BACKOFF_PASSES: u32 = 8;
+
+/// State for a schedule that keeps failing to re-arm: paces retries and drives the
+/// one-time visibility so the loop is neither hot nor silent.
+#[derive(Default)]
+struct RearmFailureState {
+    consecutive_failures: u32,
+    /// Reconcile passes still to skip before the next attempt (exponential back-off).
+    cooldown_passes: u32,
+    /// Whether the persistent failure has already been surfaced.
+    surfaced: bool,
+}
+
+lazy_static::lazy_static! {
+    /// `(workspace_id, path)` -> consecutive passes seen with no queued occurrence.
+    /// Bounded by the number of enabled schedules; entries drop as soon as a
+    /// schedule is seen armed again.
+    static ref UNARMED_SCHEDULES: Mutex<std::collections::HashMap<(String, String), u8>> =
+        Mutex::new(std::collections::HashMap::new());
+
+    /// `(workspace_id, path)` -> back-off/visibility state for schedules that keep
+    /// failing to re-arm. Entries drop as soon as a schedule re-arms or is no
+    /// longer unarmed (armed, disabled, deleted).
+    static ref SCHEDULE_REARM_FAILURES: Mutex<std::collections::HashMap<(String, String), RearmFailureState>> =
+        Mutex::new(std::collections::HashMap::new());
+}
+
+/// Re-arm enabled schedules that have no queued occurrence.
+///
+/// Every path that completes a scheduled job is supposed to push the next
+/// occurrence atomically, but a run that dies through an abnormal path (a flow
+/// whose status update fails and is later force-completed by zombie detection,
+/// say) can skip that push and leave the schedule enabled yet dead forever. This
+/// is the backstop: without it the only recovery is a manual disable/enable.
+///
+/// Replicas each run their own passes (staggered by `rd_shift`) and each keep
+/// their own strike tally, so the scan cost is per-replica. That is deliberate:
+/// scanning inside the advisory lock is what makes a double-push impossible —
+/// whoever holds it re-reads the unarmed set, so a schedule another replica just
+/// re-armed is seen armed and its tally dropped, rather than pushed twice.
+///
+/// Not an authorization boundary: it re-arms schedules across every workspace, so
+/// this is a system caller (the monitor loop) only.
+async fn reconcile_unarmed_schedules(db: &Pool<Postgres>) {
+    // Transaction-scoped advisory lock, not session-scoped: monitor_db runs under a
+    // 600s timeout, and if it fires the whole future is dropped mid-pass. A session
+    // lock taken on a pooled connection would then ride that connection back into the
+    // pool still held, wedging reconciliation on every replica until the process
+    // restarts. An xact lock is released when its transaction ends — including the
+    // rollback a dropped `Transaction` performs — so cancellation can't strand it.
+    // The tx is held open only to own the lock; the scan and re-arm run on separate
+    // pool connections.
+    let mut lock_tx = match db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("schedule reconcile: failed to begin lock tx: {e:#}");
+            return;
+        }
+    };
+    let locked: bool = match sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(SCHEDULE_RECONCILE_LOCK_ID)
+        .fetch_one(&mut *lock_tx)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("schedule reconcile: advisory lock failed: {e:#}");
+            return;
+        }
+    };
+    if !locked {
+        // Another replica is already reconciling this tick.
+        return;
+    }
+
+    if let Err(e) = reconcile_unarmed_schedules_inner(db).await {
+        tracing::error!("schedule reconcile: {e:#}");
+    }
+
+    // Ends the transaction and releases the xact lock; a plain drop would too.
+    if let Err(e) = lock_tx.rollback().await {
+        tracing::error!("schedule reconcile: releasing lock failed: {e:#}");
+    }
+}
+
+/// Record this pass's unarmed schedules against `seen` and return those that have
+/// now struck out. An armed observation drops the schedule's tally entirely, so
+/// the strikes a re-arm rests on are always consecutive.
+fn strike_unarmed(
+    seen: &mut std::collections::HashMap<(String, String), u8>,
+    current: std::collections::HashSet<(String, String)>,
+) -> Vec<(String, String)> {
+    seen.retain(|k, _| current.contains(k));
+    current
+        .into_iter()
+        .filter(|k| {
+            let strikes = seen.entry(k.clone()).or_insert(0);
+            *strikes = strikes.saturating_add(1);
+            *strikes >= SCHEDULE_RECONCILE_STRIKES
+        })
+        .collect()
+}
+
+async fn reconcile_unarmed_schedules_inner(db: &Pool<Postgres>) -> error::Result<()> {
+    let current: std::collections::HashSet<(String, String)> =
+        find_unarmed_schedules(db).await?.into_iter().collect();
+    let mut to_rearm = strike_unarmed(&mut UNARMED_SCHEDULES.lock().unwrap(), current.clone());
+
+    // Back off schedules that keep failing to re-arm (bad stored cron/timezone/args,
+    // lapsed license): skip those still cooling down, and forget state for any that
+    // are no longer unarmed. Without this a permanently-failing push is retried
+    // every pass forever.
+    {
+        let mut failures = SCHEDULE_REARM_FAILURES.lock().unwrap();
+        failures.retain(|k, _| current.contains(k));
+        to_rearm.retain(|k| match failures.get_mut(k) {
+            Some(state) if state.cooldown_passes > 0 => {
+                state.cooldown_passes -= 1;
+                false
+            }
+            _ => true,
+        });
+    }
+
+    // The first pass on an instance that has never been swept can find a large
+    // backlog; re-arming it all at once would enqueue that whole backlog in one
+    // go. The overflow keeps its tally and is picked up next pass.
+    if to_rearm.len() > SCHEDULE_RECONCILE_MAX_PER_PASS {
+        tracing::warn!(
+            "schedule reconcile: {} schedules have no queued occurrence, re-arming {} this pass and the rest on later passes",
+            to_rearm.len(),
+            SCHEDULE_RECONCILE_MAX_PER_PASS
+        );
+        to_rearm.truncate(SCHEDULE_RECONCILE_MAX_PER_PASS);
+    }
+
+    for (w_id, path) in to_rearm {
+        match rearm_schedule(db, &w_id, &path).await {
+            Ok(outcome) => {
+                if outcome == RearmOutcome::Rearmed {
+                    tracing::warn!(
+                        "schedule reconcile: re-armed enabled schedule {path} in {w_id}, which had no queued occurrence"
+                    );
+                }
+                UNARMED_SCHEDULES
+                    .lock()
+                    .unwrap()
+                    .remove(&(w_id.clone(), path.clone()));
+                // Clear the error we recorded once it re-arms, so a recovered
+                // schedule stops showing a stale failure.
+                let was_surfaced = SCHEDULE_REARM_FAILURES
+                    .lock()
+                    .unwrap()
+                    .remove(&(w_id.clone(), path.clone()))
+                    .is_some_and(|s| s.surfaced);
+                if was_surfaced {
+                    if let Err(e) = sqlx::query!(
+                        "UPDATE schedule SET error = NULL WHERE workspace_id = $1 AND path = $2 AND enabled IS TRUE",
+                        w_id,
+                        path
+                    )
+                    .execute(db)
+                    .await
+                    {
+                        tracing::error!(
+                            "schedule reconcile: could not clear error for {path} in {w_id}: {e:#}"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "schedule reconcile: could not re-arm schedule {path} in {w_id}: {e:#}"
+                );
+                let should_surface = {
+                    let mut failures = SCHEDULE_REARM_FAILURES.lock().unwrap();
+                    let state = failures.entry((w_id.clone(), path.clone())).or_default();
+                    state.consecutive_failures += 1;
+                    state.cooldown_passes = (1u32 << state.consecutive_failures.min(5))
+                        .min(SCHEDULE_REARM_MAX_BACKOFF_PASSES);
+                    let surface = !state.surfaced
+                        && state.consecutive_failures >= SCHEDULE_REARM_ALERT_THRESHOLD;
+                    state.surfaced |= surface;
+                    surface
+                };
+                // Surface without disabling: record the error for the owner (schedule
+                // stays enabled) and raise a critical alert. rearm_schedule never
+                // disables, so this is the only signal a persistently-broken schedule
+                // gives beyond server logs.
+                if should_surface {
+                    if let Err(err) = sqlx::query!(
+                        "UPDATE schedule SET error = $1 WHERE workspace_id = $2 AND path = $3 AND enabled IS TRUE",
+                        e.to_string(),
+                        w_id,
+                        path
+                    )
+                    .execute(db)
+                    .await
+                    {
+                        tracing::error!(
+                            "schedule reconcile: could not record error for {path} in {w_id}: {err:#}"
+                        );
+                    }
+                    report_critical_error(
+                        format!(
+                            "Schedule {path} in workspace {w_id} is enabled but has repeatedly failed to re-arm and will not run until the cause is fixed: {e:#}"
+                        ),
+                        db.clone(),
+                        Some(&w_id),
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn vacuuming_tables(db: &Pool<Postgres>) -> error::Result<()> {
+    sqlx::query!("VACUUM v2_job, v2_job_completed, job_result_stream_v2, job_stats, job_logs, job_perms, concurrency_key, log_file, metrics, otel_traces")
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Shortest spacing between two stored samples of the same queue metric, so a tag whose
+/// value moves on every monitor round still writes at most one row per interval. Also how
+/// often each server samples the queue when no Prometheus or OTel gauge needs it sooner.
+const QUEUE_METRIC_MIN_INTERVAL_SECS: f64 = 25.0;
+/// A held delay hovers while the head keeps changing, so an exact-value comparison would rarely
+/// dedup it. Only a move the chart would actually render is stored.
+const QUEUE_DELAY_TOLERANCE: f64 = 0.1;
+
+/// Append the queue metrics the drawer at `GET /workers/queue_metrics_series` charts, skipping
+/// any sample that repeats what is already stored.
+///
+/// Only tags with a backlog appear in `queue_stats`, and an arbitrary `?tag=` nobody serves
+/// stays backlogged forever, so writing every round would repeat the same pair of rows for
+/// the whole 14-day retention. Each metric is written when the value it draws moves, once per
+/// heartbeat while it holds, and once more (as a zero) when the tag drains. Gaps therefore
+/// mean "unchanged since the last row", which is what the chart interpolates. A delay whose
+/// head job stays put is stored as that job's wait start, which the chart draws climbing, so it
+/// never moves away from what is stored either.
+async fn save_queue_metrics(
+    db: &Pool<Postgres>,
+    queue_stats: &std::collections::HashMap<String, windmill_common::queue::QueueStat>,
+) {
+    let sampled_ids = queue_stats
+        .keys()
+        .flat_map(|tag| {
+            [
+                format!("{QUEUE_COUNT_PREFIX}{tag}"),
+                format!("{QUEUE_DELAY_PREFIX}{tag}"),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    // Last stored sample of every metric that either has a backlog now or was written
+    // recently enough to still be believed backlogged. Bounding the lookup by the stale window
+    // keeps it cheap at any `metrics` size; a per-id `ORDER BY created_at DESC LIMIT 1` does
+    // not, since the planner may serve it from `metrics_sort_idx` and walk the whole table.
+    let last_samples = match sqlx::query!(
+        "SELECT COALESCE(c.id, r.id) AS \"id!\", r.value AS \"value?\",
+            EXTRACT(EPOCH FROM r.created_at)::double precision AS \"at?\",
+            EXTRACT(EPOCH FROM now() - r.created_at)::double precision AS \"age?\"
+        FROM unnest($1::text[]) AS c(id)
+        FULL JOIN (
+            SELECT DISTINCT ON (id) id, value, created_at
+            FROM metrics
+            WHERE id LIKE 'queue_%' AND created_at > now() - make_interval(secs => $2)
+            ORDER BY id, created_at DESC
+        ) r ON r.id = c.id",
+        &sampled_ids[..],
+        QUEUE_METRIC_STALE_SECS,
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("Failed to read last queue metrics samples: {e:#}");
+            return;
+        }
+    };
+
+    let mut ids = vec![];
+    let mut values = vec![];
+    // The wait start of the head of each held delay, whose value the INSERT computes.
+    let mut held_heads: Vec<Option<f64>> = vec![];
+    for row in last_samples {
+        let Some((prefix, tag)) = [QUEUE_COUNT_PREFIX, QUEUE_DELAY_PREFIX]
+            .into_iter()
+            .find_map(|p| row.id.strip_prefix(p).map(|tag| (p, tag)))
+        else {
+            continue;
+        };
+        // A stored value that cannot be read cannot be compared, so the next reading is kept.
+        let last = row
+            .value
+            .as_ref()
+            .and_then(QueueSample::parse)
+            .zip(row.at)
+            .zip(row.age)
+            .map(|((sample, at), age)| (sample, at, age));
+        let stat = queue_stats.get(tag);
+        let current = stat.map(|stat| {
+            if prefix == QUEUE_COUNT_PREFIX {
+                stat.count as f64
+            } else {
+                stat.delay
+            }
+        });
+
+        let next_delay = stat
+            .filter(|_| prefix == QUEUE_DELAY_PREFIX)
+            .map(|stat| delay_sample(last.map(|(sample, at, _)| sample.head_since(at)), stat));
+        let drawn_now = last.map(|(sample, at, age)| (sample.value_at(at + age), age));
+        let redraws = last
+            .zip(next_delay)
+            .is_some_and(|((sample, ..), next)| redraws(sample, next));
+        if should_store(prefix, drawn_now, current, redraws) {
+            let (value, held_head) = match (stat, next_delay) {
+                (None, _) => (serde_json::json!(0), None),
+                (Some(stat), None) => (serde_json::json!(stat.count), None),
+                (Some(stat), Some(QueueSample::Held(_))) => {
+                    (serde_json::Value::Null, Some(stat.head_since))
+                }
+                (Some(_), Some(climbing)) => (climbing.to_json(), None),
+            };
+            ids.push(row.id);
+            values.push(value);
+            held_heads.push(held_head);
+        }
+    }
+
+    if ids.is_empty() {
+        return;
+    }
+    // A held delay is computed from this statement's `now()`, the row's `created_at` too, so
+    // `created_at - value` is exactly its head's wait start. That is how the next sample tells
+    // whether the same job is still at the head, within `QUEUE_DELAY_SAME_HEAD_SECS`, which the
+    // time between reading the queue and this INSERT could otherwise exceed on a busy database.
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO metrics (id, value)
+        SELECT id, COALESCE(to_jsonb(EXTRACT(EPOCH FROM now())::double precision - held_head), value)
+        FROM unnest($1::text[], $2::jsonb[], $3::double precision[]) AS u(id, value, held_head)",
+        &ids[..],
+        &values[..],
+        &held_heads[..] as &[Option<f64>],
+    )
+    .execute(db)
+    .await
+    {
+        tracing::error!("Failed to save queue metrics: {e:#}");
+    }
+}
+
+/// What to store for a delay reading, given when the head job of the last stored sample started
+/// waiting. The same job still at the head keeps the delay climbing from its wait start, which
+/// the chart draws exactly. A head that changed means a moving queue, whose delay hovers and is
+/// held; so is a first sample, which cannot tell yet and must not draw a climb that never was.
+fn delay_sample(
+    last_head_since: Option<f64>,
+    stat: &windmill_common::queue::QueueStat,
+) -> QueueSample {
+    match last_head_since {
+        Some(since) if (since - stat.head_since).abs() < QUEUE_DELAY_SAME_HEAD_SECS => {
+            QueueSample::Climbing { since: stat.head_since }
+        }
+        _ => QueueSample::Held(stat.delay),
+    }
+}
+
+/// Whether the next delay sample is drawn differently from the last one even at the same value:
+/// a climb whose head left would otherwise go on climbing from the old head, and a held delay
+/// whose head stayed would stay flat while the wait grows.
+fn redraws(last: QueueSample, next: QueueSample) -> bool {
+    matches!(last, QueueSample::Climbing { .. }) != matches!(next, QueueSample::Climbing { .. })
+}
+
+/// Whether a reading deserves a row of its own, given the last one stored for that metric:
+/// the value it draws now and how many seconds ago it was written. `current` is `None` once
+/// the tag has no backlog left; `redraws` is set when the reading must be drawn differently.
+fn should_store(
+    prefix: &str,
+    last: Option<(f64, f64)>,
+    current: Option<f64>,
+    redraws: bool,
+) -> bool {
+    let Some((last_value, age)) = last else {
+        // Nothing comparable within the lookback window: a tag that just backed up needs a
+        // first sample, one that was already gone needs nothing.
+        return current.is_some();
+    };
+    let Some(current) = current else {
+        // The tag drained. One zero pins where the line drops; after that the metric matches
+        // and goes quiet, then falls out of the lookback window entirely.
+        return last_value != 0.0;
+    };
+    if age >= QUEUE_METRIC_HEARTBEAT_SECS {
+        return true;
+    }
+    age >= QUEUE_METRIC_MIN_INTERVAL_SECS
+        && (redraws
+            || if prefix == QUEUE_COUNT_PREFIX {
+                last_value != current
+            } else {
+                (current - last_value).abs() > last_value.abs() * QUEUE_DELAY_TOLERANCE
+            })
+}
+
+#[cfg(test)]
+mod queue_metric_sampling {
+    use super::*;
+
+    const RECENT: f64 = QUEUE_METRIC_MIN_INTERVAL_SECS + 1.0;
+
+    #[test]
+    fn a_holding_backlog_writes_only_on_the_heartbeat() {
+        let held = Some((3.0, RECENT));
+        assert!(!should_store(QUEUE_COUNT_PREFIX, held, Some(3.0), false));
+        let due = Some((3.0, QUEUE_METRIC_HEARTBEAT_SECS));
+        assert!(should_store(QUEUE_COUNT_PREFIX, due, Some(3.0), false));
+        // A held delay hovers, so only a move past the tolerance counts as a change.
+        let delay = Some((100.0, RECENT));
+        assert!(!should_store(QUEUE_DELAY_PREFIX, delay, Some(105.0), false));
+        assert!(should_store(QUEUE_DELAY_PREFIX, delay, Some(120.0), false));
+    }
+
+    #[test]
+    fn a_drained_tag_writes_one_zero_then_stops() {
+        assert!(should_store(
+            QUEUE_COUNT_PREFIX,
+            Some((3.0, RECENT)),
+            None,
+            false
+        ));
+        assert!(!should_store(
+            QUEUE_COUNT_PREFIX,
+            Some((0.0, RECENT)),
+            None,
+            false
+        ));
+        // Including once the heartbeat is due: a tag that is gone stays silent.
+        let gone = Some((0.0, QUEUE_METRIC_STALE_SECS));
+        assert!(!should_store(QUEUE_COUNT_PREFIX, gone, None, false));
+        assert!(!should_store(QUEUE_COUNT_PREFIX, None, None, false));
+    }
+
+    #[test]
+    fn a_change_waits_for_the_minimum_interval() {
+        assert!(!should_store(
+            QUEUE_COUNT_PREFIX,
+            Some((3.0, 1.0)),
+            Some(9.0),
+            false
+        ));
+        assert!(should_store(
+            QUEUE_COUNT_PREFIX,
+            Some((3.0, RECENT)),
+            Some(9.0),
+            false
+        ));
+        // A tag that has just backed up is recorded at once.
+        assert!(should_store(QUEUE_COUNT_PREFIX, None, Some(9.0), false));
+    }
+
+    #[test]
+    fn a_delay_climbs_while_the_same_job_stays_at_the_head() {
+        let stat = windmill_common::queue::QueueStat { count: 3, delay: 330.0, head_since: 1000.0 };
+        // A held sample written at 1320 saw the same head: it switches to climbing at once,
+        // although the delay has not moved past the tolerance yet.
+        let first = QueueSample::Held(320.0);
+        let climbing = delay_sample(Some(first.head_since(1320.0)), &stat);
+        assert_eq!(climbing, QueueSample::Climbing { since: 1000.0 });
+        assert!(redraws(first, climbing));
+        let drawn = Some((first.value_at(1330.0), RECENT));
+        assert!(should_store(
+            QUEUE_DELAY_PREFIX,
+            drawn,
+            Some(stat.delay),
+            true
+        ));
+        // Stored climbing, it draws the delay exactly: nothing more until the heartbeat.
+        let drawn = Some((climbing.value_at(1600.0), RECENT));
+        assert!(!should_store(QUEUE_DELAY_PREFIX, drawn, Some(600.0), false));
+        assert_eq!(delay_sample(None, &stat), QueueSample::Held(330.0));
+    }
+
+    #[test]
+    fn a_climb_whose_head_left_is_held_even_within_the_tolerance() {
+        // The head waiting since 0 left at 3600 for one queued at 100: 3500s is within 10% of
+        // the 3600s the climb draws, but kept, the climb would go on from the old head.
+        let moved =
+            windmill_common::queue::QueueStat { count: 2, delay: 3500.0, head_since: 100.0 };
+        let climbing = QueueSample::Climbing { since: 0.0 };
+        let next = delay_sample(Some(climbing.head_since(3000.0)), &moved);
+        assert_eq!(next, QueueSample::Held(3500.0));
+        assert!(redraws(climbing, next));
+        let drawn = Some((climbing.value_at(3600.0), RECENT));
+        assert!(!should_store(
+            QUEUE_DELAY_PREFIX,
+            drawn,
+            Some(moved.delay),
+            false
+        ));
+        assert!(should_store(
+            QUEUE_DELAY_PREFIX,
+            drawn,
+            Some(moved.delay),
+            true
+        ));
+    }
+}
+
+/// When this server last sampled the queue into `metrics`, in Unix milliseconds. It only paces
+/// how often the queue is scanned for that; whether a sample earns a row is decided from what
+/// is already stored. Servers sampling in the same instant can each write it, and the duplicate
+/// draws the same.
+static LAST_QUEUE_SAMPLE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub async fn expose_queue_metrics(db: &Pool<Postgres>) {
+    // clean queue metrics older than 14 days
+    sqlx::query!(
+        "DELETE FROM metrics WHERE id LIKE 'queue_%' AND created_at < NOW() - INTERVAL '14 day'"
+    )
+    .execute(db)
+    .await
+    .ok();
+
+    let metrics_enabled = METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let otel_enabled = OTEL_METRICS_ENABLED.load(Ordering::Relaxed);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let save_metrics = now_ms - LAST_QUEUE_SAMPLE_MS.load(Ordering::Relaxed)
+        >= (QUEUE_METRIC_MIN_INTERVAL_SECS * 1000.0) as i64;
+    if !(metrics_enabled || otel_enabled || save_metrics) {
+        return;
+    }
+
+    // Single DB query for running counts, shared by Prometheus and OTel. It runs ahead of the
+    // backlog read below, which gives up on the rest of the round when it fails.
+    let otel_running = otel_enabled;
+    #[cfg(feature = "prometheus")]
+    let need_running_counts = metrics_enabled || otel_running;
+    #[cfg(not(feature = "prometheus"))]
+    let need_running_counts = otel_running;
+
+    if need_running_counts {
+        let queue_running_counts = windmill_common::queue::get_queue_running_counts(db).await;
+
+        #[cfg(feature = "prometheus")]
+        if metrics_enabled {
+            for q in QUEUE_RUNNING_COUNT_TAGS.read().await.iter() {
+                if queue_running_counts.get(q).is_none() {
+                    (*QUEUE_RUNNING_COUNT).with_label_values(&[q]).set(0);
+                }
+            }
+        }
+
+        if otel_running {
+            for q in OTEL_QUEUE_RUNNING_COUNT_TAGS.read().await.iter() {
+                if queue_running_counts.get(q).is_none() {
+                    otel_set_queue_running_count(q, 0);
+                }
+            }
+        }
+
+        #[allow(unused_mut, unused_variables)]
+        let mut running_tags_to_watch: Vec<String> = vec![];
+        #[allow(unused_mut, unused_variables)]
+        let mut otel_running_tags_to_watch: Vec<String> = vec![];
+        for (tag, count) in &queue_running_counts {
+            #[cfg(feature = "prometheus")]
+            if metrics_enabled {
+                let metric = (*QUEUE_RUNNING_COUNT).with_label_values(&[tag]);
+                metric.set(*count as i64);
+                running_tags_to_watch.push(tag.to_string());
+            }
+
+            if otel_running {
+                otel_set_queue_running_count(tag, *count as i64);
+                otel_running_tags_to_watch.push(tag.to_string());
+            }
+        }
+
+        #[cfg(feature = "prometheus")]
+        if metrics_enabled {
+            let mut w = QUEUE_RUNNING_COUNT_TAGS.write().await;
+            *w = running_tags_to_watch;
+        }
+        if otel_running {
+            let mut w = OTEL_QUEUE_RUNNING_COUNT_TAGS.write().await;
+            *w = otel_running_tags_to_watch;
+        }
+    }
+
+    let queue_stats = match windmill_common::queue::get_queue_stats(db).await {
+        Ok(queue_stats) => queue_stats,
+        Err(e) => {
+            tracing::error!("Failed to read queue stats: {e:#}");
+            return;
+        }
+    };
+
+    #[cfg(feature = "prometheus")]
+    if metrics_enabled {
+        for q in QUEUE_COUNT_TAGS.read().await.iter() {
+            if queue_stats.get(q).is_none() {
+                (*QUEUE_COUNT).with_label_values(&[q]).set(0);
+                (*QUEUE_DELAY_SECONDS).with_label_values(&[q]).set(0.0);
+            }
+        }
+    }
+
+    if otel_enabled {
+        for q in OTEL_QUEUE_COUNT_TAGS.read().await.iter() {
+            if queue_stats.get(q).is_none() {
+                otel_set_queue_count(q, 0);
+                otel_set_queue_delay(q, 0.0);
+            }
+        }
+    }
+
+    #[allow(unused_mut)]
+    let mut tags_to_watch = vec![];
+    #[allow(unused_mut)]
+    let mut otel_tags_to_watch = vec![];
+    for (tag, stat) in queue_stats.iter() {
+        let count = stat.count;
+
+        #[cfg(feature = "prometheus")]
+        if metrics_enabled {
+            let metric = (*QUEUE_COUNT).with_label_values(&[tag]);
+            metric.set(count as i64);
+            (*QUEUE_DELAY_SECONDS)
+                .with_label_values(&[tag])
+                .set(stat.delay);
+            tags_to_watch.push(tag.to_string());
+        }
+
+        if otel_enabled {
+            otel_tags_to_watch.push(tag.to_string());
+        }
+        otel_set_queue_count(tag, count as i64);
+        otel_set_queue_delay(tag, stat.delay);
+    }
+
+    if save_metrics {
+        LAST_QUEUE_SAMPLE_MS.store(now_ms, Ordering::Relaxed);
+        save_queue_metrics(db, &queue_stats).await;
+    }
+
+    if metrics_enabled {
+        let mut w = QUEUE_COUNT_TAGS.write().await;
+        *w = tags_to_watch;
+    }
+    if otel_enabled {
+        let mut w = OTEL_QUEUE_COUNT_TAGS.write().await;
+        *w = otel_tags_to_watch;
+    }
+}
+
+pub async fn reload_smtp_config(db: &Pool<Postgres>) {
+    let smtp_config = load_smtp_config(&db).await;
+    if let Err(e) = smtp_config {
+        tracing::error!("Error reloading smtp config: {:?}", e)
+    } else {
+        tracing::info!("Reloading smtp config...");
+        SMTP_CONFIG.store(std::sync::Arc::new(smtp_config.unwrap()));
+    }
+}
+
+pub async fn reload_indexer_config(db: &Pool<Postgres>) {
+    let indexer_config = load_indexer_config(&db).await;
+    if let Err(e) = indexer_config {
+        tracing::error!("Error reloading indexer config: {:?}", e)
+    } else {
+        tracing::info!("Reloading indexer config...");
+        INDEXER_CONFIG.store(std::sync::Arc::new(indexer_config.unwrap()));
+    }
+}
+
+pub async fn reload_worker_config(db: &DB, tx: KillpillSender, kill_if_change: bool) {
+    let config = load_worker_config(db, tx.clone()).await;
+    if let Err(e) = config {
+        tracing::error!("Error reloading worker config: {:?}", e)
+    } else {
+        let wc = WORKER_CONFIG.load();
+        let config = config.unwrap();
+        let has_dedicated = config.dedicated_worker.is_some()
+            || config
+                .dedicated_workers
+                .as_ref()
+                .is_some_and(|dws| !dws.is_empty());
+
+        // Pausing or resuming must not restart the workers, dedicated ones included: a reload
+        // whose only difference is the flag skips every restart below.
+        let only_pause_changed = wc.paused != config.paused
+            && WorkerConfig { paused: wc.paused, ..config.clone() } == **wc;
+
+        if **wc != config || has_dedicated {
+            if kill_if_change && !only_pause_changed {
+                if has_dedicated
+                    || wc.dedicated_worker != config.dedicated_worker
+                    || wc.dedicated_workers != config.dedicated_workers
+                {
+                    tracing::info!("Dedicated worker config changed, sending killpill. Expecting to be restarted by supervisor.");
+                    let _ = tx.send();
+                }
+
+                if wc.init_bash != config.init_bash {
+                    tracing::info!("Init bash config changed, sending killpill. Expecting to be restarted by supervisor.");
+                    let _ = tx.send();
+                }
+
+                if wc.cache_clear != config.cache_clear {
+                    tracing::info!("Cache clear changed, sending killpill. Expecting to be restarted by supervisor.");
+                    let _ = tx.send();
+                    tracing::info!("Waiting 5 seconds to allow others workers to start potential jobs that depend on a potential shared cache volume");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if let Err(e) = windmill_worker::common::clean_cache().await {
+                        tracing::error!("Error cleaning the cache: {e:#}");
+                    }
+                }
+
+                if wc.periodic_script_bash != config.periodic_script_bash {
+                    tracing::info!("Periodic script bash config changed, sending killpill. Expecting to be restarted by supervisor.");
+                    let _ = tx.send();
+                }
+
+                if wc.periodic_script_interval_seconds != config.periodic_script_interval_seconds {
+                    tracing::info!("Periodic script interval config changed, sending killpill. Expecting to be restarted by supervisor.");
+                    let _ = tx.send();
+                }
+
+                if wc.native_mode != config.native_mode {
+                    tracing::info!("Native mode config changed, sending killpill. Expecting to be restarted by supervisor.");
+                    let _ = tx.send();
+                }
+            }
+            drop(wc);
+
+            tracing::info!("Reloading worker config...");
+            store_suspended_pull_query(&config).await;
+            store_pull_query(&config).await;
+            WORKER_CONFIG.store(std::sync::Arc::new(config));
+        }
+
+        // After the store, so a retry that wakes mid-build reads the config being applied
+        // rather than the one it replaced. Unconditional rather than gated on the value
+        // changing, so that a pass triggered by anything else — a license-plan change, most
+        // of all — still re-evaluates the entitlement.
+        #[cfg(feature = "parquet")]
+        reload_cache_object_store_override_with_retry(db).await;
+    }
+}
+
+/// Apply this worker group's dependency-cache object store, retrying once shortly after a build
+/// that failed for a reason that may pass — the periodic settings reload behind it is 12h apart,
+/// which is a long time for a whole group to cache nothing but locally.
+#[cfg(feature = "parquet")]
+pub async fn reload_cache_object_store_override_with_retry(db: &DB) {
+    let settings = WORKER_CONFIG.load().object_store_cache_config.clone();
+    if matches!(
+        windmill_object_store::reload_cache_object_store_override(db, settings).await,
+        ObjectStoreReload::Later
+    ) {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if windmill_object_store::cache_object_store_override_failed().await {
+                // Re-read rather than reuse: the group config may have changed while we slept,
+                // and installing the settings this retry was born with would pin the worker to a
+                // store the group no longer asks for.
+                let settings = WORKER_CONFIG.load().object_store_cache_config.clone();
+                windmill_object_store::reload_cache_object_store_override(&db, settings).await;
+            }
+        });
+    }
+}
+
+pub async fn load_base_url(conn: &Connection) -> error::Result<String> {
+    let q_base_url =
+        load_value_from_global_settings_with_conn(conn, BASE_URL_SETTING, false).await?;
+    Ok(parse_base_url(q_base_url))
+}
+
+/// The half of [`load_base_url`] after the read, so [`SettingsPass`] can use a value it
+/// already fetched. Stores into `BASE_URL` as well as returning it.
+pub fn parse_base_url(q_base_url: Option<serde_json::Value>) -> String {
+    let std_base_url = std::env::var("BASE_URL")
+        .ok()
+        .unwrap_or_else(|| "http://localhost".to_string());
+    let base_url = if let Some(q) = q_base_url {
+        if let Ok(v) = serde_json::from_value::<String>(q.clone()) {
+            if v != "" {
+                v
+            } else {
+                std_base_url
+            }
+        } else {
+            tracing::error!(
+                "Could not parse base_url setting as a string, found: {:#?}",
+                &q
+            );
+            std_base_url
+        }
+    } else {
+        std_base_url
+    };
+    BASE_URL.store(std::sync::Arc::new(base_url.clone()));
+    base_url
+}
+
+pub async fn reload_base_url_setting(conn: &Connection) -> error::Result<()> {
+    #[cfg(feature = "oauth2")]
+    let q_oauth = match conn.as_sql() {
+        Some(db) => load_value_from_global_settings(db, OAUTH_SETTING).await?,
+        None => None,
+    };
+    #[cfg(not(feature = "oauth2"))]
+    let q_oauth = None;
+    let q_base_url =
+        load_value_from_global_settings_with_conn(conn, BASE_URL_SETTING, false).await?;
+    apply_base_url_setting(conn, q_oauth, q_base_url).await
+}
+
+/// The half of [`reload_base_url_setting`] after the reads.
+pub async fn apply_base_url_setting(
+    conn: &Connection,
+    q_oauth: Option<serde_json::Value>,
+    q_base_url: Option<serde_json::Value>,
+) -> error::Result<()> {
+    // Both only reach a use under a feature gate.
+    let (_, _) = (&conn, &q_oauth);
+    #[cfg(feature = "oauth2")]
+    let oauths = if conn.as_sql().is_some() {
+        if let Some(q) = q_oauth {
+            if let Ok(v) = serde_json::from_value::<
+                Option<HashMap<String, windmill_api::oauth2_oss::OAuthClient>>,
+            >(q.clone())
+            {
+                v
+            } else {
+                tracing::error!("Could not parse oauth setting as a json, found: {:#?}", &q);
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let base_url = parse_base_url(q_base_url);
+    let is_secure = base_url.starts_with("https://");
+
+    #[cfg(feature = "oauth2")]
+    {
+        if let Some(db) = conn.as_sql() {
+            let clients = windmill_api::oauth2_oss::build_oauth_clients(&base_url, oauths, db).await
+                .map_err(|e| tracing::error!("Error building oauth clients (is the oauth.json mounted and in correct format? Use '{}' as minimal oauth.json): {}", "{}", e))
+                .unwrap();
+            windmill_api::OAUTH_CLIENTS.store(std::sync::Arc::new(clients));
+        }
+    }
+
+    IS_SECURE.store(is_secure, Ordering::Relaxed);
+
+    Ok(())
+}
+
+async fn stale_job_cancellation(db: &Pool<Postgres>) {
+    if let Some(threshold) = *STALE_JOB_THRESHOLD_MINUTES {
+        let stale_jobs = sqlx::query!(
+            "SELECT v2_job_queue.id, v2_job.tag, v2_job_queue.scheduled_for, v2_job_queue.workspace_id FROM v2_job_queue LEFT JOIN v2_job ON v2_job_queue.id = v2_job.id WHERE running = false AND scheduled_for < now() - ($1 || ' minutes')::interval AND v2_job.trigger_kind IS DISTINCT FROM 'schedule'::job_trigger_kind",
+            threshold.to_string()
+        )
+        .fetch_all(db)
+            .await
+            .ok()
+            .unwrap_or_else(|| vec![]);
+
+        if !stale_jobs.is_empty() {
+            tracing::info!(
+                "Cancelling {} stale jobs (> {} minutes old)",
+                stale_jobs.len(),
+                threshold
+            );
+        }
+        for job in stale_jobs {
+            if let Err(e) =
+                cancel_stale_job(db, job.id, job.tag, job.workspace_id, job.scheduled_for).await
+            {
+                tracing::error!("Error cancelling stale job {}: {}", job.id, e);
+            }
+        }
+    }
+}
+
+async fn cancel_stale_job(
+    db: &Pool<Postgres>,
+    id: Uuid,
+    tag: String,
+    workspace_id: String,
+    scheduled_for: DateTime<Utc>,
+) -> error::Result<()> {
+    let mut tx = db.begin().await?;
+    tracing::error!(
+        "Stale job detected: {} in workspace {} with tag {} (scheduled for: {}) . Cancelling it.",
+        id,
+        workspace_id,
+        tag,
+        scheduled_for
+    );
+    (tx, _) = cancel_job(
+        "monitor",
+        Some(format!(
+            "Stale job cancellation (scheduled for: {})",
+            scheduled_for
+        )),
+        id,
+        &workspace_id,
+        tx,
+        db,
+        true,
+        false,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+const RESTART_LIMIT: i32 = 3;
+
+async fn handle_zombie_jobs(db: &Pool<Postgres>, base_internal_url: &str, node_name: &str) {
+    let mut zombie_jobs_uuid_restart_limit_reached = vec![];
+
+    if *RESTART_ZOMBIE_JOBS {
+        let restarted = sqlx::query!(
+            "WITH to_update AS (
+                SELECT q.id, q.workspace_id, r.ping, COALESCE(zjc.counter, 0) as counter
+                FROM v2_job_queue q
+                JOIN v2_job j ON j.id = q.id
+                JOIN v2_job_runtime r ON r.id = j.id
+                LEFT JOIN zombie_job_counter zjc ON zjc.job_id = q.id
+                WHERE ping < now() - ($1 || ' seconds')::interval
+                    AND running = true
+                    AND kind NOT IN ('flow', 'flowpreview', 'flownode', 'singlestepflow')
+                    AND same_worker = false
+                    AND q.suspend_until IS NULL
+                    AND (zjc.counter IS NULL OR zjc.counter <= $2)
+                FOR UPDATE of q SKIP LOCKED
+            ),
+            zombie_jobs AS (
+                UPDATE v2_job_queue q
+                SET running = false, started_at = null
+                FROM to_update tu
+                WHERE q.id = tu.id AND (tu.counter IS NULL OR tu.counter < $2)
+                RETURNING q.id, q.workspace_id, ping, tu.counter
+            ),
+            update_ping AS (
+                UPDATE v2_job_runtime r
+                SET ping = null
+                FROM zombie_jobs zj
+                WHERE r.id = zj.id
+            ),
+            increment_counter AS (
+                INSERT INTO zombie_job_counter (job_id, counter)
+                SELECT id, 1 FROM to_update WHERE counter < $2
+                ON CONFLICT (job_id) DO UPDATE
+                SET counter = zombie_job_counter.counter + 1
+            ),
+            update_concurrency AS (
+                UPDATE concurrency_counter cc
+                SET job_uuids = job_uuids - zj.id::text
+                FROM zombie_jobs zj
+                INNER JOIN concurrency_key ck ON ck.job_id = zj.id
+                WHERE cc.concurrency_id = ck.key
+            )
+            SELECT id AS \"id!\", workspace_id AS \"workspace_id!\", ping, counter + 1 AS counter FROM to_update",
+            *ZOMBIE_JOB_TIMEOUT,
+            RESTART_LIMIT
+        )
+        .fetch_all(db)
+        .await
+        .ok()
+        .unwrap_or_else(|| vec![]);
+
+        #[cfg(feature = "prometheus")]
+        if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            QUEUE_ZOMBIE_RESTART_COUNT.inc_by(restarted.len() as _);
+        }
+
+        otel_incr_zombie_restart_count(restarted.len() as u64);
+
+        let base_url = (**BASE_URL.load()).clone();
+        for r in restarted {
+            let last_ping = if let Some(x) = r.ping {
+                format!("last ping at {x}")
+            } else {
+                "no last ping".to_string()
+            };
+            let url = format!("{}/run/{}?workspace={}", base_url, r.id, r.workspace_id,);
+            let restart = r.counter.is_none_or(|x| x < RESTART_LIMIT);
+            let (critical_error_message, restart_message) = if restart {
+                (
+                        format!(
+                        "Zombie job {} on {} ({}) detected, restarting it ({}/{} attempts), last ping: {}",
+                        r.id,
+                        r.workspace_id,
+                        url,
+                        r.counter.unwrap_or(0) + 1,
+                        RESTART_LIMIT,
+                        last_ping
+                    ),
+                    format!(
+                        "Restarted job after not receiving job's ping for too long the {} ({}/{} attempts)\n\n",
+                        last_ping,
+                        r.counter.unwrap_or(0) + 1,
+                        RESTART_LIMIT
+                    )
+                )
+            } else {
+                (
+                        format!(
+                        "Zombie job {} on {} ({}) detected, but restart limit ({}) reached, job will be processed as an error, last ping: {}",
+                        r.id, r.workspace_id, url, RESTART_LIMIT, last_ping
+                    ),
+                    format!(
+                        "job's ping was received last at {}, job will be processed as an error since all {} restart attempts failed",
+                        last_ping, RESTART_LIMIT
+                    )
+                )
+            };
+
+            let _ = sqlx::query!(
+                "
+                INSERT INTO job_logs (job_id, logs)
+                VALUES ($1, $2)
+                ON CONFLICT (job_id) DO UPDATE SET logs = job_logs.logs || '\n' || EXCLUDED.logs
+                WHERE job_logs.job_id = $1",
+                r.id,
+                restart_message
+            )
+            .execute(db)
+            .await;
+            tracing::error!(critical_error_message);
+            // A restart that still has attempts left is self-healing, so an operator can mute it on
+            // an instance with flaky workers. Exhausting the attempts is a real failure and always
+            // alerts.
+            if !restart || !CRITICAL_ALERT_MUTE_ZOMBIE_JOB_RESTART.load(Ordering::Relaxed) {
+                report_critical_error(
+                    critical_error_message,
+                    db.clone(),
+                    Some(&r.workspace_id),
+                    None,
+                )
+                .await;
+            }
+
+            if !restart {
+                zombie_jobs_uuid_restart_limit_reached.push(r.id);
+            }
+        }
+    }
+
+    let same_worker_timeout_jobs = {
+        let long_same_worker_jobs = sqlx::query!(
+            "SELECT worker, array_agg(v2_job_queue.id) as ids FROM v2_job_queue LEFT JOIN v2_job ON v2_job_queue.id = v2_job.id LEFT JOIN v2_job_runtime ON v2_job_queue.id = v2_job_runtime.id WHERE v2_job_queue.created_at < now() - ('60 seconds')::interval
+    AND running = true AND (ping IS NULL OR ping < now() - ('60 seconds')::interval) AND same_worker = true AND worker IS NOT NULL AND v2_job_queue.suspend_until IS NULL GROUP BY worker",
+        )
+        .fetch_all(db)
+        .await
+        .ok()
+        .unwrap_or_else(|| vec![]);
+
+        let worker_ids = long_same_worker_jobs
+            .iter()
+            .map(|x| x.worker.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+
+        let long_dead_workers: std::collections::HashSet<String> = sqlx::query_scalar!(
+            "WITH worker_ids AS (SELECT unnest($1::text[]) as worker)
+            SELECT worker_ids.worker FROM worker_ids
+            LEFT JOIN worker_ping ON worker_ids.worker = worker_ping.worker
+                WHERE worker_ping.worker IS NULL OR worker_ping.ping_at < now() - ('60 seconds')::interval",
+            &worker_ids[..]
+        )
+        .fetch_all(db)
+        .await
+        .ok()
+        .unwrap_or_else(|| vec![])
+        .into_iter()
+        .filter_map(|x| x)
+        .collect();
+
+        let mut timeouts: Vec<Uuid> = vec![];
+        for worker in long_same_worker_jobs {
+            if worker.worker.is_some() && long_dead_workers.contains(&worker.worker.unwrap()) {
+                if let Some(ids) = worker.ids {
+                    timeouts.extend(ids);
+                }
+            }
+        }
+        if !timeouts.is_empty() {
+            tracing::error!(
+                "Failing same worker zombie jobs: {:?}",
+                timeouts
+                    .iter()
+                    .map(|x| x.hyphenated().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+
+        timeouts
+    };
+
+    let non_restartable_jobs = if *RESTART_ZOMBIE_JOBS {
+        vec![]
+    } else {
+        sqlx::query_scalar!("SELECT j.id
+             FROM v2_job_queue q JOIN v2_job j USING (id) LEFT JOIN v2_job_runtime r USING (id) LEFT JOIN v2_job_status s USING (id)
+             WHERE r.ping < now() - ($1 || ' seconds')::interval
+             AND q.running = true AND j.kind NOT IN ('flow', 'flowpreview', 'flownode', 'singlestepflow') AND j.same_worker = false AND q.suspend_until IS NULL",
+             ZOMBIE_JOB_TIMEOUT.as_str())
+        .fetch_all(db)
+        .await
+        .ok()
+            .unwrap_or_else(|| vec![])
+    };
+
+    enum ErrorMessage {
+        RestartLimit,
+        SameWorker,
+        RestartDisabled,
+    }
+
+    impl ErrorMessage {
+        fn to_string(&self) -> String {
+            match self {
+                ErrorMessage::RestartLimit => format!("RestartLimit ({})", RESTART_LIMIT),
+                ErrorMessage::SameWorker => "SameWorker".to_string(),
+                ErrorMessage::RestartDisabled => "RestartDisabled".to_string(),
+            }
+        }
+    }
+
+    let timeouts = non_restartable_jobs
+        .into_iter()
+        .map(|x| (x, ErrorMessage::RestartDisabled))
+        .chain(
+            same_worker_timeout_jobs
+                .into_iter()
+                .map(|x| (x, ErrorMessage::SameWorker)),
+        )
+        .chain(
+            zombie_jobs_uuid_restart_limit_reached
+                .into_iter()
+                .map(|x| (x, ErrorMessage::RestartLimit)),
+        )
+        .collect::<Vec<_>>();
+
+    #[cfg(feature = "prometheus")]
+    if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        QUEUE_ZOMBIE_DELETE_COUNT.inc_by(timeouts.len() as _);
+    }
+
+    otel_incr_zombie_delete_count(timeouts.len() as u64);
+
+    for (job_id, error_kind) in timeouts {
+        // since the job is unrecoverable, the same worker queue should never be sent anything
+        let (same_worker_tx_never_used, _same_worker_rx_never_used) =
+            mpsc::channel::<SameWorkerPayload>(1);
+        let same_worker_tx_never_used =
+            SameWorkerSender(same_worker_tx_never_used, Arc::new(AtomicU16::new(0)));
+        let (send_result_never_used, _send_result_rx_never_used) =
+            JobCompletedSender::new_never_used();
+
+        let job = get_queued_job_v2(db, &job_id).await;
+        if let Err(e) = job {
+            tracing::error!("Error getting queued job: {:?}", e);
+            continue;
+        }
+        if let Some(job) = job.unwrap() {
+            // Read while the job is still queued: a re-run (perpetual, retry) takes its cap from
+            // here once the `job_perms` row is swept after completion. A failed read leaves the
+            // job for the next sweep rather than completing it with no cap.
+            let perms =
+                match windmill_common::auth::get_job_perms(db, &job.id, &job.workspace_id).await {
+                    Ok(perms) => perms,
+                    Err(e) => {
+                        tracing::error!(
+                            "Could not read the permissions of zombie job {}: {e:#}",
+                            job.id
+                        );
+                        continue;
+                    }
+                };
+            let job_token_scopes = perms.as_ref().and_then(|p| p.job_token_scopes.clone());
+            let label = ephemeral_script_token_label(&job.permissioned_as, &job.created_by);
+            let token = create_token_for_owner(
+                &db,
+                &job.workspace_id,
+                &job.permissioned_as,
+                &label,
+                job_token_expiry_secs(&db, &job.workspace_id).await,
+                &job.permissioned_as_email,
+                &job.id,
+                perms,
+                Some(format!("handle_zombie_jobs")),
+            )
+            .await
+            .expect("could not create job token");
+
+            let client = AuthedClient::new(
+                base_internal_url.to_string(),
+                job.workspace_id.to_string(),
+                token,
+                None,
+            );
+
+            let error_message = format!(
+                "Job timed out after no ping from job since {} (ZOMBIE_JOB_TIMEOUT: {}, reason: {:?}).\nThis likely means that the job died on worker {}, OOM are a common reason for worker crashes.\nCheck the workers around the time of the last ping and the exit code if any.",
+                job.last_ping.unwrap_or_default(),
+                *ZOMBIE_JOB_TIMEOUT,
+                error_kind.to_string(),
+                job.worker.clone().unwrap_or_default(),
+            );
+            let memory_peak = job.memory_peak.unwrap_or(0);
+            let (_, killpill_rx_never_used) = KillpillSender::new(1);
+            let mut completed = windmill_queue::MiniCompletedJob::from(job);
+            completed.job_token_scopes = job_token_scopes;
+            let _ = handle_job_error(
+                db,
+                &client,
+                &completed,
+                memory_peak,
+                None,
+                error::Error::ExecutionErr(error_message.clone()),
+                // a same worker zombie means the worker itself is gone
+                if matches!(error_kind, ErrorMessage::SameWorker) {
+                    StepFailureKind::Unrecoverable
+                } else {
+                    StepFailureKind::Normal
+                },
+                Some(&same_worker_tx_never_used),
+                "",
+                node_name,
+                send_result_never_used,
+                &killpill_rx_never_used,
+                #[cfg(feature = "benchmark")]
+                &mut windmill_common::bench::BenchmarkIter::new(),
+            )
+            .await;
+
+            // If handle_job_error failed (e.g. schedule push failure rolled back the tx),
+            // the job is still in the queue. Force-complete it to prevent infinite zombie loops.
+            if let Err(e) = force_complete_zombie_job(db, &job_id, &error_message).await {
+                tracing::error!("Failed to force-complete zombie job {}: {e:#}", job_id);
+            }
+        }
+    }
+}
+
+/// Force-complete a zombie job that handle_job_error failed to complete.
+/// This is a minimal fallback: it moves the job from the queue to a failed
+/// completed job in a single transaction, without schedule pushing or
+/// error handler logic. The one thing it keeps is the WAC parent notification,
+/// deliberately inside the transaction: if that fails, the whole completion
+/// rolls back and the job waits for the next sweep, which is cheaper than a
+/// parent parked for its full suspend window and a task run twice.
+async fn force_complete_zombie_job(
+    db: &Pool<Postgres>,
+    job_id: &Uuid,
+    error_message: &str,
+) -> error::Result<()> {
+    let still_queued = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM v2_job_queue WHERE id = $1)",
+        job_id
+    )
+    .fetch_one(db)
+    .await?
+    .unwrap_or(false);
+
+    if !still_queued {
+        return Ok(());
+    }
+
+    tracing::error!(
+        "Zombie job {job_id} was not completed by handle_job_error, force-completing it"
+    );
+
+    // Same `{"error": ...}` shape as every other failed job's result, so a WAC
+    // parent's failure record reads the name and message like any task failure.
+    let error_value = serde_json::json!({
+        "error": {
+            "message": error_message,
+            "name": "ExecutionErr",
+        }
+    });
+
+    let mut tx = db.begin().await?;
+
+    // Locks in the order of every other completion: a WAC parent's rows, then this job's queue
+    // row, then its completed row (see `record_child_completion`). A worker completing the same
+    // job concurrently would otherwise deadlock against this.
+    let duration_ms = sqlx::query_scalar!(
+        "SELECT COALESCE(c.duration_ms, COALESCE((EXTRACT('epoch' FROM now()) - EXTRACT('epoch' FROM COALESCE(q.started_at, now()))) * 1000, 0)::bigint) AS \"duration_ms!\"
+        FROM v2_job_queue q LEFT JOIN v2_job_completed c ON c.id = q.id WHERE q.id = $1",
+        job_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(duration_ms) = duration_ms else {
+        return Ok(());
+    };
+
+    // A WAC parent parked on this job must learn of the failure here too, or it
+    // waits out its whole suspend window and runs the task again.
+    let mut wac_parent_ready = false;
+    let parent = sqlx::query!(
+        "SELECT parent_job, flow_step_id FROM v2_job WHERE id = $1",
+        job_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(parent_job) = parent
+        .filter(|j| j.flow_step_id.is_none())
+        .and_then(|j| j.parent_job)
+    {
+        wac_parent_ready = windmill_common::wac::record_child_completion(
+            &mut tx,
+            &parent_job,
+            job_id,
+            false,
+            duration_ms,
+            &error_value.to_string(),
+        )
+        .await?;
+    }
+
+    let completed = sqlx::query_scalar!(
+        "WITH deleted AS (
+            DELETE FROM v2_job_queue WHERE id = $1 RETURNING id, workspace_id, started_at, worker
+        )
+        INSERT INTO v2_job_completed
+            (workspace_id, id, started_at, duration_ms, result, memory_peak, status, worker)
+        SELECT d.workspace_id, d.id, d.started_at, $3, $2::jsonb, r.memory_peak,
+            'failure'::job_status, d.worker
+        FROM deleted d
+        LEFT JOIN v2_job_runtime r ON r.id = d.id
+        ON CONFLICT (id) DO UPDATE SET status = 'failure', result = $2::jsonb
+        RETURNING id",
+        job_id,
+        error_value,
+        duration_ms,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    // Completed by someone else while this waited on the WAC parent: roll back, so the parent
+    // keeps what the winning completion recorded.
+    if completed.is_none() {
+        return Ok(());
+    }
+
+    tx.commit().await?;
+
+    if wac_parent_ready {
+        windmill_common::wac::WAC_SUSPEND_READY.store(true, Ordering::Relaxed);
+    }
+
+    tracing::info!("Force-completed zombie job {job_id}");
+    Ok(())
+}
+
+async fn cleanup_concurrency_counters_orphaned_keys(db: &DB) -> error::Result<()> {
+    let result = sqlx::query!(
+        "
+WITH lockable_counters AS (
+    SELECT concurrency_id, job_uuids
+    FROM concurrency_counter
+    WHERE job_uuids != '{}'::jsonb
+    FOR UPDATE SKIP LOCKED
+),
+all_job_uuids AS (
+    SELECT DISTINCT jsonb_object_keys(job_uuids) AS job_uuid
+    FROM lockable_counters
+),
+orphaned_job_uuids AS (
+    SELECT job_uuid
+    FROM all_job_uuids
+    WHERE job_uuid NOT IN (
+        SELECT id::text
+        FROM v2_job_queue
+        FOR SHARE SKIP LOCKED
+    )
+),
+orphaned_array AS (
+    SELECT ARRAY(SELECT job_uuid FROM orphaned_job_uuids) AS orphaned_keys
+),
+before_update AS (
+    SELECT lc.concurrency_id, lc.job_uuids, oa.orphaned_keys
+    FROM lockable_counters lc, orphaned_array oa
+    WHERE lc.job_uuids ?| oa.orphaned_keys
+),
+affected_rows AS (
+    UPDATE concurrency_counter
+    SET job_uuids = job_uuids - orphaned_array.orphaned_keys
+    FROM orphaned_array
+    WHERE concurrency_counter.concurrency_id IN (
+        SELECT concurrency_id FROM before_update
+    )
+    RETURNING concurrency_id, job_uuids AS updated_job_uuids
+),
+expanded_orphaned AS (
+    SELECT bu.concurrency_id,
+           bu.job_uuids AS original_job_uuids,
+           unnest(bu.orphaned_keys) AS orphaned_key
+    FROM before_update bu
+)
+SELECT
+    eo.concurrency_id,
+    eo.orphaned_key,
+    eo.original_job_uuids,
+    ar.updated_job_uuids
+FROM expanded_orphaned eo
+JOIN affected_rows ar ON eo.concurrency_id = ar.concurrency_id
+WHERE eo.original_job_uuids ? eo.orphaned_key
+ORDER BY eo.concurrency_id, eo.orphaned_key
+",
+    )
+    .fetch_all(db)
+    .await?;
+
+    if result.len() > 0 {
+        tracing::info!("Cleaned up {} concurrency counters", result.len());
+        for row in result {
+            tracing::info!("Concurrency counter cleaned up: concurrency_id: {}, orphaned_key: {:?}, original_job_uuids: {:?}, updated_job_uuids: {:?}", row.concurrency_id, row.orphaned_key, row.original_job_uuids, row.updated_job_uuids);
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_concurrency_counters_empty_keys(db: &DB) -> error::Result<()> {
+    let result = sqlx::query!(
+        "
+WITH rows_to_delete AS (
+    SELECT concurrency_id
+    FROM concurrency_counter
+
+    WHERE job_uuids = '{}'::jsonb
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM concurrency_counter
+WHERE concurrency_id IN (SELECT concurrency_id FROM rows_to_delete)  RETURNING concurrency_id",
+    )
+    .fetch_all(db)
+    .await?;
+
+    if result.len() > 0 {
+        tracing::info!(
+            "Cleaned up {} empty concurrency counters: {:?}",
+            result.len(),
+            result
+                .iter()
+                .map(|x| x.concurrency_id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    Ok(())
+}
+
+/// Memory usage at a worker's last ping as a fraction of its cgroup limit.
+/// Takes the larger of the cgroup-wide reading and the windmill process's
+/// jemalloc resident — if only one is present, that value wins; if both are
+/// present, the larger is the more conservative (higher-signal) choice.
+fn zombie_worker_memory_pct(
+    usage: Option<i64>,
+    wm_usage: Option<i64>,
+    total: Option<i64>,
+) -> Option<f64> {
+    let total = total?;
+    if total <= 0 {
+        return None;
+    }
+    let used = usage.max(wm_usage)?;
+    Some(used as f64 / total as f64)
+}
+
+struct ZombieFlowCulprit {
+    worker: String,
+    ping_at: DateTime<Utc>,
+    memory_usage: Option<i64>,
+    wm_memory_usage: Option<i64>,
+    memory_total: Option<i64>,
+    worker_group: Option<String>,
+    worker_instance: Option<String>,
+    ping_delta_secs: Option<f64>,
+}
+
+/// Finds the worker that likely performed and dropped the flow's final state
+/// transition when `q.worker` (the outer queue-row worker) looks healthy — a
+/// different worker on the same pod/group whose *latest* ping is frozen in the
+/// `[last_ping-5s, +15s]` window (a live worker would have advanced its in-place
+/// ping past that old window, so a frozen ping there proves it has gone silent),
+/// nearest the transition. Diagnostics-only: fails soft to `None`.
+async fn find_zombie_flow_culprit_worker(
+    db: &DB,
+    q_worker: &str,
+    last_ping: DateTime<Utc>,
+) -> Option<ZombieFlowCulprit> {
+    let res = sqlx::query_as!(
+        ZombieFlowCulprit,
+        r#"
+        WITH ref AS (
+            SELECT worker_instance, worker_group FROM worker_ping WHERE worker = $1 LIMIT 1
+        )
+        SELECT
+            wp.worker AS "worker!",
+            wp.ping_at AS "ping_at!",
+            wp.memory_usage,
+            wp.wm_memory_usage,
+            wp.memory AS memory_total,
+            wp.worker_group,
+            wp.worker_instance,
+            EXTRACT(EPOCH FROM (wp.ping_at - $2::timestamptz))::float8 AS ping_delta_secs
+        FROM worker_ping wp, ref
+        WHERE wp.worker <> $1
+            AND (
+                (ref.worker_instance IS NOT NULL AND wp.worker_instance = ref.worker_instance)
+                OR (ref.worker_group IS NOT NULL AND wp.worker_group = ref.worker_group)
+            )
+            AND wp.ping_at >= $2::timestamptz - interval '5 seconds'
+            AND wp.ping_at <= $2::timestamptz + interval '15 seconds'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (wp.ping_at - $2::timestamptz))) ASC
+        LIMIT 1
+        "#,
+        q_worker,
+        last_ping,
+    )
+    .fetch_optional(db)
+    .await;
+    match res {
+        Ok(culprit) => culprit,
+        Err(e) => {
+            tracing::warn!(
+                "failed to query for zombie-flow culprit worker (q_worker={q_worker}): {e:#}"
+            );
+            None
+        }
+    }
+}
+
+async fn handle_zombie_flows(db: &DB) -> error::Result<()> {
+    // A canceled flow gets ten times the transition timeout: requeuing it while its worker is
+    // still in a slow transition lets a second worker complete it under that transition, and
+    // which worker runs a transition is not recorded anywhere to tell a slow one from a dead one.
+    // flow_status is cast ::text on purpose: decoding the jsonb column directly as Box<str>
+    // yields its binary form (leading version byte) and fails serde_json parsing at column 1.
+    let flows = sqlx::query!(
+        r#"
+        SELECT
+            j.id AS "id!", j.workspace_id AS "workspace_id!", j.parent_job, j.flow_step_id IS NOT NULL AS "is_flow_step?",
+            COALESCE(s.flow_status, s.workflow_as_code_status)::text AS "flow_status: Box<str>", r.ping AS last_ping, j.same_worker AS "same_worker?",
+            q.worker AS "worker?",
+            wp.ping_at AS "worker_last_ping?",
+            wp.memory_usage AS "worker_memory_usage?",
+            wp.wm_memory_usage AS "worker_wm_memory_usage?",
+            wp.memory AS "worker_memory_total?",
+            wp.worker_group AS "worker_group?",
+            wp.wm_version AS "worker_version?",
+            wp.current_job_id AS "worker_current_job_id?",
+            wp.worker_instance AS "worker_instance?",
+            q.canceled_by AS "canceled_by?", q.canceled_reason AS "canceled_reason?"
+        FROM v2_job_queue q JOIN v2_job j USING (id) LEFT JOIN v2_job_runtime r USING (id) LEFT JOIN v2_job_status s USING (id)
+            LEFT JOIN worker_ping wp ON wp.worker = q.worker
+        WHERE q.running = true AND q.suspend = 0 AND q.suspend_until IS null AND q.scheduled_for <= now()
+            AND (j.kind = 'flow' OR j.kind = 'flowpreview' OR j.kind = 'flownode' OR j.kind = 'singlestepflow')
+            AND r.ping IS NOT NULL AND r.ping < NOW() - ($1 || ' seconds')::interval
+            AND (q.canceled_by IS NULL OR r.ping < NOW() - ($1 || ' seconds')::interval * 10)
+
+        "#,
+        FLOW_ZOMBIE_TRANSITION_TIMEOUT.as_str()
+    )
+    .fetch_all(db)
+    .await?;
+
+    for flow in flows {
+        let status = flow
+            .flow_status
+            .as_deref()
+            .and_then(|x| serde_json::from_str::<FlowStatus>(x).ok());
+        // A worker that pulls a canceled flow completes it as canceled, and hands that to its
+        // parent like any step's cancel, so a canceled flow whose transition was lost goes back
+        // to the queue exactly like a flow that never started.
+        if flow.canceled_by.is_some()
+            || (!flow.same_worker.unwrap_or(false)
+                && status.as_ref().is_some_and(|s| s.is_not_yet_started()))
+        {
+            let mut tx = db.begin().await?;
+
+            // Claims the flow unless another sweep holds it or it visibly moved on since it was
+            // read. This does not tell a slow transition from a lost one: the ping is written when
+            // the step completes, at the start of the transition, and nothing is locked until its
+            // end, so the grace in the query above is what keeps a live transition safe.
+            let claimed = sqlx::query_scalar!(
+                "SELECT q.id FROM v2_job_queue q JOIN v2_job_runtime r ON r.id = q.id
+                WHERE q.id = $1 AND q.running AND r.ping = $2
+                FOR UPDATE OF q SKIP LOCKED",
+                flow.id,
+                flow.last_ping,
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            if !claimed {
+                continue;
+            }
+
+            let error_message = if let Some(canceler) = flow.canceled_by.as_deref() {
+                // Bounds the requeues of a canceled flow whose completion keeps failing: past the
+                // limit it is completed on its own instead, on every sweep until that succeeds.
+                // The count is taken under the row claim, so the alert goes out once.
+                let attempt = sqlx::query_scalar!(
+                    "INSERT INTO zombie_job_counter (job_id, counter) VALUES ($1, 1)
+                    ON CONFLICT (job_id) DO UPDATE SET counter = zombie_job_counter.counter + 1
+                    RETURNING counter",
+                    flow.id
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                if attempt > RESTART_LIMIT {
+                    tx.commit().await?;
+                    if attempt == RESTART_LIMIT + 1 {
+                        let error_message = format!(
+                            "Zombie flow detected: {} in workspace {}. It was canceled by {canceler} but could not be completed after {RESTART_LIMIT} attempts, completing it as canceled without handing it to its parent.",
+                            flow.id, flow.workspace_id
+                        );
+                        tracing::error!(error_message);
+                        report_critical_error(
+                            error_message,
+                            db.clone(),
+                            Some(&flow.workspace_id),
+                            None,
+                        )
+                        .await;
+                    }
+                    let completed = match get_queued_job_v2(db, &flow.id).await {
+                        Ok(Some(job)) => add_completed_job_error(
+                            db,
+                            &MiniCompletedJob::from(job),
+                            0,
+                            Some(CanceledBy {
+                                username: Some(canceler.to_string()),
+                                reason: flow.canceled_reason.clone(),
+                            }),
+                            canceled_result(flow.canceled_reason.as_deref(), Some(canceler)),
+                            "monitor",
+                            false,
+                            None,
+                        )
+                        .await
+                        .map(|_| ()),
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = completed {
+                        tracing::error!(
+                            "could not complete canceled zombie flow {}, retrying on the next sweep: {e:#}",
+                            flow.id
+                        );
+                    }
+                    continue;
+                }
+                format!(
+                    "Zombie flow detected: {} in workspace {}. It was canceled by {canceler} but its worker stopped between two steps, queuing it again to complete the cancel ({attempt}/{RESTART_LIMIT}).",
+                    flow.id, flow.workspace_id
+                )
+            } else {
+                format!(
+                    "Zombie flow detected: {} in workspace {}. It hasn't started yet, restarting it.",
+                    flow.id, flow.workspace_id
+                )
+            };
+
+            let concurrency_key =
+                sqlx::query_scalar!("SELECT key FROM concurrency_key WHERE job_id = $1", flow.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+
+            if let Some(key) = concurrency_key {
+                if *DISABLE_CONCURRENCY_LIMIT {
+                    tracing::warn!("Concurrency limit is disabled, skipping");
+                } else {
+                    sqlx::query!(
+                        "UPDATE concurrency_counter SET job_uuids = job_uuids - $2 WHERE concurrency_id = $1",
+                        key,
+                        flow.id.hyphenated().to_string()
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+
+            // A canceled flow keeps its start: the pull only sets a missing one, and the canceled
+            // run's duration is measured from it.
+            sqlx::query!(
+                "UPDATE v2_job_queue SET running = false,
+                    started_at = CASE WHEN canceled_by IS NULL THEN NULL ELSE started_at END
+                WHERE id = $1",
+                flow.id
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+
+            tracing::error!(error_message);
+            if flow.canceled_by.is_some()
+                || !CRITICAL_ALERT_MUTE_ZOMBIE_JOB_RESTART.load(Ordering::Relaxed)
+            {
+                report_critical_error(error_message, db.clone(), Some(&flow.workspace_id), None)
+                    .await;
+            }
+        } else {
+            let id = flow.id.clone();
+            let last_ping = flow.last_ping.clone();
+            let now = now_from_db(db).await?;
+            let base_url = BASE_URL.load();
+            let workspace_id = flow.workspace_id.clone();
+
+            let fmt_mb = |b: i64| format!("{:.1} MB", b as f64 / 1024.0 / 1024.0);
+            let worker_ping_stale = flow
+                .worker_last_ping
+                .map(|wp| (now - wp).num_seconds() > 60);
+            // Zombie flows between steps are, in practice, almost always the worker
+            // getting OOM-killed mid state-transition. Score the memory signal at
+            // the worker's last ping as a fraction of the cgroup limit, taking the
+            // larger of the cgroup-wide reading (`worker_memory_usage`) and the
+            // windmill process's jemalloc resident (`worker_wm_memory_usage`) — if
+            // only one is present, that value wins; if both are present, the larger
+            // is the more conservative (higher-signal) choice. If the pod restarted
+            // in-place, a replacement worker process comes up under a new windmill
+            // worker name; this flow's recorded worker name still points at the
+            // dead process whose last ping can be under 60s old, and the memory
+            // signal is what lets us catch that window.
+            let memory_pct: Option<f64> = zombie_worker_memory_pct(
+                flow.worker_memory_usage,
+                flow.worker_wm_memory_usage,
+                flow.worker_memory_total,
+            );
+            let oom_strong = memory_pct.is_some_and(|p| p >= 0.85);
+            let oom_moderate = memory_pct.is_some_and(|p| p >= 0.60);
+            let mem_pct_str = memory_pct
+                .map(|p| format!("{:.1}% of container limit", (p * 100.0).min(100.0)))
+                .unwrap_or_else(|| "memory unknown at last ping".to_string());
+
+            // When q.worker itself already shows OOM evidence the diagnosis below is
+            // already correct. Otherwise q.worker is likely a bystander (the outer
+            // queue-row worker) and the dropped transition was performed by a
+            // different worker on the same pod/group that OOM-died — go find it.
+            let q_worker_shows_oom = oom_moderate || worker_ping_stale == Some(true);
+            let culprit = if q_worker_shows_oom {
+                None
+            } else if let (Some(qw), Some(lp)) = (flow.worker.as_deref(), flow.last_ping) {
+                find_zombie_flow_culprit_worker(db, qw, lp).await
+            } else {
+                None
+            };
+            let culprit_pct = culprit.as_ref().and_then(|c| {
+                zombie_worker_memory_pct(c.memory_usage, c.wm_memory_usage, c.memory_total)
+            });
+            let culprit_pct_str =
+                culprit_pct.map(|p| format!("{:.1}% of its memory limit", (p * 100.0).min(100.0)));
+
+            let worker_info = if let Some(worker_name) = flow.worker.as_deref() {
+                let mut s = format!("\nWorker handling the flow: {worker_name}");
+                match (flow.worker_group.as_deref(), flow.worker_version.as_deref()) {
+                    (Some(g), Some(v)) => s.push_str(&format!(" (group: {g}, version: {v})")),
+                    (Some(g), None) => s.push_str(&format!(" (group: {g})")),
+                    (None, Some(v)) => s.push_str(&format!(" (version: {v})")),
+                    (None, None) => {}
+                }
+                if let Some(wp) = flow.worker_last_ping {
+                    let age = (now - wp).num_seconds();
+                    let status: String = match (
+                        worker_ping_stale.unwrap_or(false),
+                        oom_strong,
+                        oom_moderate,
+                    ) {
+                        (true, true, _) => format!(
+                            "OOM-KILLED — {mem_pct_str} at last ping, worker then stopped pinging"
+                        ),
+                        (true, false, true) => format!(
+                            "LIKELY OOM-KILLED — {mem_pct_str} at last ping, worker then stopped pinging"
+                        ),
+                        (true, false, false) => {
+                            "WORKER DIED — most likely OOM-killed (no strong memory evidence captured at last ping); less likely: crash, host failure, or network partition".to_string()
+                        }
+                        (false, true, _) => format!(
+                            "OOM-KILLED — {mem_pct_str} at last ping (a replacement worker process may have started in the same pod under a new windmill worker name; this alert references the dead process's record, which pinged just before being killed)"
+                        ),
+                        (false, false, true) => format!(
+                            "LIKELY OOM-KILLED — {mem_pct_str} at last ping (a replacement worker process may have started in the same pod under a new windmill worker name)"
+                        ),
+                        (false, false, false) if culprit.is_some() => {
+                            "still pinging with healthy memory — this is NOT the worker that performed the flow's final state transition (see likely culprit worker below)".to_string()
+                        }
+                        (false, false, false) => {
+                            "worker still pinging with healthy memory — most likely a different worker performed and dropped the final transition (see hint); less likely: this worker deadlocked or is blocking on the state transition".to_string()
+                        }
+                    };
+                    s.push_str(&format!("\nWorker last ping: {wp} ({age}s ago) — {status}"));
+                    if let Some(cjid) = flow.worker_current_job_id {
+                        if cjid != flow.id {
+                            s.push_str(&format!("\nWorker has since moved on to job {cjid}"));
+                        }
+                    }
+                } else {
+                    s.push_str("\nWorker last ping: unknown (no worker_ping record)");
+                }
+                let total_suffix = flow
+                    .worker_memory_total
+                    .map(|t| format!(" (total available: {})", fmt_mb(t)))
+                    .unwrap_or_default();
+                match (flow.worker_memory_usage, flow.worker_wm_memory_usage) {
+                    (Some(host), Some(wm)) => s.push_str(&format!(
+                        "\nWorker memory at last ping: host={}, wm process={}{}",
+                        fmt_mb(host),
+                        fmt_mb(wm),
+                        total_suffix
+                    )),
+                    (Some(host), None) => s.push_str(&format!(
+                        "\nWorker memory at last ping: host={}{}",
+                        fmt_mb(host),
+                        total_suffix
+                    )),
+                    (None, Some(wm)) => s.push_str(&format!(
+                        "\nWorker memory at last ping: wm process={}{}",
+                        fmt_mb(wm),
+                        total_suffix
+                    )),
+                    (None, None) => {
+                        if let Some(total) = flow.worker_memory_total {
+                            s.push_str(&format!("\nWorker total memory: {}", fmt_mb(total)));
+                        }
+                    }
+                }
+                s
+            } else {
+                "\nWorker handling the flow: unknown (no worker recorded on v2_job_queue)"
+                    .to_string()
+            };
+
+            let culprit_info = if let Some(c) = culprit.as_ref() {
+                let age = (now - c.ping_at).num_seconds();
+                let rel = match c.ping_delta_secs {
+                    Some(d) if d >= 0.0 => format!("{d:.0}s after"),
+                    Some(d) => format!("{:.0}s before", -d),
+                    None => "around".to_string(),
+                };
+                let loc =
+                    if c.worker_instance.is_some() && c.worker_instance == flow.worker_instance {
+                        format!(
+                            "same pod/instance '{}'",
+                            c.worker_instance.as_deref().unwrap()
+                        )
+                    } else if let Some(g) = c.worker_group.as_deref() {
+                        format!("worker group '{g}'")
+                    } else if let Some(inst) = c.worker_instance.as_deref() {
+                        format!("instance '{inst}'")
+                    } else {
+                        "same pod/group".to_string()
+                    };
+                let mem = match culprit_pct_str.as_deref() {
+                    Some(p) => format!("was at {p}"),
+                    None => "did not report memory".to_string(),
+                };
+                let mem_detail = match (c.memory_usage, c.wm_memory_usage, c.memory_total) {
+                    (host, wm, Some(total)) => {
+                        let used = host.max(wm);
+                        match used {
+                            Some(u) => format!(
+                                " (memory at last ping: {} of {})",
+                                fmt_mb(u),
+                                fmt_mb(total)
+                            ),
+                            None => format!(" (total available: {})", fmt_mb(total)),
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let q_name = flow.worker.as_deref().unwrap_or("the recorded worker");
+                format!(
+                    "\nLikely culprit worker (on {loc}): {} — last pinged {} ({age}s ago, {rel} this flow's last ping) and then stopped pinging; it {mem} at that last ping{mem_detail}. This flow's dropped state transition was most likely performed by this worker and lost to its death (most likely OOM-kill), not a deadlock on {q_name}.",
+                    c.worker, c.ping_at,
+                )
+            } else {
+                String::new()
+            };
+
+            let hint: String = if let Some(c) = culprit.as_ref() {
+                let q_name = flow.worker.as_deref().unwrap_or("the recorded worker");
+                match culprit_pct {
+                    Some(p) if p >= 0.60 => format!(
+                        "\nThis is almost certainly an OOM-kill on a *different* worker: {} (on the same pod/worker group) was at {} at its last ping right around this flow's transition, then stopped pinging. The flow's recorded worker ({q_name}) looks healthy because it is not the worker that performed the dropped transition. Raise the worker memory limit (e.g. k8s `resources.limits.memory`) or reduce per-flow memory usage. Confirm via that pod's restart count (`kubectl describe pod` / `kube_pod_container_status_last_terminated_reason`).",
+                        c.worker,
+                        culprit_pct_str.as_deref().unwrap_or("a high fraction of its limit"),
+                    ),
+                    _ => format!(
+                        "\nMost likely an OOM-kill on a *different* worker: {} (on the same pod/worker group) stopped pinging right around this flow's transition ({last_ping:?}); its memory may have spiked after its last ping or not been reported. The flow's recorded worker ({q_name}) looks healthy because it did not perform the dropped transition. First check that pod's restart count (`kubectl describe pod` / `kube_pod_container_status_last_terminated_reason`). Only if that worker was not OOM-killed, consider a deadlock on {q_name} and capture a stack trace (e.g. via SIGQUIT).",
+                        c.worker,
+                    ),
+                }
+            } else {
+                match (worker_ping_stale, oom_moderate) {
+                    (Some(_), true) => format!(
+                        "\nThis is almost certainly an OOM-kill: container memory at the worker's last ping was at {mem_pct_str}. Raise the worker memory limit (e.g. k8s `resources.limits.memory`) or reduce per-flow memory usage. Confirm via pod restart count (`kubectl describe pod` / `kube_pod_container_status_last_terminated_reason`)."
+                    ),
+                    (Some(true), false) => {
+                        "\nWorker stopped pinging and its last memory snapshot did not look high — in practice the overwhelmingly common cause here is still OOM-kill (memory may have spiked between the last ping and the kill, or never been reported). First check pod restart count (`kubectl describe pod` / `kube_pod_container_status_last_terminated_reason`). Less likely: host failure, network partition, or a panic — check worker logs / k8s events around the last ping time.".to_string()
+                    }
+                    (Some(false), false) => {
+                        format!("\nThe flow's recorded worker is still pinging with healthy memory, but that worker is often NOT the one that performed the final state transition (in nested/subflow/forloop cases the last iteration runs on another worker). First check whether a different worker on the same pod / worker group was OOM-killed around {last_ping:?} (`kubectl describe pod` / `kube_pod_container_status_last_terminated_reason`, and that pod's worker memory metrics). Only if no such worker died, treat this as a deadlock or blocking call on the recorded worker during the state transition and capture a stack trace (e.g. via SIGQUIT).")
+                    }
+                    (None, _) => String::new(),
+                }
+            };
+
+            // Pull logs for the worker (and around the time) we actually blame: the
+            // culprit's instance/last-ping when one was found, else q.worker's.
+            let (log_instance, log_ping) = match culprit.as_ref() {
+                Some(c) => (c.worker_instance.as_deref(), Some(c.ping_at)),
+                None => (flow.worker_instance.as_deref(), flow.worker_last_ping),
+            };
+            let service_logs_info = match (log_instance, log_ping) {
+                (Some(host), Some(wlp)) => {
+                    let after = (wlp - chrono::Duration::seconds(90))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let before = (wlp + chrono::Duration::seconds(30))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let log_files_result = sqlx::query!(
+                        "SELECT file_path, log_ts, ok_lines, err_lines
+                         FROM log_file
+                         WHERE hostname = $1
+                           AND log_ts BETWEEN $2::timestamp - interval '90 seconds' AND $2::timestamp + interval '30 seconds'
+                         ORDER BY log_ts DESC
+                         LIMIT 10",
+                        host,
+                        wlp.naive_utc(),
+                    )
+                    .fetch_all(db)
+                    .await;
+                    let log_files = match log_files_result {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to query log_file for hanging-flow diagnostics (host={host}): {e:#}"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    if log_files.is_empty() {
+                        format!(
+                            "\nService logs: no log_file rows found for hostname '{host}' between {after} and {before}. If service log collection is enabled (requires S3/parquet), try /api/service_logs/list_files?after={after}&before={before}."
+                        )
+                    } else {
+                        let listed = log_files
+                            .iter()
+                            .map(|f| {
+                                format!(
+                                    "  - {} (log_ts: {}, ok_lines: {}, err_lines: {}) — GET /api/service_logs/get_log_file/{}/{}",
+                                    f.file_path,
+                                    f.log_ts,
+                                    f.ok_lines.unwrap_or(0),
+                                    f.err_lines.unwrap_or(0),
+                                    host,
+                                    f.file_path,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!("\nService logs for worker instance '{host}' around last ping ({after} to {before}) (download URLs require S3/parquet service log collection):\n{listed}")
+                    }
+                }
+                _ => String::new(),
+            };
+
+            let reason = format!(
+                "{} was hanging in between 2 steps. Last ping: {last_ping:?} (now: {now}){worker_info}{culprit_info}{hint}{service_logs_info}",
+                if flow.is_flow_step.unwrap_or(false) && flow.parent_job.is_some() {
+                    format!("Flow was cancelled because subflow {id} ({base_url}/run/{id}?workspace={workspace_id})")
+                } else {
+                    format!("Flow {id} ({base_url}/run/{id}?workspace={workspace_id}) was cancelled because it")
+                }
+            );
+            let reason = match between_steps_recovery_guidance(
+                db,
+                status.as_ref(),
+                id,
+                &workspace_id,
+                &base_url,
+            )
+            .await
+            {
+                Some(guidance) => format!("{reason}\n\n{guidance}"),
+                None => reason,
+            };
+            report_critical_error(reason.clone(), db.clone(), Some(&flow.workspace_id), None).await;
+            cancel_zombie_flow_job(db, flow.id, &flow.workspace_id,
+                format!(r#"{reason}
+This would happen if a worker was interrupted, killed or crashed while doing a state transition at the end of a job which is always an unexpected behavior that should never happen.
+Please check your worker logs for more details and feel free to report it to the Windmill team on our Discord or support@windmill.dev (response for non EE customers will be best effort) with as much context as possible, ideally:
+- Windmill version
+- Worker logs right after the job referenced has finished running
+- Is the error consistent when running the same flow
+- A minimal flow and its flow.yaml that reproduces the error and that is importable in a fresh workspace
+- Your infra setup (helm, docker-compose, configuration of the workers and their number, memory of the database, etc.)
+"#)).await?;
+        }
+    }
+
+    let flows2 = sqlx::query!(
+        r#"
+        DELETE
+        FROM parallel_monitor_lock
+        WHERE last_ping IS NOT NULL AND last_ping < NOW() - ($1 || ' seconds')::interval
+        RETURNING parent_flow_id, job_id, last_ping, (SELECT workspace_id FROM v2_job_queue q
+            WHERE q.id = parent_flow_id AND q.running = true AND q.canceled_by IS NULL
+        ) AS workspace_id
+        "#,
+        FLOW_ZOMBIE_TRANSITION_TIMEOUT.as_str()
+    )
+    .fetch_all(db)
+    .await?;
+
+    for flow in flows2 {
+        if let Some(parent_flow_workspace_id) = flow.workspace_id {
+            tracing::error!(
+                "parallel Zombie flow detected: {} in workspace {}. Last ping was: {:?}.",
+                flow.parent_flow_id,
+                parent_flow_workspace_id,
+                flow.last_ping
+            );
+            cancel_zombie_flow_job(db, flow.parent_flow_id, &parent_flow_workspace_id,
+                format!("Flow {} cancelled as one of the parallel branch {} was unable to make the last transition ", flow.parent_flow_id, flow.job_id))
+                .await?;
+        } else {
+            tracing::info!("releasing lock for parallel flow: {}", flow.parent_flow_id);
+        }
+    }
+    Ok(())
+}
+
+/// When a between-steps zombie's stuck step has every child recorded as a
+/// `success` completion, the flow's state is fully derivable: only the final
+/// state transition was lost to the worker failure, not any real work. In that
+/// case return concrete restart-from-step recovery guidance to append to the
+/// cancellation reason / critical alert. Returns `None` when the state isn't
+/// derivable (some child missing or not successful), so the existing wording is
+/// left untouched. Auto-recovery is deliberately not attempted (a re-driven
+/// transition can OOM again on the same aggregated state; a human raises the
+/// memory limit first, then restarts).
+async fn between_steps_recovery_guidance(
+    db: &DB,
+    status: Option<&FlowStatus>,
+    flow_id: Uuid,
+    workspace_id: &str,
+    base_url: &str,
+) -> Option<String> {
+    // The stuck module is the current step, left InProgress because the
+    // transition that would have marked it Success was dropped. It is only
+    // derivable when its own cursor reached the end (a serial fan-out reaped
+    // mid-iteration has unrun work left; while-loops are never derivable). Whether
+    // restart reuses the children or re-runs the step (final step, or one carrying a
+    // stop/skip/approval/sleep) is decided by the restart path against the flow
+    // definition, which the reaper doesn't load; the guidance states both outcomes
+    // rather than promising reuse the restart might decline.
+    let status = status?;
+    let idx = usize::try_from(status.step).ok()?;
+    let module = status.modules.get(idx)?;
+    if !module.is_between_steps_complete() {
+        return None;
+    }
+    let step_id = module.id();
+
+    // Only a top-level deployed flow exposes a working restart-from-step: the run page's
+    // "Re-start from" button is rendered only for job_kind == 'flow' (a flowpreview, even a
+    // pathful editor preview, or a singlestepflow does not qualify), and a subflow child
+    // restarts via its root. Match that surface exactly so the guidance never points at a
+    // button / endpoint that isn't there; leave the existing wording otherwise.
+    let restartable = sqlx::query_scalar!(
+        r#"SELECT (kind = 'flow' AND parent_job IS NULL) AS "restartable!"
+           FROM v2_job WHERE id = $1"#,
+        flow_id,
+    )
+    .fetch_one(db)
+    .await
+    .ok()?;
+    if !restartable {
+        return None;
+    }
+
+    // Children whose completion the lost transition would have aggregated: the
+    // loop/branchall iterations, or the single leaf/subflow child.
+    let child_ids: Vec<Uuid> = module
+        .flow_jobs()
+        .filter(|v| !v.is_empty())
+        .or_else(|| module.job().map(|j| vec![j]))?;
+
+    // Derivable only when every child is recorded as a success completion.
+    let success_children = sqlx::query_scalar!(
+        "SELECT count(*) FROM v2_job_completed
+         WHERE workspace_id = $1 AND id = ANY($2) AND status = 'success'",
+        workspace_id,
+        &child_ids,
+    )
+    .fetch_one(db)
+    .await
+    .ok()?
+    .unwrap_or(0);
+    if success_children != child_ids.len() as i64 {
+        return None;
+    }
+    let n = child_ids.len();
+
+    // For loop/branchall, name the completed iteration/branch count so the
+    // operator can confirm the whole fan-out is intact.
+    let iteration_hint = match module {
+        FlowStatusModule::InProgress { iterator: Some(_), .. } => {
+            format!(" (loop step, all {n} iterations completed)")
+        }
+        FlowStatusModule::InProgress { branchall: Some(_), .. } => {
+            format!(" (branchall step, all {n} branches completed)")
+        }
+        _ => String::new(),
+    };
+
+    Some(format!(
+        "RECOVERY: all {n} child job(s) of step `{step_id}`{iteration_hint} completed successfully; \
+only the flow's final state transition was lost to the worker failure above (not any genuine failure), so \
+the completed work is intact. To recover: first change the failure condition (raise the worker memory limit, \
+e.g. k8s `resources.limits.memory`, or move the flow to a larger worker group), then restart from step \
+`{step_id}`. Restart replays only the dropped transition and reuses the completed children where the step's \
+result is fully derivable; a step that is the flow's last, or carries a stop/skip condition, an approval, or a \
+sleep, is re-run instead (re-evaluating those on the larger worker).\n\
+  UI:  open {base_url}/run/{flow_id}?workspace={workspace_id} and use \"Re-start from {step_id}\".\n\
+  API: POST {base_url}/api/w/{workspace_id}/jobs/restart/f/{flow_id} with body {{\"step_id\":\"{step_id}\"}}."
+    ))
+}
+
+async fn cancel_zombie_flow_job(
+    db: &Pool<Postgres>,
+    id: Uuid,
+    workspace_id: &str,
+    message: String,
+) -> Result<(), error::Error> {
+    let mut tx = db.begin().await?;
+    tracing::error!(
+        "zombie flow detected: {} in workspace {}. Cancelling it.",
+        id,
+        workspace_id
+    );
+    (tx, _) = cancel_job(
+        "monitor",
+        Some(message),
+        id,
+        workspace_id,
+        tx,
+        db,
+        true,
+        false,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn reload_hub_base_url_setting(
+    conn: &Connection,
+    server_mode: bool,
+) -> error::Result<()> {
+    let v = load_value_from_global_settings_with_conn(conn, HUB_BASE_URL_SETTING, true).await?;
+    apply_hub_base_url_setting(conn, server_mode, v).await
+}
+
+/// The half of [`reload_hub_base_url_setting`] after the read.
+pub async fn apply_hub_base_url_setting(
+    conn: &Connection,
+    server_mode: bool,
+    hub_base_url: Option<serde_json::Value>,
+) -> error::Result<()> {
+    // Only reaches a use under the `embedding` feature.
+    let _ = &conn;
+    let base_url = if let Some(q) = hub_base_url {
+        if let Ok(v) = serde_json::from_value::<String>(q.clone()) {
+            if v != "" {
+                v
+            } else {
+                DEFAULT_HUB_BASE_URL.to_string()
+            }
+        } else {
+            tracing::error!(
+                "Could not parse hub_base_url setting as a string, found: {:#?}",
+                &q
+            );
+            DEFAULT_HUB_BASE_URL.to_string()
+        }
+    } else {
+        DEFAULT_HUB_BASE_URL.to_string()
+    };
+
+    let previous = HUB_BASE_URL.load();
+    if server_mode {
+        #[cfg(feature = "embedding")]
+        if let Some(db) = conn.as_sql() {
+            if **previous != base_url {
+                let disable_embedding = std::env::var("DISABLE_EMBEDDING")
+                    .ok()
+                    .map(|x| x.parse::<bool>().unwrap_or(false))
+                    .unwrap_or(false);
+                if !disable_embedding {
+                    let db_clone = db.clone();
+                    tokio::spawn(async move {
+                        update_embeddings_db(&db_clone).await;
+                    });
+                }
+            }
+        }
+    }
+    drop(previous);
+    HUB_BASE_URL.store(std::sync::Arc::new(base_url));
+
+    Ok(())
+}
+
+pub async fn reload_critical_error_channels_setting(conn: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(conn, CRITICAL_ERROR_CHANNELS_SETTING).await?;
+    apply_critical_error_channels_setting(v);
+    Ok(())
+}
+
+pub fn apply_critical_error_channels_setting(critical_error_channels: Option<serde_json::Value>) {
+    let critical_error_channels = if let Some(q) = critical_error_channels {
+        if let Ok(v) = serde_json::from_value::<Vec<CriticalErrorChannel>>(q.clone()) {
+            v
+        } else {
+            tracing::error!(
+                "Could not parse critical_error_channels setting as an array of channels, found: {:#?}",
+                &q
+            );
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    CRITICAL_ERROR_CHANNELS.store(std::sync::Arc::new(critical_error_channels));
+}
+
+pub async fn reload_app_workspaced_route_setting(conn: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(conn, APP_WORKSPACED_ROUTE_SETTING).await?;
+    apply_app_workspaced_route_setting(v);
+    Ok(())
+}
+
+pub fn apply_app_workspaced_route_setting(app_workspaced_route: Option<serde_json::Value>) {
+    let ws_route = match app_workspaced_route {
+        Some(serde_json::Value::Bool(ws_route)) => ws_route,
+        None => false,
+        _ => {
+            tracing::error!(
+                "Expected {} to be a boolean got: {:?}. Defaulting to false",
+                APP_WORKSPACED_ROUTE_SETTING,
+                app_workspaced_route
+            );
+            false
+        }
+    };
+
+    APP_WORKSPACED_ROUTE.store(ws_route, Ordering::Relaxed);
+}
+
+pub async fn reload_http_route_default_allowed_origins_setting(conn: &DB) -> error::Result<()> {
+    let v =
+        load_value_from_global_settings(conn, HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING).await?;
+    apply_http_route_default_allowed_origins_setting(v)
+}
+
+pub fn apply_http_route_default_allowed_origins_setting(
+    value: Option<serde_json::Value>,
+) -> error::Result<()> {
+    // A bad value leaves whatever is already loaded in place rather than
+    // reverting to no restriction. On the boot path that is still the empty
+    // default, so what keeps a stored typo from widening CORS instance-wide is
+    // write-time validation, not this.
+    let origins = match parse_allowed_origins_setting(value.as_ref()) {
+        Ok(origins) => origins,
+        Err(err) => {
+            tracing::error!(
+                "Invalid {} setting, keeping the previous value: {err:#}",
+                HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING
+            );
+            return Ok(());
+        }
+    };
+
+    HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS.store(std::sync::Arc::new(origins));
+    Ok(())
+}
+
+pub async fn reload_http_route_workspaced_route_setting(conn: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(conn, HTTP_ROUTE_WORKSPACED_ROUTE_SETTING).await?;
+    apply_http_route_workspaced_route_setting(conn, v).await
+}
+
+pub async fn apply_http_route_workspaced_route_setting(
+    conn: &DB,
+    http_route_workspaced_route: Option<serde_json::Value>,
+) -> error::Result<()> {
+    let ws_route = match http_route_workspaced_route {
+        Some(serde_json::Value::Bool(ws_route)) => ws_route,
+        None => false,
+        _ => {
+            tracing::error!(
+                "Expected {} to be a boolean got: {:?}. Defaulting to false",
+                HTTP_ROUTE_WORKSPACED_ROUTE_SETTING,
+                http_route_workspaced_route
+            );
+            false
+        }
+    };
+
+    let previous = HTTP_ROUTE_WORKSPACED_ROUTE.swap(ws_route, Ordering::Relaxed);
+    if previous != ws_route {
+        // Bump the HTTP trigger version so the route cache is rebuilt with
+        // the updated workspaced_route behavior on the next request.
+        sqlx::query!("SELECT nextval('http_trigger_version_seq')")
+            .fetch_one(conn)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn reload_critical_alerts_on_db_oversize(conn: &DB) -> error::Result<()> {
+    #[derive(Deserialize)]
+    struct DBOversize {
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        value: f32,
+    }
+    let db_oversize_value =
+        load_value_from_global_settings(conn, CRITICAL_ALERTS_ON_DB_OVERSIZE_SETTING).await?;
+
+    let db_oversize = if let Some(q) = db_oversize_value {
+        match serde_json::from_value::<DBOversize>(q.clone()) {
+            Ok(DBOversize { enabled: true, value }) => Some(value),
+            Ok(_) => None,
+            Err(q) => {
+                tracing::error!(
+                    "Could not parse critical_alerts_on_db_oversize setting, found: {:#?}",
+                    &q
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    CRITICAL_ALERTS_ON_DB_OVERSIZE.store(std::sync::Arc::new(db_oversize));
+
+    Ok(())
+}
+
+pub async fn reload_jwt_secret_setting(db: &DB) -> error::Result<()> {
+    let v = load_value_from_global_settings(db, JWT_SECRET_SETTING).await?;
+    apply_jwt_secret_setting(db, v).await
+}
+
+/// The half of [`reload_jwt_secret_setting`] after the read.
+///
+/// `value` may be stale, which is why generating falls to
+/// [`get_or_create_jwt_secret`]: that statement, not this read, decides whether a new secret
+/// is stored, so a pass that batched an absent read cannot overwrite one another process
+/// wrote in the meantime.
+pub async fn apply_jwt_secret_setting(
+    db: &DB,
+    value: Option<serde_json::Value>,
+) -> error::Result<()> {
+    let jwt_secret = match value {
+        Some(q) => match serde_json::from_value::<String>(q) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::error!("Could not parse jwt_secret setting, generating new one");
+                get_or_create_jwt_secret(db).await?
+            }
+        },
+        None => {
+            tracing::info!("No jwt secret found, generating one");
+            get_or_create_jwt_secret(db).await?
+        }
+    };
+
+    JWT_SECRET.store(std::sync::Arc::new(jwt_secret));
+
+    // The debug signing key is derived from JWT_SECRET, so re-derive it here so
+    // rotation propagates to /api/debug/* signing without requiring a restart.
+    windmill_api::reload_debug_signing_key().await;
+
+    Ok(())
+}
+
+async fn cleanup_debounce_orphaned_keys(db: &DB) -> error::Result<()> {
+    let result = sqlx::query!(
+        "
+DELETE FROM debounce_key
+WHERE job_id NOT IN (SELECT id FROM v2_job_queue)
+RETURNING key,job_id
+        ",
+    )
+    .fetch_all(db)
+    .await?;
+
+    tracing::debug!("Cleaning up debounce keys");
+
+    if result.len() > 0 {
+        tracing::info!("Cleaned up {} debounce keys", result.len());
+        for row in result {
+            tracing::info!(
+                "Debounce key cleaned up: key: {}, job_id: {:?}",
+                row.key,
+                row.job_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// GC for claim-based debounce batches: once a batch row has been consumed (its
+/// args accumulated into some survivor's run), it only lingers to let a later-pulled
+/// survivor of the same batch tell "already consumed" from "never batched". A generous
+/// grace period (>> any debounce window) makes that decision safe; after it, the rows
+/// are dead weight. A re-pulled survivor whose row was GC'd correctly falls back to its
+/// own (already-accumulated, persisted) args, so the grace period is not correctness-
+/// critical.
+async fn cleanup_consumed_debounce_batches(db: &DB) -> error::Result<()> {
+    // Only reclaim a consumed row once its job has LEFT the queue. A consumed sibling
+    // (its contribution already accumulated by another survivor) can sit queued well
+    // past any time-based grace under a concurrency limit / worker backlog; removing its
+    // row while still queued would make its eventual pull treat it as never-batched and
+    // re-run its item (a duplicate). Keeping the row until the job is no longer queued
+    // guarantees that pull still sees "already consumed" and runs empty. The age floor
+    // is just a safety margin on top.
+    let deleted = sqlx::query_scalar!(
+        "WITH del AS (
+            DELETE FROM v2_job_debounce_batch
+            WHERE consumed_at IS NOT NULL
+              AND consumed_at < now() - interval '10 minutes'
+              AND id NOT IN (SELECT id FROM v2_job_queue)
+            RETURNING 1
+        ) SELECT count(*) FROM del"
+    )
+    .fetch_one(db)
+    .await?
+    .unwrap_or(0);
+
+    if deleted > 0 {
+        tracing::info!("Cleaned up {deleted} consumed debounce batch rows");
+    }
+    Ok(())
+}
+
+async fn cleanup_debounce_keys_for_completed_jobs(db: &DB) -> error::Result<()> {
+    // If min version doesn't support runnable settings, clean up debounce keys for completed jobs
+    if !windmill_common::min_version::MIN_VERSION_SUPPORTS_RUNNABLE_SETTINGS_V0
+        .met()
+        .await
+    {
+        let result = sqlx::query!(
+            "
+DELETE FROM debounce_key
+WHERE job_id IN (SELECT id FROM v2_job_completed)
+RETURNING key,job_id
+            ",
+        )
+        .fetch_all(db)
+        .await?;
+
+        if result.len() > 0 {
+            tracing::warn!(
+                "Cleaned up {} debounce keys for completed jobs (runnable settings v0 not supported by all workers)",
+                result.len()
+            );
+            for row in result {
+                tracing::debug!(
+                    "Debounce key for completed job cleaned up: key: {}, job_id: {:?}",
+                    row.key,
+                    row.job_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// Per-statement cap keeps each delete short and lock-light; the per-cycle batch
+// cap bounds total work per monitor iteration so monitor_db stays responsive.
+// A large backlog drains across several iterations rather than one long delete.
+//
+// These sweeps anti-join the whole table to find orphans, so their cost tracks the heap's
+// physical size. job_perms / job_result_stream_v2 are high-churn (one row per job, deleted
+// here), so their bloat — not the query shape — is what makes the sweep slow. These sweeps run
+// every monitor cycle, but the bulk vacuuming_tables() runs only ~hourly, so dead tuples pile
+// up between bulk vacuums; each sweep VACUUMs its own table right after deleting (see below) to
+// keep the heap near the live working set. The outer `ctid IN (SELECT ... LIMIT)` is
+// deliberate: a `job_id IN (...)` rewrite adds a second scan/probe for the delete and
+// benchmarks slower, so don't "simplify" it.
+const ORPHAN_CLEANUP_BATCH_SIZE: u64 = 100_000;
+const ORPHAN_CLEANUP_MAX_BATCHES: usize = 10;
+
+// Reclaim the dead tuples a sweep just created so the next sweep's anti-join scans a lean heap
+// instead of a bloated one. Plain VACUUM (not FULL) only takes SHARE UPDATE EXCLUSIVE, so
+// concurrent reads/writes (every job create touches job_perms) keep running, and the visibility
+// map lets it skip unchanged pages so repeated runs are cheap. SKIP_LOCKED means HA replicas
+// don't pile up: one vacuums, the rest skip rather than queue behind it.
+async fn vacuum_after_sweep(db: &DB, table: &str) {
+    if let Err(e) = sqlx::query(&format!("VACUUM (SKIP_LOCKED) {table}"))
+        .execute(db)
+        .await
+    {
+        tracing::warn!("Error vacuuming {table} after orphan cleanup: {e:?}");
+    }
+}
+
+async fn cleanup_job_perms_orphaned(db: &DB) -> error::Result<()> {
+    let mut total: u64 = 0;
+    for _ in 0..ORPHAN_CLEANUP_MAX_BATCHES {
+        let count = sqlx::query!(
+            "DELETE FROM job_perms
+             WHERE ctid IN (
+                 SELECT jp.ctid FROM job_perms jp
+                 WHERE NOT EXISTS (SELECT 1 FROM v2_job_queue q WHERE q.id = jp.job_id)
+                 LIMIT 100000
+             )"
+        )
+        .execute(db)
+        .await?
+        .rows_affected();
+        total += count;
+        if count < ORPHAN_CLEANUP_BATCH_SIZE {
+            break;
+        }
+    }
+
+    if total > 0 {
+        tracing::info!("Cleaned up {total} orphaned job_perms rows");
+        vacuum_after_sweep(db, "job_perms").await;
+    }
+    Ok(())
+}
+
+async fn cleanup_job_result_stream_orphaned_jobs(db: &DB) -> error::Result<()> {
+    let mut total: u64 = 0;
+    for _ in 0..ORPHAN_CLEANUP_MAX_BATCHES {
+        let count = sqlx::query!(
+            "DELETE FROM job_result_stream_v2
+             WHERE ctid IN (
+                 SELECT jrs.ctid FROM job_result_stream_v2 jrs
+                 WHERE NOT EXISTS (SELECT 1 FROM v2_job_queue q WHERE q.id = jrs.job_id)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM v2_job_completed c
+                       WHERE c.id = jrs.job_id
+                         AND c.completed_at > NOW() - INTERVAL '60 seconds'
+                   )
+                 LIMIT 100000
+             )",
+        )
+        .execute(db)
+        .await?
+        .rows_affected();
+        total += count;
+        if count < ORPHAN_CLEANUP_BATCH_SIZE {
+            break;
+        }
+    }
+
+    if total > 0 {
+        tracing::info!("Cleaned up {total} orphaned job_result_stream_v2 rows");
+        vacuum_after_sweep(db, "job_result_stream_v2").await;
+    }
+    Ok(())
+}
+
+/// A parked agent cancelled from outside, or a worker that died mid-segment, never deletes its
+/// checkpoint itself.
+async fn cleanup_ai_agent_checkpoint_orphaned_jobs(db: &DB) -> error::Result<()> {
+    let deleted = sqlx::query(
+        "DELETE FROM ai_agent_checkpoint c
+         WHERE NOT EXISTS (SELECT 1 FROM v2_job_queue q WHERE q.id = c.job_id)",
+    )
+    .execute(db)
+    .await?
+    .rows_affected();
+    if deleted > 0 {
+        tracing::info!("Cleaned up {deleted} orphaned ai_agent_checkpoint rows");
+    }
+    Ok(())
+}
+
+async fn cleanup_flow_iterator_data_orphaned_jobs(db: &DB) -> error::Result<()> {
+    let result = sqlx::query!(
+        "
+DELETE FROM flow_iterator_data
+WHERE job_id NOT IN (SELECT id FROM v2_job_queue)
+RETURNING job_id
+        ",
+    )
+    .fetch_all(db)
+    .await?;
+
+    if result.len() > 0 {
+        tracing::info!(
+            "Cleaned up {} orphaned flow_iterator_data rows",
+            result.len()
+        );
+    }
+    Ok(())
+}
+
+async fn audit_log_retention_days() -> i64 {
+    let v = AUDIT_LOG_RETENTION_DAYS.load(std::sync::atomic::Ordering::Relaxed);
+    if v > 0 {
+        v
+    } else {
+        14
+    }
+}
+
+/// Number of days ahead (including today) for which an audit partition must
+/// always exist. A missing partition in this window means audit inserts fail
+/// once that date is reached — and because some callers (notably login) write
+/// the audit row in the same transaction as their own work, that failure
+/// poisons the whole transaction, so a missing partition is a hard outage, not
+/// just a dropped audit row.
+const AUDIT_PARTITION_LOOKAHEAD_DAYS: i64 = 3;
+
+async fn manage_audit_partitions(db: &DB, retention_days: i64) {
+    let today = chrono::Utc::now().date_naive();
+
+    // Create partitions for today and the next few days
+    for days_ahead in 0..=AUDIT_PARTITION_LOOKAHEAD_DAYS {
+        let date = today + chrono::Duration::days(days_ahead);
+        let next_date = date + chrono::Duration::days(1);
+        let partition_name = format!("audit_{}", date.format("%Y%m%d"));
+        let quoted_name = format!("\"{}\"", partition_name.replace('"', "\"\""));
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {quoted_name} PARTITION OF audit_partitioned \
+             FOR VALUES FROM ('{date}') TO ('{next_date}')"
+        );
+        if let Err(e) = sqlx::query(&sql).execute(db).await {
+            if !e.to_string().contains("already exists") {
+                tracing::error!("Error creating audit partition {partition_name}: {e:?}");
+            }
+        }
+    }
+
+    let partitions = sqlx::query_scalar::<_, String>(
+        "SELECT c.relname::text \
+         FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = 'audit_partitioned'::regclass",
+    )
+    .fetch_all(db)
+    .await;
+
+    let partitions = match partitions {
+        Ok(partitions) => partitions,
+        Err(e) => {
+            tracing::error!("Error listing audit partitions: {e:?}");
+            return;
+        }
+    };
+
+    // Verify the lookahead window is actually covered. If a create above failed
+    // (or this loop has not run for several days), alert loudly instead of
+    // letting it surface days later as failed audit inserts and broken logins.
+    let existing: std::collections::HashSet<&str> = partitions.iter().map(|s| s.as_str()).collect();
+    let missing: Vec<String> = (0..=AUDIT_PARTITION_LOOKAHEAD_DAYS)
+        .map(|days_ahead| {
+            format!(
+                "audit_{}",
+                (today + chrono::Duration::days(days_ahead)).format("%Y%m%d")
+            )
+        })
+        .filter(|name| !existing.contains(name.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        report_critical_error(
+            format!(
+                "Audit log partitions missing after maintenance run: {}. \
+                 Audit inserts will fail once these dates are reached, which also \
+                 breaks logins (the login audit row shares the login transaction). \
+                 Check for earlier 'Error creating audit partition' logs and verify \
+                 the audit-partition maintenance loop is still running.",
+                missing.join(", ")
+            ),
+            db.clone(),
+            None,
+            None,
+        )
+        .await;
+    }
+
+    // Drop expired partitions
+    let cutoff_date = today - chrono::Duration::days(retention_days);
+    for partition_name in &partitions {
+        if let Some(date_str) = partition_name.strip_prefix("audit_") {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y%m%d") {
+                if date < cutoff_date {
+                    let quoted_name = format!("\"{}\"", partition_name.replace('"', "\"\""));
+                    let sql = format!("DROP TABLE IF EXISTS {quoted_name}");
+                    match sqlx::query(&sql).execute(db).await {
+                        Ok(_) => {
+                            tracing::info!("Dropped expired audit partition {partition_name}")
+                        }
+                        Err(e) => tracing::error!(
+                            "Error dropping audit partition {partition_name}: {e:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod strike_unarmed_tests {
+    use super::strike_unarmed;
+    use std::collections::{HashMap, HashSet};
+
+    fn key(path: &str) -> (String, String) {
+        ("ws".to_string(), path.to_string())
+    }
+
+    fn set(paths: &[&str]) -> HashSet<(String, String)> {
+        paths.iter().map(|p| key(p)).collect()
+    }
+
+    /// The strike threshold is the only thing keeping the reconciler from racing
+    /// an in-flight push: `push_scheduled_job`'s own `already_exists` guard keys
+    /// on the same columns as the scan, so it is false by construction whenever a
+    /// schedule is found unarmed.
+    #[test]
+    fn rearms_only_after_consecutive_unarmed_passes() {
+        let mut seen = HashMap::new();
+        assert!(strike_unarmed(&mut seen, set(&["a"])).is_empty());
+        assert_eq!(strike_unarmed(&mut seen, set(&["a"])), vec![key("a")]);
+    }
+
+    #[test]
+    fn armed_observation_resets_the_tally() {
+        let mut seen = HashMap::new();
+        assert!(strike_unarmed(&mut seen, set(&["a"])).is_empty());
+        // `a` is armed again on this pass, so its strike must not carry over.
+        assert!(strike_unarmed(&mut seen, set(&[])).is_empty());
+        assert!(strike_unarmed(&mut seen, set(&["a"])).is_empty());
+        assert_eq!(strike_unarmed(&mut seen, set(&["a"])), vec![key("a")]);
+    }
+
+    #[test]
+    fn tallies_are_per_schedule() {
+        let mut seen = HashMap::new();
+        assert!(strike_unarmed(&mut seen, set(&["a"])).is_empty());
+        assert_eq!(strike_unarmed(&mut seen, set(&["a", "b"])), vec![key("a")]);
+        assert_eq!(strike_unarmed(&mut seen, set(&["b"])), vec![key("b")]);
+    }
+}
+
+#[cfg(test)]
+mod zombie_worker_memory_pct_tests {
+    use super::zombie_worker_memory_pct;
+
+    #[test]
+    fn takes_the_larger_of_the_two_readings() {
+        // Both present: the larger (higher-signal) reading wins, not either
+        // one unconditionally — a "simplify to `usage.or(wm_usage)`" refactor
+        // would silently under-report and miss OOMs.
+        let p = zombie_worker_memory_pct(Some(600), Some(900), Some(1000)).unwrap();
+        assert!((p - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn falls_back_to_whichever_reading_is_present() {
+        assert_eq!(
+            zombie_worker_memory_pct(Some(700), None, Some(1000)),
+            Some(0.7)
+        );
+        assert_eq!(
+            zombie_worker_memory_pct(None, Some(800), Some(1000)),
+            Some(0.8)
+        );
+    }
+
+    #[test]
+    fn none_when_no_usage_or_no_valid_total() {
+        assert_eq!(zombie_worker_memory_pct(None, None, Some(1000)), None);
+        assert_eq!(zombie_worker_memory_pct(Some(500), Some(500), None), None);
+        assert_eq!(
+            zombie_worker_memory_pct(Some(500), Some(500), Some(0)),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod otel_traces_retention_tests {
+    use super::{delete_expired_otel_traces, DB};
+
+    async fn insert_span(db: &DB, id: u8, age_secs: i64) {
+        sqlx::query!(
+            "INSERT INTO otel_traces (trace_id, span_id, name, kind, start_time_unix_nano, end_time_unix_nano)
+             VALUES ($1, $2, 'GET /', 3, $3, $3)",
+            &[id; 16][..],
+            &[id; 8][..],
+            (chrono::Utc::now() - chrono::Duration::seconds(age_secs))
+                .timestamp_nanos_opt()
+                .unwrap(),
+        )
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// The cutoff crosses two units: a retention configured in seconds against a column holding
+    /// nanoseconds. Getting that conversion wrong is silent in both directions — a window a
+    /// billion times too wide never deletes anything, one a billion times too narrow deletes
+    /// every span on the next tick — so pin it on either side of the boundary.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deletes_only_spans_past_the_window(db: DB) -> anyhow::Result<()> {
+        let day = 60 * 60 * 24;
+        insert_span(&db, 1, 60).await;
+        insert_span(&db, 2, 6 * day).await;
+        insert_span(&db, 3, 8 * day).await;
+
+        assert_eq!(delete_expired_otel_traces(&db, 7 * day).await, 1);
+
+        let kept = sqlx::query_scalar!("SELECT trace_id FROM otel_traces ORDER BY trace_id")
+            .fetch_all(&db)
+            .await?;
+        assert_eq!(kept, vec![vec![1u8; 16], vec![2u8; 16]]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod log_file_listing_tests {
+    use super::{rotated_log_files, sorted_log_files};
+
+    fn names(files: Vec<(chrono::NaiveDateTime, String)>) -> Vec<String> {
+        files.into_iter().map(|(_, n)| n).collect()
+    }
+
+    /// A directory read newest-entry-first is what tmpfs actually hands back.
+    #[test]
+    fn orders_by_minute_whatever_order_readdir_used() {
+        let newest_first = [
+            "h.log.2026-08-29-06-49",
+            "h.log.2026-08-29-06-46",
+            "h.log.2026-08-29-06-48",
+            "h.log.2026-08-29-06-47",
+        ];
+        assert_eq!(
+            names(sorted_log_files(newest_first.iter().map(|x| x.to_string()))),
+            vec![
+                "h.log.2026-08-29-06-46",
+                "h.log.2026-08-29-06-47",
+                "h.log.2026-08-29-06-48",
+                "h.log.2026-08-29-06-49",
+            ]
+        );
+        assert_eq!(
+            names(rotated_log_files(
+                newest_first.iter().map(|x| x.to_string())
+            )),
+            vec![
+                "h.log.2026-08-29-06-46",
+                "h.log.2026-08-29-06-47",
+                "h.log.2026-08-29-06-48",
+            ]
+        );
+    }
+
+    #[test]
+    fn drops_names_that_are_not_rotated_log_files() {
+        let files = sorted_log_files(
+            ["h.log", "not-a-log-file", "h.log.2026-08-29-06-46"]
+                .iter()
+                .map(|x| x.to_string()),
+        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, "h.log.2026-08-29-06-46");
+        assert_eq!(files[0].0.to_string(), "2026-08-29 06:46:00");
+    }
+}
+
+#[cfg(test)]
+mod canceled_zombie_flow_tests {
+    use super::{handle_zombie_flows, DB, RESTART_LIMIT};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    /// A running flow at `step` (0: not started yet), last pinged `ping_age` ago (`None`: mid-step, no ping).
+    async fn insert_flow(
+        db: &DB,
+        parent: Option<Uuid>,
+        step: i32,
+        ping_age: Option<&str>,
+        canceled_by: Option<&str>,
+    ) -> anyhow::Result<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO v2_job (id, workspace_id, created_by, permissioned_as, permissioned_as_email,
+                kind, tag, parent_job, flow_step_id)
+             VALUES ($1, 'admins', 'admin', 'u/admin', 'admin@windmill.dev', 'flowpreview', 'flow',
+                $2, CASE WHEN $2 IS NOT NULL THEN 'sf' END)",
+        )
+        .bind(id)
+        .bind(parent)
+        .execute(db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO v2_job_queue (id, workspace_id, scheduled_for, running, started_at, tag,
+                canceled_by, canceled_reason)
+             VALUES ($1, 'admins', now(), true, now() - interval '1 hour', 'flow', $2, $2)",
+        )
+        .bind(id)
+        .bind(canceled_by)
+        .execute(db)
+        .await?;
+        sqlx::query("INSERT INTO v2_job_runtime (id, ping) VALUES ($1, now() - $2::interval)")
+            .bind(id)
+            .bind(ping_age)
+            .execute(db)
+            .await?;
+        sqlx::query("INSERT INTO v2_job_status (id, flow_status) VALUES ($1, $2)")
+            .bind(id)
+            .bind(json!({"step": step, "modules": [if step == 0 {
+                json!({"type": "WaitingForPriorSteps", "id": "a"})
+            } else {
+                json!({"type": "InProgress", "id": "a", "job": Uuid::nil()})
+            }],
+                "failure_module": {"type": "WaitingForPriorSteps", "id": "failure"}}))
+            .execute(db)
+            .await?;
+        Ok(id)
+    }
+
+    /// `(running, canceled_by, still started an hour ago)`
+    async fn queue_row(db: &DB, id: Uuid) -> anyhow::Result<(bool, Option<String>, Option<bool>)> {
+        Ok(sqlx::query_as(
+            "SELECT running, canceled_by, started_at < now() - interval '30 minutes'
+             FROM v2_job_queue WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(db)
+        .await?)
+    }
+
+    /// A subflow canceled on its own whose worker died between two steps goes back to the queue
+    /// with its cancel and its start, for a worker to complete it and hand it to its parent. The
+    /// parent is left alone: the cancel must not reach flows the user never canceled.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn requeues_a_stranded_canceled_flow_and_nothing_else(db: DB) -> anyhow::Result<()> {
+        let root = insert_flow(&db, None, 0, None, None).await?;
+        let child = insert_flow(&db, Some(root), 1, Some("1 hour"), Some("admin")).await?;
+
+        handle_zombie_flows(&db).await?;
+
+        assert_eq!(
+            queue_row(&db, child).await?,
+            (false, Some("admin".to_string()), Some(true))
+        );
+        assert_eq!(queue_row(&db, root).await?, (true, None, Some(true)));
+        Ok(())
+    }
+
+    /// A canceled flow is left to a transition that may just be slow for ten times the timeout
+    /// a flow that never started gets.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn gives_a_canceled_flow_a_longer_grace(db: DB) -> anyhow::Result<()> {
+        let slow = insert_flow(&db, None, 1, Some("2 minutes"), Some("admin")).await?;
+        let stuck = insert_flow(&db, None, 1, Some("1 hour"), Some("admin")).await?;
+        let not_started = insert_flow(&db, None, 0, Some("2 minutes"), None).await?;
+
+        handle_zombie_flows(&db).await?;
+
+        assert!(
+            queue_row(&db, slow).await?.0,
+            "a recent canceled flow is left running"
+        );
+        assert!(
+            !queue_row(&db, stuck).await?.0,
+            "past the grace, it is requeued"
+        );
+        assert!(
+            !queue_row(&db, not_started).await?.0,
+            "a flow that never started is not held back"
+        );
+        Ok(())
+    }
+
+    /// A canceled flow that keeps coming back after its requeues is completed as canceled on its
+    /// own instead of being requeued (and alerted on) forever, and that completion is retried by
+    /// the next sweep if a previous one did not land. Its parent is not advanced, since the
+    /// transition that would do it is what kept failing.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn completes_a_canceled_flow_requeued_too_often(db: DB) -> anyhow::Result<()> {
+        let root = insert_flow(&db, None, 0, None, None).await?;
+        let child = insert_flow(&db, Some(root), 1, Some("1 hour"), Some("admin")).await?;
+        let retried = insert_flow(&db, None, 1, Some("1 hour"), Some("admin")).await?;
+        for (id, counter) in [(child, RESTART_LIMIT), (retried, RESTART_LIMIT + 1)] {
+            sqlx::query("INSERT INTO zombie_job_counter (job_id, counter) VALUES ($1, $2)")
+                .bind(id)
+                .bind(counter)
+                .execute(&db)
+                .await?;
+        }
+
+        handle_zombie_flows(&db).await?;
+
+        for id in [child, retried] {
+            let completed: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT status::text, canceled_by FROM v2_job_completed WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&db)
+            .await?;
+            assert_eq!(
+                completed,
+                Some(("canceled".to_string(), Some("admin".to_string())))
+            );
+        }
+        // the parent is not advanced, but the completion pings it: the sweep then reaps it as a
+        // flow hanging between two steps instead of leaving it waiting
+        assert_eq!(queue_row(&db, root).await?, (true, None, Some(true)));
+        let parent_pinged: bool = sqlx::query_scalar(
+            "SELECT ping > now() - interval '1 minute' FROM v2_job_runtime WHERE id = $1",
+        )
+        .bind(root)
+        .fetch_one(&db)
+        .await?;
+        assert!(parent_pinged);
+        Ok(())
+    }
+}
