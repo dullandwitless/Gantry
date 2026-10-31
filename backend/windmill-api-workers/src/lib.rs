@@ -520,19 +520,16 @@ pub struct WorkspaceFairnessEvent {
 }
 
 /// Return the most recent ~200 cap and ~200 uncap transitions (merged into
-/// at most 400 rows) written by `workspace_fairness::emit_transition_audit`.
-/// Workspace fairness is an Enterprise feature; on non-EE / non-enabled
-/// instances the table is naturally empty.
+/// at most 400 rows) that a workspace-fairness refresh records in the audit
+/// log. `workspace_fairness` is a stub that records none, so nothing here
+/// writes these rows.
 async fn get_workspace_fairness_events(
     authed: ApiAuthed,
     Extension(db): Extension<DB>,
 ) -> JsonResult<Vec<WorkspaceFairnessEvent>> {
     require_devops_role(&db, &authed).await?;
 
-    // No cloud-host gate — workspace fairness is an Enterprise feature
-    // available on any multi-tenant EE deployment. Non-EE / non-enabled
-    // instances will simply have no audit rows of these operation types,
-    // so the table is naturally empty.
+    // No cloud-host gate.
     //
     // Return the most recent 200 cap **and** the most recent 200 uncap
     // events separately, then merge — without this, a long stretch of caps

@@ -15,13 +15,13 @@
 //! Run tests (static token mode):
 //! ```bash
 //! VAULT_TOKEN=your-token cargo test -p windmill-common \
-//!     --test secret_backend_integration --features private,enterprise -- --ignored --nocapture
+//!     --test secret_backend_integration -- --ignored --nocapture
 //! ```
 //!
 //! Run tests (JWT mode - requires Windmill instance running for JWKS endpoint):
 //! ```bash
 //! BASE_URL=http://localhost:8000 cargo test -p windmill-common \
-//!     --test secret_backend_integration --features private,enterprise,openidconnect \
+//!     --test secret_backend_integration --features openidconnect \
 //!     -- --ignored --nocapture
 //! ```
 

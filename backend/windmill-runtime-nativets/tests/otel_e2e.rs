@@ -1,19 +1,18 @@
-//! End-to-end coverage for the EE HTTP-tracing path on nativets.
+//! End-to-end coverage for the HTTP-tracing path on nativets.
 //!
 //! Pairs with `otel_init.rs` (which pins only the `OTEL_GLOBALS`
 //! population contract). This test exercises the full chain that
 //! actually delivers a span to a collector:
 //!
-//!   `deno_telemetry::init` with EE config (Rust)
+//!   `deno_telemetry::init` with tracing enabled (Rust)
 //!     → `globalThis.__bootstrapOtel()` (JS, flips TRACING_ENABLED)
 //!     → user `fetch()` → deno_fetch's `builtinTracer().startSpan`
 //!     → `BatchSpanProcessor` → `HttpExporter` (OTLP/HTTP-binary)
 //!     → our mock OTLP listener captures the request bytes
 //!
-//! Without the v1.702.0 fix (#573 EE / #9163 OSS), the third arrow
+//! Without the v1.702.0 fix (upstream #9163), the third arrow
 //! panics in a tokio worker. With the fix in place, the span is
-//! emitted and shows up at the listener — which is what the customer
-//! is paying for when they enable HTTP tracing on nativets.
+//! emitted and shows up at the listener.
 //!
 //! `#[ignore]`'d: spins a V8 isolate (~seconds) and binds two TCP
 //! listeners. Run with `cargo test -p windmill-runtime-nativets
@@ -65,11 +64,8 @@ async fn spawn_capturing_http(captured: Arc<Mutex<Vec<Vec<u8>>>>) -> u16 {
     port
 }
 
-/// Initialize `deno_telemetry` with the exact `OtelConfig` shape that
-/// the EE `load_internal_otel_exporter` ships in production. Keeps
-/// this test in lockstep with the actual call site: if production
-/// drifts away from `tracing_enabled + Capture`, this test breaks
-/// before the customer-facing panic does.
+/// Initialize `deno_telemetry` with the `OtelConfig` shape an
+/// HTTP-tracing caller must pass (`tracing_enabled + Capture`).
 fn init_with_ee_otel_config() {
     windmill_runtime_nativets::init_telemetry(
         deno_telemetry::OtelRuntimeConfig {
@@ -98,7 +94,7 @@ async fn fetch_after_init_otel_emits_span_to_collector() {
     let otlp_port = spawn_capturing_http(otlp_hits.clone()).await;
 
     // 2. Point the deno_telemetry exporter at the mock collector and
-    //    initialize. Mirrors `load_internal_otel_exporter` in EE.
+    //    initialize.
     //
     // SAFETY: test runs in its own process binary; no other thread
     // reads OTEL_EXPORTER_OTLP_ENDPOINT before init returns.

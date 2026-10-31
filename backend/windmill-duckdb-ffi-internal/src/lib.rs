@@ -1236,9 +1236,8 @@ mod temporal_json_tests {
 
 // Cross-engine parity for the `wm_partition` materialize macro. The macro is
 // `strftime(ts, '<fmt>')` where `<fmt>` is single-sourced in windmill-parser's
-// `PartitionKind::default_time_format` — the SAME format the EE resolver
-// (`partition_ee.rs`) uses (via chrono) to stamp the `{partition}` identity.
-// The macro only works if the *bundled* DuckDB engine renders that format
+// `PartitionKind::default_time_format`, the format a `{partition}` identity is
+// stamped with. The macro only works if the *bundled* DuckDB engine renders that format
 // byte-for-byte identically to chrono. Weekly `%G-W%V` (ISO year/week) is the
 // one that can diverge at a year boundary, so it's exercised head-on here — a
 // gap a pure-Rust unit test can't reach.

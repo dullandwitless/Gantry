@@ -1,7 +1,6 @@
-//! OSS fallback: backfilling a range of partitions is an enterprise
-//! feature (the resolution/enumeration logic lives in `windmill-ee-private`,
-//! `windmill-api-assets/src/backfill_ee.rs`). Single-partition runs with an
-//! explicit `partition` arg remain available in OSS.
+//! Stub: backfilling a range of partitions is not implemented, so the request
+//! is refused. Single-partition runs with an explicit `partition` arg remain
+//! available.
 
 use windmill_common::error::{Error, Result};
 

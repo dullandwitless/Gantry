@@ -53,6 +53,6 @@ else
     echo "  # OSS triggers"
     echo "  cargo test --test trigger_e2e --features mqtt_trigger,websocket,postgres_trigger -- --ignored --nocapture"
     echo ""
-    echo "  # Enterprise triggers"
-    echo "  AWS_ENDPOINT_URL=http://localhost:4566 PUBSUB_EMULATOR_HOST=localhost:8085 cargo test --test trigger_e2e --features kafka,nats,sqs_trigger,gcp_trigger,enterprise,private -- --ignored --nocapture"
+    echo "  # Kafka, NATS, SQS and GCP Pub/Sub triggers"
+    echo "  AWS_ENDPOINT_URL=http://localhost:4566 PUBSUB_EMULATOR_HOST=localhost:8085 cargo test --test trigger_e2e --features kafka,nats,sqs_trigger,gcp_trigger -- --ignored --nocapture"
 fi

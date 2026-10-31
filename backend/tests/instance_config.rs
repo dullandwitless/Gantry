@@ -211,7 +211,7 @@ async fn test_from_db_hides_legacy_worker_configs_ghost_row(db: Pool<Postgres>) 
 /// Regression: a bulk `diff_global_settings` desired map that contains an
 /// empty-string value for a key must route that key to `deletes` rather than
 /// upserting `""`. Mirrors the single-key endpoint's behavior and prevents
-/// stale `""` rows (e.g. `npmrc`) from tripping the EE registry gate on CE.
+/// stale `""` rows (e.g. `npmrc`) from tripping the private registry gate.
 #[sqlx::test(fixtures("base"))]
 async fn test_diff_global_settings_empty_string_routes_to_delete(db: Pool<Postgres>) {
     clear_settings_and_configs(&db).await;

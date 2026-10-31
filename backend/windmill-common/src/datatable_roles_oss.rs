@@ -6,16 +6,15 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-//! Where data table roles come from: the enterprise implementation, or a refusal.
+//! Data table roles: a refusal. Roles are not implemented.
 //!
-//! Roles are an Enterprise Edition feature. An edition without them creates, grants and connects
-//! as none, and a data table saved under roles — by an enterprise build, before a downgrade — is
-//! refused rather than resolved as `admin`. A data table not under roles, asked for no role,
-//! resolves as it always has. `private` alone is not that edition: community builds carry it.
+//! This build creates, grants and connects as no role, and a data table saved under roles — by
+//! another build — is refused rather than resolved as `admin`. A data table not under roles,
+//! asked for no role, resolves as it always has.
 
 use crate::error::Error;
 
-/// What every roles path answers without the Enterprise Edition. The frontend matches this exact
+/// What every roles path answers. The frontend matches this exact
 /// sentence (`datatableUsableRoles.ts`) to read the refusal as "not under roles": reword both.
 pub fn datatable_roles_unavailable() -> Error {
     Error::BadRequest("Data table roles are a Windmill Enterprise Edition feature".to_string())

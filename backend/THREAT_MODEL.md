@@ -9,9 +9,9 @@ alternative to Retool / Pipedream / Airplane. The backend is a Rust workspace
 `windmill-common`, a family of `windmill-trigger-*` crates, `windmill-mcp`,
 `windmill-sandbox`, etc.) fronting a PostgreSQL database. A Svelte 5 frontend
 (not in scope here, but referenced where stored-XSS threats originate) is
-served by the same instance. The product ships in a Community Edition (CE,
-public Docker images) and an Enterprise Edition (EE, `*_ee.rs` files gated by
-`enterprise`/`private`/`license` cargo features).
+served by the same instance. Upstream ships a Community Edition and a
+proprietary Enterprise Edition; this tree contains only the AGPL code, with
+`*_oss.rs` stubs where upstream's enterprise modules would be.
 
 The defining characteristic for threat modeling is that **Windmill executes
 arbitrary user-supplied code** (Python, TypeScript via Bun/Deno, Go, Bash,

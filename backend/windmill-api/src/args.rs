@@ -594,8 +594,7 @@ lazy_static::lazy_static! {
 /// tracing is disabled (so non-tracing instances don't accumulate a stray
 /// reserved arg key) or when no `traceparent` header is present. The W3C format
 /// is not validated here — it is checked later at use time
-/// (`valid_w3c_traceparent` for the env, EE `span_cx_from_traceparent` for the
-/// span).
+/// (`valid_w3c_traceparent` for the env).
 fn inbound_traceparent(headers: &HeaderMap) -> Option<String> {
     if !OTEL_TRACING_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;

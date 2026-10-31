@@ -13,8 +13,7 @@
 //! `windmill_common::secret_backend` (so lower-level crates can resolve secrets
 //! too) and are re-exported here for existing callers.
 //!
-//! Note: HashiCorp Vault integration requires Enterprise Edition.
-//! The OSS version only supports the database backend.
+//! Note: only the database backend is implemented.
 
 use windmill_common::{
     db::DB,
@@ -41,7 +40,7 @@ pub fn http_store_rename_error(path: &str) -> Error {
 /// Store a secret value using the configured backend
 ///
 /// For database backend: encrypts using workspace key and returns encrypted value
-/// For vault backend (EE only): stores in Vault and returns a placeholder for DB storage
+/// For vault backend (stub): stores in Vault and returns a placeholder for DB storage
 pub async fn store_secret_value(
     db: &DB,
     workspace_id: &str,
@@ -192,7 +191,7 @@ pub(crate) async fn store_oauth_token_value(
 /// Delete a secret from the configured backend (if using Vault)
 ///
 /// For database backend: no-op (DB delete is handled separately)
-/// For vault backend (EE only): deletes from Vault
+/// For vault backend (stub): deletes from Vault
 pub async fn delete_secret_from_backend(db: &DB, workspace_id: &str, path: &str) -> Result<()> {
     if is_vault_backend_configured(db).await? {
         let backend = get_secret_backend(db).await?;

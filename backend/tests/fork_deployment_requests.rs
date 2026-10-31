@@ -182,8 +182,8 @@ async fn test_fork_deployment_request_lifecycle(db: Pool<Postgres>) -> anyhow::R
     );
 
     // ---- 8. anchored comment becomes obsolete when item changes in fork ----
-    // The CE stub of `mark_anchor_obsolete` is a no-op (the EE module fills
-    // it in). Simulate the EE effect directly so the CE test can verify
+    // The stub of `mark_anchor_obsolete` is a no-op. Set the flag directly so
+    // the test can verify
     // the GET response renders obsolete comments correctly.
     sqlx::query!(
         r#"

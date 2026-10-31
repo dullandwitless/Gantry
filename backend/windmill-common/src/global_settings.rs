@@ -87,8 +87,8 @@ pub const SANDBOX_IMAGE_PULL_POLICY_SETTING: &str = "sandbox_image_pull_policy";
 pub const SANDBOX_IMAGE_DEFAULT_REGISTRY_SETTING: &str = "sandbox_image_default_registry";
 pub const SANDBOX_REGISTRY_AUTH_SETTING: &str = "sandbox_registry_auth";
 // Enables the `#ssh <resource>` directive that reroutes bash execution to a
-// remote host over SSH (enterprise feature). Off by default. See
-// windmill-worker/src/ssh_executor_ee.rs.
+// remote host over SSH. Off by default. The SSH executor
+// (windmill-worker/src/ssh_executor_oss.rs) is a stub that refuses to run.
 pub const SSH_EXECUTION_SETTING: &str = "ssh_execution_enabled";
 pub const OBJECT_STORE_CONFIG_SETTING: &str = "object_store_cache_config";
 /// Whether the instance object store stands in for a workspace without storage of its own
@@ -190,8 +190,8 @@ pub const GITHUB_APP_WEBHOOK_BASE_URL_SETTING: &str = "github_app_webhook_base_u
 /// Base URL the UI shows for the endpoints external clients call (webhooks, HTTP
 /// routes, push trigger endpoints, the CLI, the MCP server), instead of the origin the UI is
 /// browsed on. For deployments that serve the API on a separate domain or behind a gateway.
-/// The server reads it too, through [`mcp_base_url`], for the MCP gateway's OAuth metadata.
-/// EE only. Readable by any authenticated user, like [`INSTANCE_BANNER_SETTING`]:
+/// The MCP gateway's OAuth metadata does not use it: see [`mcp_base_url`].
+/// Readable by any authenticated user, like [`INSTANCE_BANNER_SETTING`]:
 /// every user is shown URLs built from it.
 pub const API_BASE_URL_SETTING: &str = "api_base_url";
 /// Which of [`API_BASE_URL_SURFACES`] [`API_BASE_URL_SETTING`] applies to; unset means all,
@@ -462,7 +462,7 @@ pub const WORKSPACE_REGISTRIES_SETTING: &str = "workspace_registries";
 pub const RESTART_COORDINATION_SETTING: &str = "_restart_coordination";
 pub const ALERT_CONFIG_SETTING: &str = "alert_job_queue_waiting";
 
-/// The instance's workspace roles (EE), a list of `crate::roles::RoleDefinition`.
+/// The instance's workspace roles, a list of `crate::roles::RoleDefinition`.
 pub const WORKSPACE_ROLES_SETTING: &str = "workspace_roles";
 
 // Workspace fairness: cloud-only mechanism that caps any single workspace at
@@ -688,13 +688,14 @@ pub fn client_access(scopes: &[String]) -> Result<bool, String> {
     Ok(false)
 }
 
-/// [`API_BASE_URL_SETTING`] when it applies to MCP, else `base_url`. The MCP gateway builds every URL it hands a
-/// client to call from it: its resource identifier, the authorization server it names, and
-/// that server's issuer, token and registration endpoints. Not the authorization endpoint:
-/// the user's browser opens it, and the consent page it redirects to is served on `base_url`.
+/// The base URL the MCP gateway builds every URL it hands a client to call from: its resource
+/// identifier, the authorization server it names, and that server's issuer, token and
+/// registration endpoints. Not the authorization endpoint: the user's browser opens it, and the
+/// consent page it redirects to is served on `base_url`.
 ///
-/// Enterprise only, like the UI that shows the MCP URL: an MCP client rejects metadata
-/// naming a host other than the URL it was given, so the two must agree.
+/// Always `base_url`: this build does not apply [`API_BASE_URL_SETTING`] here. An MCP client
+/// rejects metadata naming a host other than the URL it was given, so this and the UI that
+/// shows the MCP URL must agree.
 pub fn mcp_base_url() -> String {
     crate::BASE_URL.load().to_string()
 }

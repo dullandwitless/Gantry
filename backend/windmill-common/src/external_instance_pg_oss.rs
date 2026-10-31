@@ -6,8 +6,7 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-//! Where the external instance cluster comes from: the enterprise implementation, or a refusal.
-//! `private` alone is not that edition: community builds carry it.
+//! The external instance cluster: a refusal. It is not implemented.
 
 use crate::error::Error;
 

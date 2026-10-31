@@ -6,17 +6,24 @@
 
 use serde_json::json;
 use sqlx::{Pool, Postgres};
+#[cfg(feature = "deno_core")]
 use windmill_common::worker::Connection;
 use windmill_test_utils::*;
 
 const SAME_WS_TOKEN: &str = "SECRET_TOKEN";
+#[cfg(feature = "deno_core")]
 const OTHER_WS_TOKEN: &str = "OTHER_WS_TOKEN";
+#[cfg(feature = "deno_core")]
 const NO_WS_TOKEN: &str = "NO_WS_TOKEN";
 
+#[cfg(feature = "deno_core")]
 const SAME_WS_EMAIL: &str = "test@windmill.dev";
+#[cfg(feature = "deno_core")]
 const OTHER_WS_EMAIL: &str = "other-ws@windmill.dev";
+#[cfg(feature = "deno_core")]
 const NO_WS_EMAIL: &str = "no-ws@windmill.dev";
 
+#[cfg(feature = "deno_core")]
 const GET_EMAIL_CONTENT: &str =
     "export function main() { return process.env.WM_END_USER_EMAIL || \"\"; }";
 
@@ -29,6 +36,7 @@ fn authed(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuil
 }
 
 /// Create an app with inline script via API
+#[cfg(feature = "deno_core")]
 async fn create_app_with_inline_script(port: u16, path: &str) -> anyhow::Result<()> {
     let url = format!("http://localhost:{}/api/w/test-workspace/apps/create", port);
     let resp = authed(client().post(&url), SAME_WS_TOKEN)
@@ -78,6 +86,7 @@ async fn create_app_with_inline_script(port: u16, path: &str) -> anyhow::Result<
 }
 
 /// Create a raw app with inline script via API (uses regular app endpoint with rawapp type)
+#[cfg(feature = "deno_core")]
 async fn create_raw_app_with_inline_script(port: u16, path: &str) -> anyhow::Result<()> {
     let url = format!("http://localhost:{}/api/w/test-workspace/apps/create", port);
     let resp = authed(client().post(&url), SAME_WS_TOKEN)
@@ -125,6 +134,7 @@ async fn create_raw_app_with_inline_script(port: u16, path: &str) -> anyhow::Res
 }
 
 /// Create an app whose policy allows triggering the fixture flow
+#[cfg(feature = "deno_core")]
 async fn create_app_triggering_flow(port: u16, path: &str, flow_path: &str) -> anyhow::Result<()> {
     let url = format!("http://localhost:{}/api/w/test-workspace/apps/create", port);
     let resp = authed(client().post(&url), SAME_WS_TOKEN)
@@ -161,6 +171,7 @@ async fn create_app_triggering_flow(port: u16, path: &str, flow_path: &str) -> a
     Ok(())
 }
 
+#[cfg(feature = "deno_core")]
 async fn run_app_flow(
     port: u16,
     token: &str,
@@ -190,6 +201,7 @@ async fn run_app_flow(
     wait_for_job_result(port, token, &job_id).await
 }
 
+#[cfg(feature = "deno_core")]
 fn find_inline_script_id(value: &serde_json::Value) -> Option<i64> {
     match value {
         serde_json::Value::Object(m) => m
@@ -204,6 +216,7 @@ fn find_inline_script_id(value: &serde_json::Value) -> Option<i64> {
 
 /// Once the app's dependency job writes the deployed lite value, inline code runs only through
 /// the `app_script` rows it references, so the run must carry that row's id.
+#[cfg(feature = "deno_core")]
 async fn deployed_inline_script_id(port: u16, app_path: &str) -> anyhow::Result<i64> {
     let url = format!(
         "http://localhost:{}/api/w/test-workspace/apps/get/lite/{}",
@@ -222,6 +235,7 @@ async fn deployed_inline_script_id(port: u16, app_path: &str) -> anyhow::Result<
     anyhow::bail!("timeout waiting for the deployed app_script id of {app_path}")
 }
 
+#[cfg(feature = "deno_core")]
 async fn run_inline_script(
     port: u16,
     token: &str,
@@ -260,6 +274,7 @@ async fn run_inline_script(
     wait_for_job_result(port, token, &job_id).await
 }
 
+#[cfg(feature = "deno_core")]
 async fn wait_for_job_result(port: u16, token: &str, job_id: &str) -> anyhow::Result<String> {
     let url = format!(
         "http://localhost:{}/api/w/test-workspace/jobs_u/completed/get_result/{}",
@@ -280,6 +295,7 @@ async fn wait_for_job_result(port: u16, token: &str, job_id: &str) -> anyhow::Re
     anyhow::bail!("timeout waiting for job result")
 }
 
+#[cfg(feature = "deno_core")]
 async fn run_direct(port: u16, token: &str, route: &str) -> anyhow::Result<String> {
     let url = format!(
         "http://localhost:{}/api/w/test-workspace/jobs/run/{}",

@@ -197,7 +197,7 @@ pub enum InstallStrategy<T: Clone + Send + Sync> {
 ///
 /// # Features
 ///
-/// This helper will install all specified dependencies in parallel and if it is EE, cache to S3
+/// This helper will install all specified dependencies in parallel.
 /// It has atomic success file, allowing to distinguish failed installations from succesfull.
 ///
 /// Besides that it provides console output and does logging.
@@ -332,7 +332,7 @@ pub async fn par_install_language_dependencies_all_at_once<
 ///
 /// # Features
 ///
-/// This helper will install all specified dependencies in parallel and if it is EE, cache to S3
+/// This helper will install all specified dependencies in parallel.
 /// It has atomic success file, allowing to distinguish failed installations from succesfull.
 ///
 /// Besides that it provides console output and does logging.

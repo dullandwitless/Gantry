@@ -69,7 +69,7 @@ impl std::fmt::Display for SsrfValidationError {
 }
 
 // Enables `?` from `validate_url_for_ssrf` in functions returning
-// `anyhow::Result` (e.g. the EE SAML metadata loader).
+// `anyhow::Result`.
 impl std::error::Error for SsrfValidationError {}
 
 /// A URL that passed SSRF validation, carrying the exact addresses its host

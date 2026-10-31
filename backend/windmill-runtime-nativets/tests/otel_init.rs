@@ -1,8 +1,7 @@
 //! Regression test for the deno_telemetry 0.31 nativets-fetch panic.
 //!
-//! Setup: when EE's `load_internal_otel_exporter` runs (HTTP tracing
-//! enabled), it calls `deno_telemetry::init` and then flips
-//! `DENO_OTEL_INITIALIZED=true` so `js_eval` will run
+//! Setup: an HTTP-tracing caller calls `deno_telemetry::init` and then
+//! flips `DENO_OTEL_INITIALIZED=true` so `js_eval` will run
 //! `globalThis.__bootstrapOtel()` inside the nativets JsRuntime. That
 //! bootstrap unconditionally sets JS-side `TRACING_ENABLED=true`, which
 //! makes `deno_fetch`'s `fetch()` call `builtinTracer().startSpan(...)`
@@ -15,11 +14,11 @@
 //! bootstrap proceeded but the Rust-side OnceCell was empty, and the
 //! first `fetch()` panicked the tokio worker in a context that cannot
 //! unwind. Fixed in v1.702.0 by passing `tracing_enabled: true` +
-//! `console: Capture` from `load_internal_otel_exporter` (PRs #573 EE
-//! / #9163 OSS), matching the JS bootstrap shape `[1, 0, 1, 0]`.
+//! `console: Capture` (upstream #9163), matching the JS bootstrap shape
+//! `[1, 0, 1, 0]`.
 //!
 //! This test pins that contract directly against `deno_telemetry::
-//! init` — the function the EE call site invokes — so the next time
+//! init`, so the next time
 //! the dep is bumped and someone is tempted to "simplify" the config
 //! back to `OtelConfig::default()`, CI catches it.
 //!
@@ -70,9 +69,8 @@ async fn ee_otel_init_config_populates_otel_globals() {
     // concurrently.
     unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", "not-a-protocol") };
 
-    // Step 2: re-call init with the exact config shape that the EE
-    // `load_internal_otel_exporter` ships — this is what production
-    // hits, so the test exercises the actual prod call path.
+    // Step 2: re-call init with the config shape an HTTP-tracing caller
+    // must pass (`tracing_enabled` + `Capture`).
     windmill_runtime_nativets::init_telemetry(
         deno_telemetry::OtelRuntimeConfig {
             runtime_name: "windmill-nativets".into(),

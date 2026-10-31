@@ -1,8 +1,6 @@
-//! OSS fallback: scheduled ducklake maintenance (snapshot expiry, adjacent-file
-//! compaction, orphaned-file cleanup via managed per-lake schedules) is an
-//! enterprise feature; the implementation lives in windmill-ee-private
-//! (see `ducklake_maintenance_ee`). In the public build the entry points report
-//! that the enterprise edition is required.
+//! Stub: scheduled ducklake maintenance (snapshot expiry, adjacent-file
+//! compaction, orphaned-file cleanup via managed per-lake schedules) is not
+//! implemented. Enabling it is refused.
 
 use std::collections::HashMap;
 
@@ -23,7 +21,7 @@ use windmill_common::{
 /// workspace-admin on `w_id` and that the identity is the authenticated
 /// caller's (as `edit_ducklake_config` does via `require_admin`).
 // Only newly-enabled maintenance is rejected: a config that already had it
-// enabled (e.g. an enterprise license lapsed) must not make every unrelated
+// enabled (e.g. one written by another build) must not make every unrelated
 // ducklake settings save fail, and the admin must be able to save it off.
 pub async fn sync_ducklake_maintenance_schedules<'c>(
     _db: &DB,
@@ -45,12 +43,10 @@ pub async fn sync_ducklake_maintenance_schedules<'c>(
         ));
     }
 
-    // Saving maintenance off (e.g. after an enterprise license lapsed) must
-    // remove the managed row AND its already-queued occurrence here too —
-    // otherwise a maintenance job pushed under the enterprise edition still
-    // runs once after the admin disabled it. Like the enterprise
-    // implementation, the removed set is derived from config, never from the
-    // path prefix.
+    // Saving maintenance off must remove the managed row AND its already-queued
+    // occurrence — otherwise a maintenance job that is already queued still
+    // runs once after the admin disabled it. The removed set is derived from
+    // config, never from the path prefix.
     let removed = previous
         .iter()
         .filter(|(name, dl)| enabled(dl) && !ducklakes.get(*name).is_some_and(|cur| enabled(cur)))
@@ -76,8 +72,8 @@ pub async fn sync_ducklake_maintenance_schedules<'c>(
 ///
 /// Always `Ok(None)` in the public build: the caller falls through to normal
 /// script resolution, so a pre-existing user schedule under a real
-/// `ducklake_maintenance` folder keeps running, while a managed row left over
-/// from an enterprise period fails script resolution with NotFound and is
+/// `ducklake_maintenance` folder keeps running, while a leftover managed row
+/// fails script resolution with NotFound and is
 /// auto-disabled with `schedule.error` recorded by the post-completion
 /// scheduler.
 pub async fn build_maintenance_schedule_payload<'c>(

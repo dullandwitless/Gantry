@@ -11,10 +11,9 @@
 //! This is the MDC-equivalent for windmill: a tokio task-local that carries
 //! request/job identifiers from the entry point (axum middleware in
 //! windmill-api, job execution wrapper in windmill-worker) to log emission
-//! sites. The EE OTEL log bridge reads this at event time and attaches the
-//! fields to exported LogRecords, so Sentry / OTLP backends can filter logs
-//! by workspace_id, email, script_path, etc., without joining against
-//! traces.
+//! sites. An OTEL log bridge can read this at event time and attach the
+//! fields to exported LogRecords; the one in `otel_oss` is a stub that
+//! exports nothing.
 //!
 //! The context is stored as `ArcSwap<LogContext>` inside the task-local,
 //! which means reads are effectively free (atomic load of an Arc) and

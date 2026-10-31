@@ -1,5 +1,5 @@
-//! Who may read and change a data table's grants and owners. On the Enterprise Edition: its
-//! administrators, from the workspace that governs it. Without it: nobody. Each refusal is decided
+//! Who may read and change a data table's grants and owners: nobody, since data table roles
+//! are not implemented. Each refusal is decided
 //! before anything connects to the data table, so the fixture's database never has to exist.
 
 use serde_json::{json, Value};

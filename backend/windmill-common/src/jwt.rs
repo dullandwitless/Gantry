@@ -66,7 +66,7 @@ pub async fn generate_signature(header_and_payload: &str) -> anyhow::Result<Stri
 
 /// The signing algorithm a JWK names in its `alg`, or `None` when it names none (or one
 /// that is not a signing algorithm, e.g. `RSA-OAEP`). The only place that reads the
-/// field, so callers, including EE ones, stay agnostic of how `jsonwebtoken` models it.
+/// field, so callers stay agnostic of how `jsonwebtoken` models it.
 pub fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<jsonwebtoken::Algorithm> {
     // `alg` is a `KeyAlgorithm` (signing and encryption algorithms alike); only the
     // signing subset maps onto `Algorithm`.

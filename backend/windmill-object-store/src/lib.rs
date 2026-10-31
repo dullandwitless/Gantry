@@ -311,9 +311,9 @@ pub async fn reload_cache_object_store_override(
         return ObjectStoreReload::Never;
     };
 
-    // Enterprise-only, so anything else — Community, including a CE build reaching this through
-    // the config-as-code API, and Pro — must not get a store, and a plan that stops being
-    // Enterprise must drop one loaded while it still was.
+    // Allowed only on the Enterprise plan, so anything else — Community (which `get_license_plan`
+    // always returns here), including through the config-as-code API, and Pro — must not get a
+    // store, and a plan that stops being Enterprise must drop one loaded while it still was.
     if !matches!(get_license_plan().await, LicensePlan::Enterprise) {
         tracing::error!(
             "Object store cache override requires an enterprise license, ignoring it for this worker group"

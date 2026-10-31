@@ -1,7 +1,6 @@
-//! OSS fallback for anonymous feature-usage collection.
+//! Stub for anonymous feature-usage collection.
 //!
-//! Collection is a `private` feature (see `feature_usage_ee`). The public build
-//! never sends a stats payload (`stats_oss`), so counting anything would only
+//! Collection is not implemented. The build never sends a stats payload (`stats_oss`), so counting anything would only
 //! write rows nothing reads: every entry point here is inert, and the
 //! `log_feature_usage` endpoint accepts its posts without recording them.
 

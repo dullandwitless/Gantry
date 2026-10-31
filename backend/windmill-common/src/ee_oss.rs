@@ -47,7 +47,7 @@ pub enum LicensePlan {
 }
 
 pub async fn get_license_plan() -> LicensePlan {
-    // Implementation is not open source
+    // Stub: not implemented.
     return Community;
 }
 

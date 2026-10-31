@@ -2,7 +2,6 @@
 
 - **Coding patterns**: MUST use the `rust-backend` skill when writing Rust code
 - **Validation**: `docs/validation.md` — which `cargo check` flags to use
-- **Enterprise**: `docs/enterprise.md` — EE file conventions and PR workflow
 - **DB schema**: `backend/summarized_schema.txt`
 - **API routes entry point**: `windmill-api/src/lib.rs`
 - **OpenAPI spec**: `windmill-api/openapi.yaml`
@@ -24,8 +23,8 @@
 
 The dev backend runs under `cargo watch` and is launched by default with **only
 `--features quickjs`** (see the backend pane). That baseline compiles fast but
-**deliberately omits most functionality** — notably S3/object storage, the S3 proxy, all
-EE code, MCP, and every non-JS language runtime. A running server never gains a feature you
+**deliberately omits most functionality** — notably S3/object storage, the S3 proxy, MCP,
+and every non-JS language runtime. A running server never gains a feature you
 didn't compile in: feature-gated routes 404 or return a `"requires <feature>"` stub. So if
 you touch code behind a feature gate, or need to *exercise* such a feature at runtime, you
 MUST **restart the backend with the appropriate features** for what you're working on.
@@ -65,7 +64,7 @@ and the rest of the worktree environment. Scope every kill to this worktree — 
 
    ```bash
    herdr pane send-keys <pane_id> C-c
-   herdr pane run <pane_id> 'PORT=$BACKEND_PORT cargo watch -x "run --features quickjs,private,parquet"'
+   herdr pane run <pane_id> 'PORT=$BACKEND_PORT cargo watch -x "run --features quickjs,parquet"'
    # under webmux: tmux send-keys -t "$WIN.<idx>" C-c, then the same command line with Enter
    ```
 
@@ -116,9 +115,7 @@ only what you need — build time scales with the set.
 | Feature | Enables | Need it for |
 |---|---|---|
 | `quickjs` | Embedded JS engine for inline JS eval (the default dev baseline). | Keep in every dev set. |
-| `private` | Compiles the `*_ee.rs` files (symlinked from `windmill-ee-private`). Gates **all** EE code, including the real S3 helpers, the S3 proxy, and advanced S3 permission checks. | Any EE code path, S3/object storage. |
-| `enterprise` | EE business logic (autoscaling, SAML hooks, advanced S3 rule **enforcement**, WAP, forks, …). Pulls in `license`. | Running EE features. Advanced S3 permission rules only take effect with this. |
-| `license` | License-key/plan plumbing (`LICENSE_KEY`). Pulled in by `enterprise`. Having the feature compiled does **not** require a license *key* at runtime — CE defaults to a free plan and most EE paths still run keyless. | License-gated behavior. |
+| `license` | License-key plumbing (`LICENSE_KEY`). The plan stays Community either way: `get_license_plan` (`windmill-common/src/ee_oss.rs`) always returns it. | License-key handling. |
 | `parquet` | S3/object-storage support: the `job_helpers/*` and `apps_u/*` S3 endpoints, parquet/CSV preview, workspace large-file storage. Without it those routes return `"requires parquet"`. | Anything touching S3/object storage or datasets. |
 | `duckdb` | DuckDB script executor (also needs the runner binary — see above). | DuckDB scripts, DuckLake. |
 | `python` `rust` `php` `java` `ruby` `csharp` `nu` `deno_core` `mysql` `mssql` `bigquery` `snowflake` `oracledb` `rlang` | Each enables that language/DB runtime for job execution. | Running jobs in that language. |
@@ -134,9 +131,8 @@ minimal explicit set for dev.
 | Goal | `--features` |
 |---|---|
 | Plain dev baseline (JS eval only) | `quickjs` |
-| S3 / object storage / datasets (CE) | `quickjs,private,parquet` |
-| S3 + EE (advanced S3 rules, on-behalf app reads, WAP, forks) | `quickjs,enterprise,private,parquet` |
-| DuckLake / DuckDB (CE) | `quickjs,duckdb,parquet,private` (+ build the runner) |
+| S3 / object storage / datasets | `quickjs,parquet` |
+| DuckLake / DuckDB | `quickjs,duckdb,parquet` (+ build the runner) |
 | + Python jobs | append `,python` |
 
 ## Workspace object storage in dev — use the local filesystem
@@ -145,8 +141,7 @@ For a dev workspace you don't need MinIO/S3: use the built-in **`FilesystemStora
 storage (a root path on local disk). It is a **debug-build affordance only** — every site that
 builds a filesystem object store calls `ensure_filesystem_storage_allowed`, so release builds
 refuse it, and the settings UI never offers it — so set it via the API on a `cargo run`/`cargo
-test` binary. Requires the backend built with `parquet` (+ `private` for the real S3 helpers,
-+ `enterprise` if you want advanced permission rules enforced):
+test` binary. Requires the backend built with `parquet`:
 
 ```bash
 curl -X POST "$BASE/api/w/<ws>/workspaces/edit_large_file_storage_config" \
@@ -155,8 +150,8 @@ curl -X POST "$BASE/api/w/<ws>/workspaces/edit_large_file_storage_config" \
        "public_resource":false,"advanced_permissions":null,"secondary_storage":{}}}'
 ```
 
-Optional `advanced_permissions` (EE) is a list of `{"pattern":"<glob>","allow":"read[,write,delete,list]"}`
-rules: admins bypass them, non-admins are confined to matching grants. Uploads/reads then flow
+Optional `advanced_permissions` is a list of `{"pattern":"<glob>","allow":"read[,write,delete,list]"}`
+rules. It is stored with the config, but nothing in Gantry enforces it. Uploads/reads then flow
 through the normal `job_helpers/*` (viewer-scoped) and `apps_u/*` (app-author on-behalf) S3
 endpoints. Caveat: direct DuckDB access rejects filesystem stores (`"Filesystem is not supported
 in DuckDB"`) — DuckLake/datatable go through the S3 proxy instead, which works.
@@ -171,11 +166,9 @@ are silent-ish, so agents lose time. Verify feature names against `backend/Cargo
 
 | Goal | Command |
 |---|---|
-| CE DuckLake (DuckDB scripts + S3 proxy) | `cargo run --features quickjs,duckdb,parquet,private` |
+| DuckLake (DuckDB scripts) | `cargo run --features quickjs,duckdb,parquet` |
 | + Python scripts | add `,python` |
-| EE features (WAP, partitioning, forks, …) | add `,enterprise,license` |
 
-`enterprise` already pulls in `license`, but list both when you want the license-gated paths.
 `quickjs` is for JS eval, not DuckLake per se — keep it if your baseline build had it.
 
 **Before running any DuckDB script**, build the runner (see the bullet above):
@@ -189,14 +182,12 @@ are silent-ish, so agents lose time. Verify feature names against `backend/Cargo
    `"Duck DB requires the duckdb feature to be enabled"` (`windmill-worker/src/worker.rs`). Fix:
    compile with `--features duckdb`.
 2. **DuckLake writes 404 (no S3 proxy).** The workspace S3 proxy (`/w/{ws}/s3_proxy/*`) that
-   DuckLake uses for reads/writes only mounts the real service under
-   `#[cfg(all(feature = "private", feature = "parquet"))]` (`windmill-api/src/s3_proxy_oss.rs`);
-   otherwise it's an empty router and every proxied request 404s. Fix: compile with **both**
-   `private` and `parquet`.
+   DuckLake uses for reads/writes is an empty router in Gantry
+   (`windmill-api/src/s3_proxy_oss.rs`), so every proxied request 404s whatever the features.
 
 ## Cloud vs self-hosted gating
 
-The `cloud` cargo feature is compiled into **all** EE builds, so `#[cfg(feature = "cloud")]` is **not** a "cloud-only" runtime gate — it only means the code is present. The real gate for behavior specific to the managed cloud (app.windmill.dev) is the runtime flag `*CLOUD_HOSTED` (`windmill_common::worker::CLOUD_HOSTED`, from the `CLOUD_HOSTED` env var; note it's loaded from `.env` via `dotenv`, so it won't show in `/proc/<pid>/environ` — check the running behavior, not the exec env).
+The `cloud` cargo feature is part of the `ee_core` bundle (so of `ee` and `ee_rhel`), so `#[cfg(feature = "cloud")]` is **not** a "cloud-only" runtime gate — it only means the code is present. The real gate for behavior specific to the managed cloud (app.windmill.dev) is the runtime flag `*CLOUD_HOSTED` (`windmill_common::worker::CLOUD_HOSTED`, from the `CLOUD_HOSTED` env var; note it's loaded from `.env` via `dotenv`, so it won't show in `/proc/<pid>/environ` — check the running behavior, not the exec env).
 
 Cloud-only logic must be behind `if *CLOUD_HOSTED { ... }`: feature-gate the helper so it compiles, then **runtime-gate the call**. `#[cfg(feature = "cloud")]` on its own is only sufficient for:
 - pure helper/struct definitions (they only run when a gated caller invokes them),

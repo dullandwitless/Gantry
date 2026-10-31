@@ -73,7 +73,6 @@ pub fn workspaced_service() -> Router {
     #[cfg(feature = "oauth2")]
     let router = router.route("/connect_slack", post(workspace_connect_slack));
 
-    #[cfg(not(feature = "stripe"))]
     router
 }
 
@@ -162,7 +161,7 @@ pub(crate) async fn edit_copilot_config(
         crate::ai_free_tier_oss::free_tier_copilot_config(&db, &authed.email).await?
     {
         // Same fallback as get_copilot_info: with nothing configured, surface Windmill's free
-        // tier (EE-only) so clearing a workspace provider activates it immediately, instead of
+        // tier (a stub that never opts in) so clearing a workspace provider activates it immediately, instead of
         // returning an empty config that disables AI until the next page reload re-fetches it.
         free_config
     } else {
@@ -231,7 +230,7 @@ async fn get_copilot_info(
         } else if let Some(free_config) =
             crate::ai_free_tier_oss::free_tier_copilot_config(&db, &authed.email).await?
         {
-            // Nothing configured: fall back to Windmill's free tier (EE-only). The config
+            // Nothing configured: fall back to Windmill's free tier (a stub that never opts in). The config
             // carries a `free_tier` marker even once the user's grant is spent — with no
             // providers, but telling the client *why* AI is off.
             free_config

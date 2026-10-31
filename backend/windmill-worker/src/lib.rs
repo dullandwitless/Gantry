@@ -57,8 +57,6 @@ mod mysql_executor;
 mod nsjail_compat;
 #[cfg(feature = "nu")]
 mod nu_executor;
-#[cfg(feature = "oracledb")]
-mod oracledb_executor;
 mod otel_oss;
 mod otel_tracing_proxy_oss;
 pub mod pg_executor;

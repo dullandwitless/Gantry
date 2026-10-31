@@ -43,7 +43,7 @@ pub fn is_user_token(label: Option<&str>) -> bool {
                 && l != "debugger-token"
                 && !l.starts_with("mcp-oauth-")
                 // Short-lived tokens the server mints per app open or per service-account
-                // impersonation (EE `users_ee.rs`) and nobody manages, so an expiry warning
+                // impersonation and nobody manages, so an expiry warning
                 // for one is noise.
                 && !l.starts_with(APP_EMBED_TOKEN_LABEL_PREFIX)
                 && !l.starts_with(RAW_APP_SDK_TOKEN_LABEL_PREFIX)

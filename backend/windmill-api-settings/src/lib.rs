@@ -781,11 +781,10 @@ fn is_workspace_fairness_setting(key: &str) -> bool {
     )
 }
 
-/// Enterprise gate for the workspace-fairness settings. Workspace fairness is
-/// only useful on multi-tenant clusters where one workspace can starve other
-/// workspaces sharing the same worker pool, and the feature is licensed as
-/// part of Enterprise. Non-EE installs are rejected at write time; the runtime
-/// dispatch additionally honours the `WORKSPACE_FAIRNESS_ENABLED` toggle.
+/// License gate for the workspace-fairness settings: allowed only on the
+/// Enterprise plan, which `get_license_plan` never returns in Gantry, so
+/// enabling writes are always rejected. The runtime dispatch additionally
+/// honours the `WORKSPACE_FAIRNESS_ENABLED` toggle.
 async fn workspace_fairness_settings_allowed() -> bool {
     matches!(get_license_plan().await, LicensePlan::Enterprise)
 }
@@ -833,17 +832,16 @@ pub async fn set_global_setting_internal(
         value
     };
 
-    // EE gate for workspace-fairness settings. Workspace fairness only matters
-    // on multi-tenant clusters; it is licensed as an Enterprise feature so the
-    // setter rejects writes from non-EE builds. Disabling/clearing writes are
-    // *always* allowed regardless of license, so an admin who downgrades from
-    // EE (or imports a row from a cloned EE DB) can always turn the cap off:
+    // License gate for workspace-fairness settings (see
+    // `workspace_fairness_settings_allowed`). Disabling/clearing writes are
+    // *always* allowed regardless of license, so an admin who imports a row
+    // from another database can always turn the cap off:
     //   - `Null` / empty-string  → row delete
     //   - `Bool(false)` on `workspace_fairness_enabled` → explicit disable
     // Without the `Bool(false)` carve-out, a stale `enabled=true` row from a
     // downgrade would be impossible to flip off through the normal API/UI
     // and the runtime path (which only checks the toggle) would keep
-    // throttling.
+    // reading it as on.
     let is_clearing_value = matches!(&value, serde_json::Value::Null)
         || matches!(&value, serde_json::Value::String(s) if s.trim().is_empty())
         || (key == WORKSPACE_FAIRNESS_ENABLED_SETTING
@@ -1325,8 +1323,8 @@ async fn set_instance_config(
             .iter()
             .any(|(key, _)| key == AI_CONFIG_SETTING);
 
-        // Mirror the per-key EE gate in `set_global_setting_internal`. Without
-        // this, the bulk endpoint would let a non-EE superadmin persist
+        // Mirror the per-key license gate in `set_global_setting_internal`. Without
+        // this, the bulk endpoint would let an unlicensed superadmin persist
         // `workspace_fairness_*` rows even though the per-key API rejects them.
         // Only block *non-disabling* upserts; deletes are allowed everywhere
         // (already filtered into `settings_diff.removals`) and a
@@ -2128,10 +2126,6 @@ async fn drop_custom_instance_pg_database(
 }
 
 // ============================================================================
-// Secret Backend Settings (HashiCorp Vault Integration) - Enterprise Edition
-// ============================================================================
-
-// ============================================================================
 // JWKS Endpoint for Vault JWT Authentication
 // ============================================================================
 
@@ -2141,11 +2135,7 @@ pub struct JwksResponse {
     pub keys: Vec<serde_json::Value>,
 }
 
-/// Fallback JWKS endpoint used when OIDC support is not compiled in.
-///
-/// When built with `private` + `enterprise` + `openidconnect`, the route in
-/// `windmill-api` dispatches to `oidc_oss::jwks` (re-exported from
-/// `oidc_ee::jwks`) instead, which serves the actual public keys.
+/// JWKS endpoint served at `/.well-known/jwks.json`. It returns an empty key set.
 pub async fn get_jwks() -> JsonResult<JwksResponse> {
     Ok(Json(JwksResponse { keys: vec![] }))
 }

@@ -1,8 +1,8 @@
 #![cfg(feature = "parquet")]
 //! Opt-in historical backfill of audit logs to the instance object store.
 //!
-//! The steady-state exporter (the EE `export_audit_logs_to_object_store`) cursors
-//! on transaction xmin and, by design, only exports rows committed *after* the
+//! The steady-state exporter (`export_audit_logs_to_object_store`, a no-op stub
+//! here) is designed to cursor on transaction xmin and, by design, only exports rows committed *after* the
 //! feature was enabled — it never rescans history (an `age(xmin)` predicate is
 //! unindexable, so scanning the whole partitioned table can't survive a
 //! `statement_timeout`). This module covers the complementary need: exporting a

@@ -4995,7 +4995,7 @@ async fn pull_single_job_and_mark_as_running_no_concurrency_limit<'c>(
                 return Ok((None, false));
             }
 
-            // Workspace fairness (Enterprise): if the fairness refresh has flagged
+            // Workspace fairness: if the fairness refresh has flagged
             // any overloaded workspaces, this pull is randomly routed between two
             // pull queries:
             //   * with probability `(cap + ε)/100`, the standard query (capped
@@ -7293,8 +7293,8 @@ async fn push_inner<'c, 'd>(
             }
         }
         JobPayload::DeploymentCallback { path, debouncing_settings, concurrency_key_append } => {
-            // `resolve_concurrency_key` prepends `{workspace_id}/` on cloud builds
-            // (compiled into every EE build), so that is what the key must leave room
+            // `resolve_concurrency_key` prepends `{workspace_id}/` on `cloud` builds,
+            // so that is what the key must leave room
             // for here.
             #[cfg(feature = "cloud")]
             let reserved_prefix_len = workspace_id.len() + 1;
@@ -7355,7 +7355,7 @@ async fn push_inner<'c, 'd>(
 
     let final_priority: Option<i16>;
     {
-        // priority is only available on EE. Do not compute it on CE
+        // Script-level priority is not implemented.
         final_priority = None;
     }
     // prioritize flow steps to drain the queue faster

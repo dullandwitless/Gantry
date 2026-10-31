@@ -1813,7 +1813,7 @@ pub struct EmbedTokenResponse {
 /// mints a token on behalf of `opt_authed` unconditionally (DB access remains
 /// gated by the viewer's own RLS, but the token's existence is not access-checked
 /// here). All current call sites (`get_app_embed_token`,
-/// `get_app_embed_token_for_path`, and the EE custom-path variant) do this.
+/// and `get_app_embed_token_for_path`) do this.
 ///
 /// Scope confinement IS enforced here: the minted scopes must be within the
 /// caller's own (`ensure_scopes_within_caller`), so a scope-restricted bearer
@@ -6988,7 +6988,6 @@ mod embed_token_tests {
     /// token is confined to its OWN app:
     /// - `apps:run:<path>` — `execute_component`.
     /// - `apps:read:<path>` — `get_app` (apps/get/p), `get_public_app_by_secret`,
-    ///   the EE custom-path `get_public_app_by_custom_path`, and
     ///   `download_s3_file_from_app`.
     /// This blocks cross-app execution, definition reads (by secret / custom path),
     /// and S3 file reads through another app's on-behalf policy.

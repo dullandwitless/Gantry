@@ -210,7 +210,7 @@ async fn test_flow_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // --- toggle_workspace_error_handler (EE-gated, expect 400 in OSS) ---
+    // --- toggle_workspace_error_handler (expect 400) ---
     let resp = authed(client().post(flow_url(
         port,
         "toggle_workspace_error_handler",

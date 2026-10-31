@@ -862,13 +862,13 @@ pub struct BillableSeats {
 
 /// Guests are free up to `FREE_GUESTS_PER_WINDOW` distinct emails over the trailing
 /// `GUEST_WINDOW_DAYS`. Past that, an Enterprise plan meters them, `GUESTS_PER_SEAT`
-/// guests to one seat, while every other plan and build stops admitting new emails.
+/// guests to one seat, while every other plan stops admitting new emails.
 pub const GUEST_WINDOW_DAYS: i32 = 30;
 pub const FREE_GUESTS_PER_WINDOW: i64 = 100;
 pub const GUESTS_PER_SEAT: i64 = 4;
 
 /// Whether guests past the allowance are metered (Enterprise plan) rather than refused.
-/// A build without `enterprise` has no plan and is capped, like a Pro key.
+/// Always `false` in this build: guests are capped, like a Pro key.
 pub async fn guests_are_metered() -> bool {
     {
         false
@@ -1627,7 +1627,7 @@ pub enum DataTableCatalogResourceType {
     #[strum(serialize = "postgres")]
     Postgresql,
     Instance,
-    /// On the external instance cluster ([`crate::external_instance_pg`]). Enterprise Edition.
+    /// On the external instance cluster ([`crate::external_instance_pg`]), which is not implemented.
     #[serde(rename = "external_instance")]
     #[strum(serialize = "external_instance")]
     ExternalInstance,
@@ -2577,7 +2577,7 @@ pub enum DucklakeForkBehavior {
     Shared,
 }
 
-/// Scheduled maintenance for a ducklake (enterprise): snapshot expiry,
+/// Scheduled maintenance for a ducklake (not implemented; enabling it is refused): snapshot expiry,
 /// adjacent-file compaction and orphaned-file cleanup, run as a managed
 /// per-lake schedule. Not mirrored in `instance_config::Ducklake`:
 /// instance-level lakes have no workspace to schedule into.
@@ -2671,7 +2671,7 @@ pub enum DucklakeCatalogResourceType {
     Postgresql,
     Mysql,
     Instance,
-    /// On the external instance cluster ([`crate::external_instance_pg`]). Enterprise Edition.
+    /// On the external instance cluster ([`crate::external_instance_pg`]), which is not implemented.
     #[serde(rename = "external_instance")]
     #[strum(serialize = "external_instance")]
     ExternalInstance,

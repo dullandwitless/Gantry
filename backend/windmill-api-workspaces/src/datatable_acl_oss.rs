@@ -6,11 +6,10 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-//! Where the ACL planner comes from: the enterprise one, or a refusal.
+//! The ACL planner: a refusal.
 //!
-//! Data table roles are an Enterprise Edition feature, and so is everything here — reading who
-//! owns what included. `private` alone is not that edition — community builds carry it — so the
-//! planner is behind `enterprise` as well.
+//! Data table roles are not implemented, and neither is anything here — reading who owns what
+//! included.
 
 use {
     crate::datatable_acl::{AclChange, AclPlan, AclTarget, CatalogFacts},

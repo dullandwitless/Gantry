@@ -429,13 +429,10 @@ impl From<KnownAdapter> for DbtAdapter {
     }
 }
 
-/// Whether this build may use the enterprise-only adapters.
+/// Whether this build may use the enterprise-only adapters: never.
 ///
-/// Two conditions, both required. `LICENSE_KEY_VALID` alone is not enough: the
-/// OSS variant of `ee_oss` initializes it to `true`, so reading it on a CE
-/// build would wave everything through. The `cfg` establishes it is an
-/// enterprise build; the atomic then reports whether that build's key actually
-/// verified.
+/// It does not read `LICENSE_KEY_VALID`, which `ee_oss` initializes to `true`,
+/// so reading it would wave everything through.
 fn enterprise_licensed() -> bool {
     {
         false

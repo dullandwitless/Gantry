@@ -10,7 +10,6 @@
 //! ## Requirements
 //!
 //! - PostgreSQL database running locally
-//! - Enterprise features enabled
 //!
 //! ## Running the tests
 //!
@@ -18,10 +17,10 @@
 //!
 //! ```bash
 //! # Run all instance group auto-add tests
-//! cargo test -p windmill --test instance_group_auto_add --features private,enterprise -- --ignored --nocapture
+//! cargo test -p windmill --test instance_group_auto_add -- --ignored --nocapture
 //!
 //! # Run a specific test
-//! cargo test -p windmill --test instance_group_auto_add --features private,enterprise -- --ignored test_role_precedence --nocapture
+//! cargo test -p windmill --test instance_group_auto_add -- --ignored test_role_precedence --nocapture
 //! ```
 
 mod tests {

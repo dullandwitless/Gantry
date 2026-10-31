@@ -111,9 +111,9 @@ pub async fn handle_bash_job(
     }
 
     // `#ssh <resource_path>` reroutes execution to a remote host over SSH
-    // (enterprise feature). The script runs on the host described by the
-    // `ssh_target` resource instead of on this worker. The OSS build returns a
-    // clear "enterprise feature" error from the stub.
+    // The script would run on the host described by the `ssh_target`
+    // resource instead of on this worker. The SSH executor is a stub that
+    // returns an error.
     if let Some(ssh_path) = windmill_common::worker::BashAnnotations::ssh_target(content) {
         if annotation.no_network {
             return Err(Error::ExecutionErr(

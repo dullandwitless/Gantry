@@ -10,7 +10,8 @@
 //!
 //! This module provides a trait-based abstraction for secret storage,
 //! allowing secrets to be stored in the database (default) or in external
-//! vaults like HashiCorp Vault (Enterprise Edition).
+//! vaults like HashiCorp Vault. Only the database backend is implemented;
+//! the external ones are stubs.
 
 pub mod database;
 pub mod resolver;
@@ -39,7 +40,6 @@ use crate::error::Result;
 ///
 /// Implementations of this trait handle the storage and retrieval of secrets.
 /// The default implementation stores secrets encrypted in the database.
-/// Enterprise Edition supports HashiCorp Vault as an alternative backend.
 #[async_trait]
 pub trait SecretBackend: Send + Sync {
     /// Retrieve a secret value
@@ -85,13 +85,13 @@ pub trait SecretBackend: Send + Sync {
 pub enum SecretBackendConfig {
     /// Store secrets encrypted in the database (default behavior)
     Database,
-    /// Store secrets in HashiCorp Vault (Enterprise Edition only)
+    /// Store secrets in HashiCorp Vault (stub: falls back to the database backend)
     HashiCorpVault(VaultSettings),
-    /// Store secrets in Azure Key Vault (Enterprise Edition only)
+    /// Store secrets in Azure Key Vault (stub: falls back to the database backend)
     AzureKeyVault(AzureKeyVaultSettings),
-    /// Store secrets in AWS Secrets Manager (Enterprise Edition only)
+    /// Store secrets in AWS Secrets Manager (stub: falls back to the database backend)
     AwsSecretsManager(AwsSecretsManagerSettings),
-    /// Read secrets from any HTTPS secret store (Enterprise Edition only, read-only)
+    /// Read secrets from any HTTPS secret store (read-only; stub: falls back to the database backend)
     HttpStore(HttpStoreSettings),
 }
 

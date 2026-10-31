@@ -23,8 +23,7 @@ fn authed(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuil
     builder.header("Authorization", format!("Bearer {}", token))
 }
 
-/// Community and Pro are capped, Enterprise is metered. Only a build with both
-/// `private` (the key id) and `enterprise` (the plan read) can meter; every other build
+/// Community and Pro are capped, Enterprise is metered. This build never meters, so it
 /// is capped whatever this says.
 fn set_plan(pro: bool) {
     let _ = pro;

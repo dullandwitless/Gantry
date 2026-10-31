@@ -45,7 +45,7 @@ pub async fn get_workspace_s3_resource<'c>(
     _w_id: &str,
     _storage: Option<String>,
 ) -> windmill_common::error::Result<(Option<bool>, Option<ObjectStoreResource>)> {
-    // implementation is not open source
+    // Stub: not implemented.
     Ok((None, None))
 }
 
@@ -93,9 +93,7 @@ pub async fn upload_file_internal(
     ))
 }
 
-// These stubs stand in for the CE quota helpers in a pure-OSS build; their only
-// callers (apps.rs / args.rs uploads) are `not(enterprise)`, so gate them the
-// same way — an enterprise-without-private build compiles neither.
+// Stubs for the storage quota helpers used by apps.rs / args.rs uploads.
 #[cfg(feature = "parquet")]
 pub async fn ce_storage_quota_remaining(
     _db: &DB,
@@ -177,9 +175,8 @@ pub struct DeleteS3FileQuery {
     pub s3_resource_path: Option<String>,
 }
 
-// Stubs for the app-scoped S3 display ops (mirrors the EE `*_internal` helpers +
-// their query/response structs). Only compiled for a CE build with `parquet` but
-// without `private`; the real implementations live in `job_helpers_ee.rs`.
+// Stubs for the app-scoped S3 display ops and their query/response structs.
+// Only compiled with `parquet`.
 #[cfg(feature = "parquet")]
 mod app_s3_display_stubs {
     use super::*;
@@ -197,8 +194,8 @@ mod app_s3_display_stubs {
     #[derive(Serialize)]
     pub struct LoadFileMetadataResponse {}
 
-    // Mirror the EE query's required/optional fields so the CE build enforces the
-    // same query contract (e.g. the mandatory byte range) at the extraction layer.
+    // Keep the required/optional fields so the build enforces the
+    // query contract (e.g. the mandatory byte range) at the extraction layer.
     #[derive(Deserialize)]
     #[allow(dead_code)]
     pub struct LoadFilePreviewQuery {

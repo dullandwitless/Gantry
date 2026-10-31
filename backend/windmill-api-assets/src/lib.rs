@@ -119,8 +119,7 @@ async fn list_partitions(
     Ok(Json(rows))
 }
 
-// Only the EE `backfill` module reads the fields; the OSS stub errors without
-// touching them.
+// The `backfill` stub errors without reading the fields.
 #[allow(dead_code)]
 #[derive(Deserialize)]
 struct PartitionsInRangeQuery {
@@ -152,10 +151,9 @@ struct PartitionsInRangeResponse {
 
 // Backfill range preview: every partition the producer's `// partitioned` spec
 // expects in `[from, to]`, joined with what `materialized_partition` records —
-// the missing/failed subset is the backfill worklist. The logic is in the
-// `backfill` module pair: EE resolves and enumerates, the OSS stub errors
-// (single-partition runs stay available everywhere; fanning out over a range
-// is enterprise).
+// the missing/failed subset is the backfill worklist. The `backfill` module is
+// a stub that refuses the request; single-partition runs with an explicit
+// `partition` arg stay available.
 async fn list_partitions_in_range(
     authed: ApiAuthed,
     Path(w_id): Path<String>,
@@ -726,9 +724,9 @@ struct GraphRunnableNode {
     freshness: Option<String>,
     // Completion time of the most recently started successful run of this
     // pipeline member. The canvas checks it against the `// freshness` window
-    // to color the badge fresh/stale. The badge itself is passive; on EE the
-    // freshness watchdog (windmill-queue) separately re-runs stale
-    // unpartitioned producers. Absent when no successful run is visible to
+    // to color the badge fresh/stale. The badge itself is passive, and the
+    // freshness watchdog in windmill-queue is a no-op stub, so nothing re-runs
+    // stale producers. Absent when no successful run is visible to
     // the caller (job RLS applies).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     last_success_at: Option<chrono::DateTime<chrono::Utc>>,

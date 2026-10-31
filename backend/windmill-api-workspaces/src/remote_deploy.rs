@@ -34,7 +34,7 @@ use windmill_common::{
     auth::hash_token,
     error::{error_source_chain, Error, Result},
     ssrf::validate_url_for_ssrf,
-    utils::{configure_client, rd_string, require_admin},
+    utils::{configure_client, rd_string},
     variables::{build_crypt, decrypt, encrypt},
     worker::CLOUD_HOSTED,
     DB,
@@ -294,88 +294,11 @@ async fn get_target(
     Ok((NO_STORE, Json(RemoteDeployStatus { target, connection })))
 }
 
-#[derive(Deserialize)]
-struct SetRemoteDeployTarget {
-    target: Option<RemoteDeployTarget>,
-}
-
-async fn set_target(
-    authed: ApiAuthed,
-    Extension(db): Extension<DB>,
-    Path(w_id): Path<String>,
-    Json(request): Json<SetRemoteDeployTarget>,
-) -> Result<String> {
-    {
-        return Err(Error::BadRequest(
-            "Deploying to another instance is only available on Windmill Enterprise Edition"
-                .to_string(),
-        ));
-    }
-    // Everyone who connects afterwards hands their token to this URL.
-    require_own_credentials(&authed)?;
-    require_admin(authed.is_admin, &authed.username)?;
-    let target = request
-        .target
-        .map(RemoteDeployTarget::normalized)
-        .transpose()?;
-
-    let mut tx = db.begin().await?;
-    let (base_url, remote_workspace_id) = match &target {
-        Some(t) => (Some(t.base_url.as_str()), Some(t.workspace_id.as_str())),
-        None => (None, None),
-    };
-    audit_log(
-        &mut *tx,
-        &authed,
-        "workspaces.edit_remote_deploy_target",
-        ActionKind::Update,
-        &w_id,
-        None,
-        Some(
-            [
-                ("base_url", base_url.unwrap_or("")),
-                ("remote_workspace_id", remote_workspace_id.unwrap_or("")),
-            ]
-            .into(),
-        ),
-    )
-    .await?;
-    let target_json = target
-        .as_ref()
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|e| Error::internal_err(e.to_string()))?;
-    sqlx::query!(
-        "UPDATE workspace_settings SET remote_deploy_target = $1::jsonb,
-             remote_deploy_target_changed_at = CASE
-                 WHEN remote_deploy_target IS DISTINCT FROM $1::jsonb THEN clock_timestamp()
-                 ELSE remote_deploy_target_changed_at END
-         WHERE workspace_id = $2",
-        target_json,
-        &w_id
-    )
-    .execute(&mut *tx)
-    .await?;
-    // A token is only ever sent to the target it was granted for, so the ones for any other
-    // target are dead credentials.
-    sqlx::query!(
-        "DELETE FROM remote_deploy_token WHERE workspace_id = $1
-           AND ($2::text IS NULL OR base_url <> $2 OR remote_workspace_id <> $3)",
-        &w_id,
-        base_url,
-        remote_workspace_id
-    )
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-
-    Ok(match target {
-        Some(t) => format!(
-            "Workspace {w_id} deploys to {} on {}",
-            t.workspace_id, t.base_url
-        ),
-        None => format!("Removed the remote deploy target of workspace {w_id}"),
-    })
+async fn set_target() -> Result<String> {
+    Err(Error::BadRequest(
+        "Deploying to another instance is only available on Windmill Enterprise Edition"
+            .to_string(),
+    ))
 }
 
 #[derive(Deserialize)]

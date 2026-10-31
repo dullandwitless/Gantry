@@ -501,7 +501,7 @@ lazy_static::lazy_static! {
     /// observed worker-second distribution and the configured cap so that
     /// admission converges to the target *worker-second* share — independent
     /// of how the capped vs uncapped workspaces compare on per-job durations.
-    /// See `workspace_fairness_ee::refresh_overloaded` for the derivation.
+    /// See the `workspace_fairness` module docs for the derivation.
     /// `10_000` (= admit all) is the default until the first refresh
     /// classifies an overloaded set — before that, no workspace is capped so
     /// `should_admit_capped` is moot and "admit all" is the correct no-op.
@@ -1352,8 +1352,9 @@ impl BashAnnotations {
 
     /// If the script declares `#ssh <resource_path>` (a resource path after the
     /// ssh annotation), returns that path. This reroutes execution to a remote
-    /// host over SSH (enterprise feature): the script runs on the host described
-    /// by the `ssh_target` resource at `<resource_path>` instead of on the worker.
+    /// host over SSH: the script would run on the host described by the
+    /// `ssh_target` resource at `<resource_path>` instead of on the worker. The
+    /// SSH executor is a stub that refuses to run it.
     /// The `#ssh $<arg_name>` form returns the `$`-prefixed token verbatim; the
     /// executor resolves it from the job argument of that name at run time.
     ///

@@ -1063,7 +1063,7 @@ async fn without_the_enterprise_edition_a_data_table_under_roles_is_refused_a_co
     use windmill_common::workspaces::{get_datatable_resource_from_db, DatatableAccess};
     initialize_tracing().await;
 
-    // Saved under roles, as an enterprise build left it: refused whoever asks, never `admin`.
+    // Saved under roles, as another build left it: refused whoever asks, never `admin`.
     for access in [DatatableAccess::Unchecked, DatatableAccess::NoIdentity] {
         let err = get_datatable_resource_from_db(&db, "test-workspace", "main", None, access)
             .await

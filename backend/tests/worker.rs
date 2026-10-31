@@ -9,7 +9,7 @@ use sqlx::{types::Uuid, Pool, Postgres};
 use windmill_api_client::types::{CreateFlowBody, RawScript};
 
 #[cfg(feature = "deno_core")]
-use windmill_common::flows::InputTransform;
+use windmill_common::flows::{FlowModule, FlowModuleValue, InputTransform};
 
 #[cfg(any(feature = "python", feature = "deno_core"))]
 use windmill_common::flow_status::RestartedFrom;
@@ -19,9 +19,6 @@ use windmill_common::{
     scripts::ScriptLang,
 };
 use windmill_test_utils::*;
-
-use windmill_common::flows::FlowModule;
-use windmill_common::flows::FlowModuleValue;
 
 // async fn _print_job(id: Uuid, db: &Pool<Postgres>) -> Result<(), anyhow::Error> {
 //     tracing::info!(

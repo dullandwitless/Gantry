@@ -21,7 +21,7 @@ async fn test_remote_deploy_proxy(db: Pool<Postgres>) -> anyhow::Result<()> {
     let port = server.addr.port();
     let base = format!("http://localhost:{port}/api/w/test-workspace/remote_deploy");
 
-    // Planted rather than set through the route, which is enterprise-gated. Unlike the route, it
+    // Planted rather than set through the route, which is refused in this build. Unlike the route, it
     // deletes no token for another target, which is what a connect landing just after the
     // route's cleanup leaves behind.
     let set_target = |base_url: String, workspace_id: &'static str| {

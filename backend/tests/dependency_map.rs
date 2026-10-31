@@ -1,13 +1,17 @@
 use sqlx::{Pool, Postgres};
+#[cfg(feature = "python")]
 use tokio_stream::StreamExt;
 
+#[cfg(feature = "python")]
 use windmill_api_client::types::NewScript;
+#[cfg(feature = "python")]
 use windmill_test_utils::{
     in_test_worker, init_client, listen_for_completed_jobs, rebuild_dmap, ApiServer,
 };
 
 mod dependency_map {
     use super::*;
+    #[cfg(feature = "python")]
     fn quick_ns(
         content: &str,
         language: windmill_api_client::types::ScriptLang,
@@ -49,6 +53,7 @@ mod dependency_map {
             modules: None,
         }
     }
+    #[cfg(feature = "python")]
     async fn init(db: Pool<Postgres>) -> (windmill_api_client::Client, u16, ApiServer) {
         init_client(db).await
     }
@@ -63,6 +68,7 @@ mod dependency_map {
     /// Corrects map according to provided replacements.
     /// Only changes importer_path and/or id
     /// Does not affect imported_path nor kind!
+    #[cfg(feature = "python")]
     fn corrected_dmap(replacements: Vec<(&str, &str)>) -> Vec<(String, String, String, String)> {
         CORRECT_DMAP
             .clone()
@@ -89,6 +95,7 @@ mod dependency_map {
             .collect()
     }
 
+    #[cfg(feature = "python")]
     async fn assert_dmap(
         db: &Pool<Postgres>,
         importer: Option<String>,
@@ -118,6 +125,7 @@ mod dependency_map {
         assert_eq!(dmap, expected);
     }
 
+    #[cfg(feature = "python")]
     lazy_static::lazy_static! {
     pub static ref CORRECT_DMAP: Vec<(&'static str, &'static str, &'static str, &'static str)> =  vec![
         ("f/rel/root_script", "script", "dependencies/test.requirements.in", ""),

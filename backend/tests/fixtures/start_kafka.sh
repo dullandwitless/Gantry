@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts a Kafka broker for trigger_e2e::test_kafka_e2e (Enterprise)
+# Starts a Kafka broker for trigger_e2e::test_kafka_e2e
 #
 # Usage:
 #   ./tests/fixtures/start_kafka.sh        # start
@@ -49,4 +49,4 @@ docker exec "$NAME" /opt/kafka/bin/kafka-topics.sh --create \
 echo "Kafka broker listening on localhost:${PORT} with topic 'windmill-e2e-test'"
 echo ""
 echo "Run the test:"
-echo "  cargo test --test trigger_e2e test_kafka_e2e --features kafka,enterprise,private -- --ignored --nocapture"
+echo "  cargo test --test trigger_e2e test_kafka_e2e --features kafka -- --ignored --nocapture"

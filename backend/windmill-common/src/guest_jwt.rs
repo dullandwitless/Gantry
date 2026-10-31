@@ -87,7 +87,7 @@ pub async fn key_source(db: &DB, w_id: &str) -> Result<Option<GuestJwtKeySource>
     }
     // No workspace key: fall back to the instance issuer, so an operator running one issuer for
     // both `jwt_ext_` and guests configures it once. Verifying it (and granting a *guest*) is
-    // done here in CE; granting a full login from it stays EE (`jwt_ext_`). Not on the shared
+    // done here; granting a full login from it is not implemented. Not on the shared
     // cloud, where one instance issuer must not be trusted to mint guests in every tenant's
     // workspace — there the per-workspace key is the only source.
     if !*crate::worker::CLOUD_HOSTED {

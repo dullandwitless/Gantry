@@ -89,11 +89,6 @@ pub(crate) fn render_relative_python_loader(
     RELATIVE_PYTHON_LOADER.replace("TEMP_SCRIPT_REFS_PLACEHOLDER", &temp_refs_py)
 }
 
-#[cfg(test)]
-pub fn has_relative_imports(content: &str) -> bool {
-    RELATIVE_IMPORT_REGEX.is_match(content)
-}
-
 use crate::{
     check_no_network_jailed,
     common::{

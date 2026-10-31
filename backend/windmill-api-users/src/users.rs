@@ -4428,7 +4428,7 @@ async fn overwrite_global_users() -> JsonResult<String> {
 }
 
 // NOTE: rename_user, update_username_in_workpsace, and RenameUser
-// are in windmill-api (depend on EE secret_backend_ext)
+// are in windmill-api (they depend on its secret_backend_ext)
 
 #[derive(Deserialize)]
 pub struct RequestPasswordReset {
@@ -4554,7 +4554,7 @@ async fn request_password_reset(
     }))
 }
 
-// NOTE: reset_password is in windmill-api (depends on users_oss::hash_password EE dispatch)
+// NOTE: reset_password is in windmill-api (depends on users_oss::hash_password)
 
 #[cfg(test)]
 mod tests {

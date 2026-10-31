@@ -1,6 +1,9 @@
+#[cfg(feature = "parquet")]
 use serde_json::json;
 use sqlx::{Pool, Postgres};
+#[cfg(feature = "parquet")]
 use windmill_common::jobs::{JobPayload, RawCode};
+#[cfg(feature = "parquet")]
 use windmill_common::scripts::ScriptLang;
 use windmill_test_utils::*;
 

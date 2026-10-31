@@ -1,6 +1,7 @@
 mod job_payload {
     use serde_json::json;
     use sqlx::{Pool, Postgres};
+    #[cfg(feature = "deno_core")]
     use windmill_common::flow_status::RestartedFrom;
     use windmill_common::flows::{FlowModule, FlowModuleValue, FlowValue};
     use windmill_common::jobs::JobPayload;
@@ -798,6 +799,7 @@ mod job_payload {
     /// reach a deeper child UUID. Used by nested-restart tests to assert that
     /// preserved iterations / preserved siblings reuse the original child UUID
     /// (and that re-run ones get a new UUID).
+    #[cfg(feature = "deno_core")]
     async fn nested_child_job_id(
         db: &Pool<Postgres>,
         mut job_id: uuid::Uuid,
@@ -812,6 +814,7 @@ mod job_payload {
     /// Look up a single child job UUID from a completed flow's `flow_status` for
     /// a given top-level step (and optional iteration index for ForLoop /
     /// BranchAll containers).
+    #[cfg(feature = "deno_core")]
     async fn child_job_id_for_step(
         db: &Pool<Postgres>,
         flow_job_id: uuid::Uuid,

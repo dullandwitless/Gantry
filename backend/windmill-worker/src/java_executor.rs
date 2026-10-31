@@ -129,15 +129,9 @@ async fn prepare<'a>(
     Ok(())
 }
 
-/// Returns the java home dir to use. If a workspace-specific maven_settings_xml
-/// override exists, writes it to `job_dir/.m2/settings.xml` and returns `job_dir`.
-/// Otherwise returns the global JAVA_HOME_DIR.
-async fn get_java_home_with_ws_settings(
-    job_id: &Uuid,
-    w_id: &str,
-    job_dir: &str,
-    conn: &Connection,
-) -> String {
+/// Returns the java home dir to use: always the global JAVA_HOME_DIR. A workspace-specific
+/// maven_settings_xml override is not applied, and the job log says so.
+async fn get_java_home_with_ws_settings(job_id: &Uuid, w_id: &str, conn: &Connection) -> String {
     let ws_settings_xml = {
         let registries = crate::WORKSPACE_REGISTRIES.read().await;
         registries
@@ -148,15 +142,13 @@ async fn get_java_home_with_ws_settings(
     };
     if let Some(ref content) = ws_settings_xml {
         if !content.trim().is_empty() {
-            {
-                append_logs(
-                    job_id,
-                    w_id,
-                    "Private registry (maven settings.xml) configuration ignored: this feature requires Windmill Enterprise Edition\n".to_string(),
-                    conn,
-                )
-                .await;
-            }
+            append_logs(
+                job_id,
+                w_id,
+                "Private registry (maven settings.xml) configuration ignored: this feature requires Windmill Enterprise Edition\n".to_string(),
+                conn,
+            )
+            .await;
         }
     }
     JAVA_HOME_DIR.to_string()
@@ -224,7 +216,7 @@ pub async fn resolve<'a>(
         } else {
             JAVA_PATH.as_str()
         });
-        let java_home = get_java_home_with_ws_settings(job_id, w_id, job_dir, conn).await;
+        let java_home = get_java_home_with_ws_settings(job_id, w_id, conn).await;
         cmd.env_clear()
             .current_dir(job_dir.to_owned())
             .env("PATH", PATH_ENV.as_str())
@@ -365,7 +357,7 @@ async fn install<'a>(
         workspace_id = %job.workspace_id,
         "JAVA classpath: {}", &classpath
     );
-    let java_home = get_java_home_with_ws_settings(&job.id, &job.workspace_id, job_dir, conn).await;
+    let java_home = get_java_home_with_ws_settings(&job.id, &job.workspace_id, conn).await;
     let (repos, no_default, trust_store_metadata) = (
         get_repos(&job.id, &job.workspace_id, conn).await,
         get_no_default(job.id, &job.workspace_id, conn).await,

@@ -13,8 +13,8 @@
 //! `ALTER ... OWNER TO` or `ALTER DEFAULT PRIVILEGES`, so Postgres is what enforces it.
 //!
 //! Reading is open to anyone who reaches the data table. Planning and applying are for those who
-//! administer it — admins of the workspace that governs it, and superadmins. All of it is
-//! Enterprise Edition ([`crate::datatable_acl_oss`]).
+//! administer it — admins of the workspace that governs it, and superadmins. None of it is
+//! implemented in this build: [`crate::datatable_acl_oss`] refuses it.
 
 use std::collections::BTreeMap;
 

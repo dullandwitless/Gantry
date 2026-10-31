@@ -128,7 +128,7 @@ mod scim_oss;
 mod scripts;
 mod secret_backend_ext;
 mod service_logs;
-// Answering in Slack is only reached from the EE Slack event handlers.
+// Nothing reaches the Slack answering path: there are no Slack event handlers.
 #[allow(dead_code)]
 mod slack_agents;
 mod slack_approvals;
@@ -298,7 +298,7 @@ async fn inject_agent_authed(
     let mut request = request;
 
     // Extract worker name from agent JWT via AgentCache
-    // (OSS returns None; EE decodes the JWT and returns the worker name)
+    // (the stub returns None)
     {
         let extracted = {
             let token = request
@@ -1138,8 +1138,8 @@ pub async fn run_server(
 
     // Seed the per-request LogContext task-local. Registered outside
     // TraceLayer so MyOnResponse::on_response's `"response"` log fires inside
-    // the scope and gets method/uri/workspace_id/email attached by the EE
-    // LogContextBridge.
+    // the scope and gets method/uri/workspace_id/email attached by an OTEL
+    // log bridge, when one is installed.
     let app = app.layer(axum::middleware::from_fn(
         tracing_init::log_context_middleware,
     ));

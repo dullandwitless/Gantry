@@ -1,8 +1,6 @@
-//! OSS fallback for enterprise pipeline features (implementations in
-//! windmill-ee-private, see `pipeline_advanced_ee`): partition backfill
-//! reports that the enterprise edition is required, and materialization-plan
-//! assembly runs the plan verbatim — dbt-like commit-then-test instead of the
-//! enterprise write-audit-publish. (Freshness lives elsewhere: the fresh/stale
+//! Stubs for advanced pipeline features: partition backfill is refused, and
+//! materialization-plan assembly runs the plan verbatim — dbt-like
+//! commit-then-test, with no write-audit-publish. (Freshness lives elsewhere: the fresh/stale
 //! badge is CE in the assets API, the active watchdog is windmill-queue's
 //! `freshness_watchdog`.)
 
@@ -15,10 +13,7 @@ pub fn backfill_todo() -> Error {
 /// Assemble a materialization plan into the statement list the DuckDB executor
 /// runs. The public build executes the plan verbatim — dbt-like
 /// commit-then-test: a failing `// data_test` still fails the run and stops
-/// the cascade, but the written slice stays live. The enterprise
-/// implementation (`pipeline_advanced_ee`) instead restructures the plan into
-/// write-audit-publish, where a failing test rolls the whole write back before
-/// anything is published.
+/// the cascade, but the written slice stays live.
 pub fn finalize_materialize_query(
     plan: windmill_parser::sql_materialize::MaterializePlan,
     _asset_path: &str,

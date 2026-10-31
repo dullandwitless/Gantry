@@ -2,6 +2,8 @@
 //! System One, Cloudflare Workers AI's, which serves each model at its own URL inside an API
 //! envelope, and OpenAI's Decisions API.
 
+#![cfg(feature = "quickjs")]
+
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 use sqlx::{Pool, Postgres};
@@ -60,7 +62,6 @@ async fn start_decision_stub() -> anyhow::Result<u16> {
 
 /// A decision's answers reach later steps as `results.<id>.output`, which a Branch to one after it
 /// routes on.
-#[cfg(feature = "quickjs")]
 #[sqlx::test(fixtures("base"))]
 async fn test_ai_decision_answers_route_a_following_branch(
     db: Pool<Postgres>,

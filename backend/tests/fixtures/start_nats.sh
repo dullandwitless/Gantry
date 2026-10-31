@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts a NATS server for trigger_e2e::test_nats_e2e (Enterprise)
+# Starts a NATS server for trigger_e2e::test_nats_e2e
 #
 # Usage:
 #   ./tests/fixtures/start_nats.sh        # start
@@ -26,4 +26,4 @@ docker run -d --name "$NAME" -p "${PORT}:4222" nats:latest
 echo "NATS server listening on localhost:${PORT}"
 echo ""
 echo "Run the test:"
-echo "  cargo test --test trigger_e2e test_nats_e2e --features nats,enterprise,private -- --ignored --nocapture"
+echo "  cargo test --test trigger_e2e test_nats_e2e --features nats -- --ignored --nocapture"

@@ -16,6 +16,8 @@
  *   USE_QUICKJS_FOR_FLOW_EVAL=1 cargo test -p windmill --features "quickjs,deno_core" --test flow_engine_parity
  */
 
+#![cfg(feature = "deno_core")]
+
 use serde_json::json;
 use sqlx::{Pool, Postgres};
 
@@ -74,7 +76,6 @@ fn static_input<T: serde::Serialize>(key: &str, value: T) -> (String, InputTrans
 // TEST 1: Simple linear flow with input transforms
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_linear_input_transforms(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -144,7 +145,6 @@ export function main(total: number, doubled_items: number[], filtered: number[],
 // TEST 2: For-loop with complex iterator and inner expressions
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_forloop_complex_expressions(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -248,7 +248,6 @@ export function main(user_name: string, user_score: number, bonus: number, index
 // TEST 3: Branch-one with complex conditions
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_branchone_conditions(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -386,7 +385,6 @@ export function main() {
 // TEST 4: Previous result and result aggregation
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_previous_result_aggregation(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -494,7 +492,6 @@ export function main(a_value: number, b_value: number, b_sum: number, combined: 
 // TEST 5: Nested for-loops with complex data
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_nested_complexity(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -592,7 +589,6 @@ export function main(cat_name: string, multiplier: number, values: number[], sum
 // TEST 6: Complex object transformations
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_object_transformations(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -690,7 +686,6 @@ export function main(admins: string[], active_count: number, admin_bonus: number
 // TEST 7: Skip-if with expression evaluation
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_skip_if_expressions(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -789,7 +784,6 @@ export function main(check_val: number, prev: any) {
 // TEST 8: Template literals and string operations
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_template_literals(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -863,7 +857,6 @@ export function main(full_name: string, greeting: string, items_str: string, upp
 // TEST 9: Optional chaining and nullish coalescing
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_optional_chaining(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -943,7 +936,6 @@ export function main(city: string, missing_city: any, null_user_name: any, defau
 // TEST 10: Parallel for-loop with expression-based parallelism
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_parallel_forloop(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1049,7 +1041,6 @@ export function main(original: number, squared: number, cubed: number) {
 // TEST 11: flow_env access in expressions
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_access(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1129,7 +1120,6 @@ export function main(env_name: string, is_debug: boolean, timeout_val: number, a
 // TEST 12: flow_input and flow_env combined with conditionals
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_input_and_env_combined(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1202,7 +1192,6 @@ export function main(effective_limit: number, env_prefix: string, is_prod: boole
 // TEST 13: Optional chaining with results proxy
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_results_optional_chaining(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1349,7 +1338,6 @@ export function main(
 // TEST 14: Large integer handling in results
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_large_integers(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1449,7 +1437,6 @@ export function main(
 // TEST 15: Unicode and emoji handling in results
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_unicode_emoji(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1534,7 +1521,6 @@ export function main(
 // TEST 16: Complex array operations with results
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_complex_array_operations(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1641,7 +1627,6 @@ export function main(
 // TEST 17: Multiline expressions with semicolons and return
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_multiline_expressions(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1758,7 +1743,6 @@ export function main(
 // TEST 18: Spread operators with results
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_spread_with_results(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -1856,7 +1840,6 @@ export function main(
 // TEST 19: Nested for-loop accessing parent step results
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_nested_forloop_results_access(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2001,7 +1984,6 @@ export function main(items: any[], category: string, original_mult: number) {
 // null rather than throwing an error (matching deno_core behavior)
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_results_non_existent_step(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2109,7 +2091,6 @@ export function main(
 // enclosing scope so predicates see the inherited env.
 // =============================================================================
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_skip_if_inside_branchone(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2241,7 +2222,6 @@ export function main(prev: any) {
 // `fetch_root_flow_env` must walk past more than one layer of
 // `payload_from_modules`-constructed FlowValue (each of which has
 // `flow_env = None`) to reach the root's flow_env.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_skip_if_nested_branchone(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2387,7 +2367,6 @@ export function main(prev: any) {
 // `flow_env.X.Y` regex that hits the API fast path). Without flow_env
 // inheritance, QuickJS would see an empty `flow_env` and the expression
 // would NaN/undefined out.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_complex_input_transform_in_branch(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2471,7 +2450,6 @@ export function main(value: number) {
 // None` (worker_flow.rs:3941), so the recursive CTE in `fetch_root_flow_env`
 // must use `parent_job` to walk up. Verify a skip_if inside an iteration
 // sub-flow sees the parent's flow_env.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_skip_if_in_parallel_forloop(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2580,7 +2558,6 @@ export function main() {
 //       NOT merged (current behavior; option (i) per design discussion).
 //   (b) the imported flow defines no flow_env → it inherits from the parent
 //       via the recursive CTE.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_imported_flow_uses_own_env(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2660,7 +2637,6 @@ async fn test_flow_env_imported_flow_uses_own_env(db: Pool<Postgres>) -> anyhow:
     Ok(())
 }
 
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_imported_flow_inherits_when_unset(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2767,7 +2743,6 @@ async fn test_flow_env_imported_flow_inherits_when_unset(db: Pool<Postgres>) -> 
 // must walk via flow_innermost_root_job to find the imported flow's scope,
 // not jump straight to root_job (which would surface the parent's env and
 // give the wrong answer).
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_imported_flow_with_nested_branch(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -2882,7 +2857,6 @@ async fn test_flow_env_imported_flow_with_nested_branch(db: Pool<Postgres>) -> a
 // own or inherited, so its worker skips `fetch_root_flow_env`. With an env two scopes up (root
 // → loop → imported flow without env → parallel loop → leaf) nothing may be marked and the
 // root's value must reach the leaf; with no env anywhere every loop iteration is marked.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_marks_sub_flows_only_without_ancestor_env(
     db: Pool<Postgres>,
@@ -3007,7 +2981,6 @@ async fn test_flow_env_marks_sub_flows_only_without_ancestor_env(
 // stop_after_if predicate sees flow_env. Regression for the eval at line 614
 // of `update_flow_status_after_job_completion_internal` which used to pass
 // `None` for flow_env unconditionally.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_in_stop_after_if(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -3099,7 +3072,6 @@ export function main() {
 // object, i.e. `{ "error": { .., "result": <step result> } }`. With the flag off
 // (the default) the error object carries no `result`. Regression for the
 // early-stop branch in `update_flow_status_after_job_completion_internal`.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_stop_after_if_error_include_result(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -3183,7 +3155,6 @@ export function main() {
 // retry_if predicate sees flow_env. Regression for the two evaluate_retry
 // call sites in `update_flow_status_after_job_completion_internal` (lines
 // 1194 and 1576) which used to pass `None` for flow_env.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_in_retry_if(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -3258,7 +3229,6 @@ export function main() {
 
 // stop_after_all_iters_if predicate sees flow_env. Regression for the
 // signature change to `evaluate_stop_after_all_iters_if`.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_env_in_stop_after_all_iters_if(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
@@ -3363,7 +3333,6 @@ export function main() {
 // flow and embeds the loop's aggregated iteration results under `error.result`.
 // Covers the loop/branch-all path where `nresult` is already populated with the
 // aggregated results (distinct from the per-step fallback to `result`).
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_stop_after_all_iters_if_error_includes_result(
     db: Pool<Postgres>,
@@ -3442,7 +3411,6 @@ export function main(i: number) {
 
 // A `$flow_expr[...]` step tag is resolved from the flow's state before the step is pushed, and
 // one that cannot be resolved fails the step instead of queueing it on a tag no worker serves.
-#[cfg(feature = "deno_core")]
 #[sqlx::test(fixtures("base"))]
 async fn test_flow_expr_step_tag(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;

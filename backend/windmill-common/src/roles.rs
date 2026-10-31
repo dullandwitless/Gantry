@@ -1,8 +1,9 @@
 //! Workspace roles: what a non-admin member may author, manage and see.
 //!
-//! `developer` and `operator` are the default roles. An EE instance defines its own list in the
-//! [`WORKSPACE_ROLES_SETTING`] global setting (at least one role), and a workspace may override any
-//! role's capabilities, or on EE define roles of its own, in `workspace_settings.role_overrides`.
+//! `developer` and `operator` are the default roles, and a workspace may override any role's
+//! capabilities in `workspace_settings.role_overrides`. Custom instance roles (the
+//! [`WORKSPACE_ROLES_SETTING`] global setting) and workspace-only roles are not enabled in this
+//! build: see [`custom_roles_built`] and [`custom_roles_enabled`].
 //! Workspace admin is not a role: it is the `is_admin` flag on top of whichever role a member has,
 //! and holds every capability. See `docs/workspace-roles.md`.
 //!
@@ -350,16 +351,14 @@ pub struct EffectiveRole {
     pub overridden: bool,
 }
 
-/// Whether stored instance roles and workspace-only roles apply: on any EE build. A CE build has
+/// Whether stored instance roles and workspace-only roles apply: never in this build, which has
 /// `developer` and `operator`, which a workspace may still override.
 fn custom_roles_built() -> bool {
     false
 }
 
-/// Whether instance roles and workspace-only roles may be changed: an EE build whose license
-/// verified. A lapsed license freezes them instead of dropping them, since falling back to the
-/// defaults would hand a restricted `developer` everything. The `cfg` is load-bearing: CE's
-/// `LICENSE_KEY_VALID` is always `true`.
+/// Whether instance roles and workspace-only roles may be changed: never in this build. It does
+/// not read `LICENSE_KEY_VALID`, which is always `true` here.
 pub fn custom_roles_enabled() -> bool {
     {
         false
@@ -537,7 +536,7 @@ lazy_static::lazy_static! {
 
 const ROLE_CACHE_TTL_SECS: i64 = 60;
 
-/// The instance's role list. A CE build, or an instance that never configured one, has the
+/// The instance's role list. This build, like an instance that never configured one, has the
 /// default roles. Cached 60s, dropped on every replica when the setting changes.
 pub async fn instance_roles(db: &DB) -> Result<Arc<Vec<RoleDefinition>>> {
     if let Some(roles) = cached_instance_roles() {

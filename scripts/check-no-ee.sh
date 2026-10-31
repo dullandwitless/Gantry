@@ -14,6 +14,11 @@ if hits=$(grep -rnE "$pattern" --include='*.rs' --include='Cargo.toml' backend);
   echo "$hits" >&2
   failed=1
 fi
+if hits=$(grep -rlE 'All Rights Reserved|Unauthorized copying' --exclude-dir=target backend cli 2>/dev/null); then
+  echo "Files with proprietary notices present:" >&2
+  echo "$hits" >&2
+  failed=1
+fi
 if hits=$(find backend -name '*_ee.rs' -not -path '*/target/*' | grep .); then
   echo "Proprietary *_ee.rs files present:" >&2
   echo "$hits" >&2

@@ -8,7 +8,7 @@
 //!
 //! Then run this binary:
 //!   OTEL_LOGS=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
-//!     cargo run --example otlp_smoke --features enterprise,private,otel \
+//!     cargo run --example otlp_smoke --features otel \
 //!     -p windmill-common
 //!
 //! Inspect the collector's debug output with:

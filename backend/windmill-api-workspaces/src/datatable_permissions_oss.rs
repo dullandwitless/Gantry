@@ -6,8 +6,8 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-//! Where the data table permissions endpoints and their gates come from: the enterprise
-//! implementation, or a refusal. Roles are an Enterprise Edition feature; see
+//! The data table permissions endpoints and their gates: a refusal. Roles are not implemented;
+//! see
 //! `windmill_common::datatable_roles_oss`.
 
 pub(crate) use ce::*;

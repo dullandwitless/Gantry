@@ -235,7 +235,7 @@ async fn test_group_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // --- export (EE-gated) ---
+    // --- export ---
     let resp = authed(client().get(format!("{global_base}/export")))
         .send()
         .await
@@ -246,7 +246,7 @@ async fn test_group_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.status()
     );
 
-    // --- overwrite (EE-gated) ---
+    // --- overwrite ---
     let resp = authed(client().post(format!("{global_base}/overwrite")))
         .json(&json!([]))
         .send()

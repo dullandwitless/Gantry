@@ -39,7 +39,7 @@ use super::core::McpSelection;
 /// which every provider knows, and which carry the user's email.
 pub const REQUESTED_SCOPES: &str = "openid profile email";
 
-/// The issuer configuration when external tokens are on: EE only.
+/// The issuer configuration when external tokens are on. Always `None`: not implemented.
 pub fn configured() -> Option<Arc<McpExternalIdp>> {
     {
         None

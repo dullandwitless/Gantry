@@ -327,7 +327,7 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     assert_eq!(resp.status(), 400);
     assert!(resp.text().await?.contains("ALLOW_PRIVATE_WEBHOOK_URLS"));
 
-    // --- edit_auto_invite (EE-gated) ---
+    // --- edit_auto_invite ---
     let resp = authed(client().post(format!("{base}/edit_auto_invite")))
         .json(&json!({"operator": false, "invite_all": false, "auto_add": false}))
         .send()
@@ -391,7 +391,7 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.text().await?
     );
 
-    // --- edit_default_app (EE-gated, may return 200 or error) ---
+    // --- edit_default_app (may return 200 or error) ---
     let resp = authed(client().post(format!("{base}/edit_default_app")))
         .json(&json!({}))
         .send()
@@ -429,7 +429,7 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.text().await?
     );
 
-    // --- edit_deploy_ui_config (EE-gated) ---
+    // --- edit_deploy_ui_config ---
     let resp = authed(client().post(format!("{base}/edit_deploy_ui_config")))
         .json(&json!({"deploy_ui": null}))
         .send()
@@ -441,7 +441,7 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.status()
     );
 
-    // --- edit_git_sync_config (EE-gated) ---
+    // --- edit_git_sync_config ---
     let resp = authed(client().post(format!("{base}/edit_git_sync_config")))
         .json(&json!({"git_sync_settings": null}))
         .send()
@@ -553,7 +553,7 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .unwrap();
     assert_eq!(resp.status(), 201, "delete_invite: {}", resp.text().await?);
 
-    // ===== Critical alerts (EE-gated, returns 404 in OSS) =====
+    // ===== Critical alerts (may return 404) =====
 
     // --- get critical_alerts ---
     let resp = authed(client().get(format!("{base}/critical_alerts")))

@@ -33,6 +33,12 @@ not_imported=(
   update_sqlx.sh
   # States that it reproduces queries from the proprietary repository.
   windmill-queue/tests/native_retry_test.rs
+  # Carry "All Rights Reserved" proprietary headers despite their location;
+  # replaced by Gantry's own windmill-common/src/secret_backend/http_store.rs.
+  windmill-common/src/secret_backend/aws_sm_oss.rs
+  windmill-common/src/secret_backend/azure_kv_oss.rs
+  windmill-common/src/secret_backend/http_store_oss.rs
+  windmill-common/tests/azure_kv_integration.rs
 )
 
 if [[ ! -f "$upstream/LICENSE" || ! -d "$upstream/backend" ]]; then

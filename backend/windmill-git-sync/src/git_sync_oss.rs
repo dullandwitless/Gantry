@@ -12,7 +12,7 @@ pub async fn handle_deployment_metadata<'c>(
     _skip_db_insert: bool,
     _renamed_from: Option<&str>,
 ) -> Result<()> {
-    // Git sync is an enterprise feature and not part of the open-source version
+    // Stub: git sync is not implemented.
     return Ok(());
 }
 
@@ -23,7 +23,7 @@ pub async fn tally_deployed_object_changes(
     _renamed_from: Option<&str>,
     _origin: Option<windmill_common::deploy_origin::DeployOrigin>,
 ) -> Result<()> {
-    // Workspace forks are an enterprise feature and not part of the open-source version
+    // Stub: fork change tallying is not implemented.
     return Ok(());
 }
 

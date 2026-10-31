@@ -134,7 +134,7 @@ use windmill_worker::{
     result_processor::handle_job_error, JobCompletedSender, JobIsolationLevel,
     OtelTracingProxySettings, SameWorkerSender, StepFailureKind, WorkspaceRegistryMap,
     BUNFIG_INSTALL_SCOPES, BUN_INSTALL_MIN_RELEASE_AGE, CARGO_REGISTRIES, INSTANCE_PYTHON_VERSION,
-    JAVA_HOME_DIR, JOB_DEFAULT_TIMEOUT, JOB_ISOLATION, KEEP_JOB_DIR, MAVEN_REPOS,
+    JOB_DEFAULT_TIMEOUT, JOB_ISOLATION, KEEP_JOB_DIR, MAVEN_REPOS,
     MAVEN_SETTINGS_XML, NO_DEFAULT_MAVEN, NPMRC, NPM_CONFIG_REGISTRY, NSJAIL_AVAILABLE,
     NSJAIL_TMPFS_SIZE_MB, NSJAIL_TMP_BACKING, NUGET_CONFIG, OTEL_TRACING_PROXY_SETTINGS,
     PIP_EXTRA_INDEX_URL, PIP_INDEX_URL, POWERSHELL_REPO_PAT, POWERSHELL_REPO_URL,
@@ -501,7 +501,7 @@ pub async fn initial_load(
     }
 
     // A step rather than a plain await: an AWS OIDC store mints its first token against an
-    // issuer built from `BASE_URL` (`oidc_ee.rs`), and with `OTEL_ENVIRONMENT` set nothing
+    // issuer built from `BASE_URL`, and with `OTEL_ENVIRONMENT` set nothing
     // loads that before this pass does, so running ahead of the applier would sign with the
     // unset default and fall back to the 10s retry.
     #[cfg(feature = "parquet")]
@@ -573,7 +573,7 @@ pub async fn initial_load(
         });
         pass.setting(AUDIT_LOG_RETENTION_DAYS_SETTING, true, |v| async move {
             AUDIT_LOG_RETENTION_DAYS.store(
-                // 0 means use default: 365 for EE, 14 for CE
+                // 0 means use the default: 14
                 parse_setting_value::<i64>(
                     v,
                     AUDIT_LOG_RETENTION_DAYS_SETTING,
@@ -608,9 +608,9 @@ pub async fn initial_load(
         // Env-var enable has no settings-row xmin and no runtime enable event;
         // anchor the export cursor at startup so rows committed before the
         // first export tick are not skipped (no-op when a settings row exists
-        // or a checkpoint is already present). Audit-log S3 export is an
-        // Enterprise feature; the core logic lives in `crate::ee` (OSS gets a
-        // no-op), gated here on a valid Enterprise license.
+        // or a checkpoint is already present). `crate::ee_oss` is a no-op stub,
+        // and the call is gated on the Enterprise plan, which `get_license_plan`
+        // never returns.
         #[cfg(feature = "parquet")]
         if let Some(db) = conn.as_sql() {
             pass.action(async move {
@@ -754,7 +754,6 @@ pub async fn initial_load(
             "MAVEN_SETTINGS_XML",
             MAVEN_SETTINGS_XML.clone(),
         );
-        pass.action(write_maven_settings_xml());
         pass.setting(gs::NO_DEFAULT_MAVEN_SETTING, true, |v| async move {
             apply_no_default_maven_setting(v)
         });
@@ -2205,7 +2204,7 @@ pub async fn delete_expired_items(db: &DB) -> () {
         ),
     }
 
-    // Per-workspace retention overrides (EE-only; the cache is always empty on CE). A workspace may
+    // Per-workspace retention overrides (the cache is always empty in this build). A workspace may
     // keep jobs LONGER or SHORTER than the instance-wide window. Phase 1 sweeps globally on the
     // instance window but excludes override workspaces; Phase 2 sweeps each override workspace on its
     // own window (a sargable `workspace_id = $w` scan). The override count is capped small
@@ -2221,7 +2220,7 @@ pub async fn delete_expired_items(db: &DB) -> () {
     // Gate the whole sweep on a confirmed-known override set: if the load never succeeded (e.g. a
     // startup DB hiccup, or malformed data), the empty cache is "unknown", not "no overrides", and
     // sweeping globally would delete jobs a longer-retention workspace configured. Retry the load
-    // once here (on CE the flag is already set at startup, so this is a no-op), and skip the whole
+    // once here (in this build the flag is already set at startup, so this is a no-op), and skip the whole
     // job-cleanup phase this tick if still unknown — it runs again shortly.
     if !JOB_RETENTION_SECS_OVERRIDES_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
         if let Err(e) = load_retention_period_overrides(db).await {
@@ -2657,8 +2656,8 @@ async fn run_retention_cleanup(db: &DB, retention_secs: i64, scope: RetentionSco
 
 /// Loads the per-workspace retention overrides from the `retention_period_secs_overrides` global
 /// setting (a JSON `{workspace_id: secs}` object) into the in-memory `JOB_RETENTION_SECS_OVERRIDES`
-/// cache, so the cleanup sweep reads them without a per-tick DB query. Enterprise-only — CE leaves
-/// the cache empty so the sweep behaves exactly as before.
+/// cache, so the cleanup sweep reads them without a per-tick DB query. This build does not load
+/// them: it leaves the cache empty so the sweep behaves exactly as before.
 ///
 /// On a load error, unexpected value shape, or malformed data the previous map is kept but
 /// `JOB_RETENTION_SECS_OVERRIDES_LOADED` is set to FALSE, marking the cache unknown. Clobbering the
@@ -2666,11 +2665,11 @@ async fn run_retention_cleanup(db: &DB, retention_secs: i64, scope: RetentionSco
 /// flag TRUE would keep the stale (possibly shorter) policy in force after a lengthened/added
 /// override fails to refresh, deleting those jobs prematurely. Marking it unknown makes the sweep
 /// fail closed — it skips and the monitor retries the load next tick until a confirmed-current state
-/// loads. `LOADED` is set true only on a valid map, explicit unset (`Ok(None)`), or CE's no-op.
+/// loads. `LOADED` is set true only on a valid map, explicit unset (`Ok(None)`), or this build's no-op.
 pub async fn load_retention_period_overrides(db: &DB) -> error::Result<()> {
     {
         let _ = db;
-        // Overrides are EE-only; empty is the correct, fully-known state on CE.
+        // Overrides are not loaded; empty is the correct, fully-known state.
         JOB_RETENTION_SECS_OVERRIDES_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
@@ -2925,34 +2924,6 @@ pub async fn reload_maven_settings_xml_setting(conn: &Connection) {
         MAVEN_SETTINGS_XML.clone(),
     )
     .await;
-    write_maven_settings_xml().await;
-}
-
-/// The half of [`reload_maven_settings_xml_setting`] after the read: mirrors the loaded value
-/// onto disk, where the Maven CLI looks for it.
-pub async fn write_maven_settings_xml() {
-    {
-        return;
-    }
-
-    let settings_xml = MAVEN_SETTINGS_XML.read().await.clone();
-    match settings_xml {
-        Some(ref content) if !content.trim().is_empty() => {
-            let m2_dir = format!("{}/.m2", *JAVA_HOME_DIR);
-            if let Err(e) = tokio::fs::create_dir_all(&m2_dir).await {
-                tracing::error!("Failed to create .m2 directory: {e:#}");
-                return;
-            }
-            let settings_path = format!("{m2_dir}/settings.xml");
-            if let Err(e) = tokio::fs::write(&settings_path, content).await {
-                tracing::error!("Failed to write Maven settings.xml: {e:#}");
-            }
-        }
-        _ => {
-            let settings_path = format!("{}/.m2/settings.xml", *JAVA_HOME_DIR);
-            let _ = tokio::fs::remove_file(&settings_path).await;
-        }
-    }
 }
 
 pub async fn reload_no_default_maven_setting(conn: &Connection) {
@@ -3075,7 +3046,7 @@ pub async fn reload_audit_log_retention_days_setting(conn: &Connection) {
         conn,
         AUDIT_LOG_RETENTION_DAYS_SETTING,
         "AUDIT_LOG_RETENTION_DAYS",
-        0, // 0 means use default: 365 for EE, 14 for CE
+        0, // 0 means use the default: 14
         |x| x,
     )
     .await
@@ -4242,9 +4213,8 @@ pub async fn monitor_db(
     };
 
     // run every 2 iterations (~20s at the default LISTEN_NEW_EVENTS_INTERVAL_SEC).
-    // Enterprise feature: core logic is in `crate::ee` (OSS gets a no-op stub);
-    // gated on a valid Enterprise license, mirroring how `audit_log()` itself
-    // is license-aware.
+    // `crate::ee_oss::export_audit_logs_to_object_store` is a no-op stub, gated
+    // on the Enterprise plan, which `get_license_plan` never returns.
     let export_audit_logs_to_object_store_f = async {
         #[cfg(feature = "parquet")]
         if server_mode && iteration.is_some() && iteration.as_ref().unwrap().should_run(2) {
@@ -4352,11 +4322,8 @@ pub async fn monitor_db(
     };
 
     // run every 2 iterations (~20s at the default LISTEN_NEW_EVENTS_INTERVAL_SEC).
-    // Enterprise feature: the active `// freshness` backstop lives in
-    // windmill-queue's `freshness_watchdog` (`private`); OSS gets a no-op stub.
-    // Runtime-gated on an Enterprise license like the audit export above. Safe
-    // on concurrent servers — the watchdog claims per-script state rows
-    // atomically before pushing.
+    // The active `// freshness` backstop, windmill-queue's `freshness_watchdog`,
+    // is a no-op stub. Gated on the Enterprise plan like the audit export above.
     let pipeline_freshness_watchdog_f = async {
         if server_mode
             && !*DISABLE_FRESHNESS_WATCHDOG

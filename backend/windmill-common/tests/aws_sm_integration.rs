@@ -15,7 +15,7 @@
 //! 2. Run the tests (they are `#[ignore]`d, so a plain `cargo test` skips them):
 //!
 //!    ```bash
-//!    cargo test -p windmill-common --features private,enterprise \
+//!    cargo test -p windmill-common \
 //!      --test aws_sm_integration -- --ignored --nocapture
 //!    ```
 //!

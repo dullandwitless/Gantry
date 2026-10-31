@@ -4,9 +4,9 @@
  * These tests verify that creating, archiving, and deleting workspace dependencies
  * triggers deployment callback jobs with the correct arguments for git sync.
  *
- * Run with enterprise features:
+ * Run with:
  * ```bash
- * cargo test --test workspace_dependencies_git_sync --features enterprise,private
+ * cargo test --test workspace_dependencies_git_sync
  * ```
  */
 

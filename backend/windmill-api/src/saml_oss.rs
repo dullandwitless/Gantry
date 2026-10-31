@@ -24,6 +24,6 @@ pub fn authed_service() -> Router {
 }
 
 pub async fn acs() -> String {
-    // Implementation is not open source as it is a Windmill Enterprise Edition feature
+    // Stub: not implemented.
     "SAML available only in enterprise version".to_string()
 }

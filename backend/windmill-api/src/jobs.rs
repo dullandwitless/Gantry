@@ -6986,8 +6986,7 @@ pub async fn run_flow_by_version_inner(
     Ok((uuid, early_return, has_failure_module))
 }
 
-/// Path parameters of `POST /w/{workspace}/jobs/restart/f/{job_id}`, shared by the CE and EE
-/// handlers. Axum only checks the tuple against the route at request time and rejects a
+/// Path parameters of `POST /w/{workspace}/jobs/restart/f/{job_id}`. Axum only checks the tuple against the route at request time and rejects a
 /// mismatch with an opaque 500 before the handler runs, so both must be declared from here:
 /// an arity that drifts from the route hides the handler behind what reads as a broken route.
 type RestartFlowPath = Path<(String, Uuid)>;
@@ -11873,7 +11872,7 @@ struct ResolveJobsRequest {
 }
 
 /// Provenance Windmill established itself, as opposed to a person's explanation, which is why
-/// this is recorded outside enterprise while a typed note is not.
+/// this is recorded while a typed note is not (`resolution_attribution` returns none).
 const SUPERSEDED_NOTE: &str = "Superseded by a successful re-run";
 
 /// Bounded so the per-id audit rows written below stay bounded too.

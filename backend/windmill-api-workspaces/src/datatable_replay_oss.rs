@@ -6,8 +6,8 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-//! Where the replay of a data table's owners and grants into its copy comes from: the enterprise
-//! one, or a refusal. Without it a data table under roles is not copied at all: its rows would
+//! The replay of a data table's owners and grants into its copy: a refusal, as it is not
+//! implemented. Without it a data table under roles is not copied at all: its rows would
 //! arrive owned by the admin connection with no grant for any role.
 
 use {

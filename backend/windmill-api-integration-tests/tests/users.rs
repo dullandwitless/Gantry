@@ -195,7 +195,7 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.text().await?
     );
 
-    // --- setpassword (EE-gated in OSS) ---
+    // --- setpassword ---
     let resp = authed(client().post(format!("{global_base}/setpassword")))
         .json(&json!({"password": "new-test-password-123"}))
         .send()
@@ -215,7 +215,7 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     assert_eq!(resp.status(), 200);
     resp.json::<Vec<serde_json::Value>>().await?;
 
-    // --- onboarding (EE-gated in OSS) ---
+    // --- onboarding ---
     let resp = authed(client().post(format!("{global_base}/onboarding")))
         .json(&json!({"touch_point": "test", "use_case": "testing"}))
         .send()
@@ -262,7 +262,7 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     assert_eq!(resp.status(), 200);
     resp.json::<bool>().await?;
 
-    // --- create user (global, EE-gated in OSS) ---
+    // --- create user (global) ---
     let resp = authed(client().post(format!("{global_base}/create")))
         .json(&json!({
             "email": "newglobaluser@windmill.dev",
@@ -281,7 +281,7 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     );
 
     if create_status == 201 {
-        // --- rename user (only if create succeeded / EE) ---
+        // --- rename user (only if create succeeded) ---
         let resp =
             authed(client().post(format!("{global_base}/rename/newglobaluser@windmill.dev")))
                 .json(&json!({"new_username": "renamed_user"}))
@@ -358,7 +358,7 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.status()
     );
 
-    // --- reset_password (EE-gated, invalid token) ---
+    // --- reset_password (invalid token) ---
     let resp = client()
         .post(format!("{auth_base}/reset_password"))
         .json(&json!({"token": "invalid-token", "new_password": "new-pass"}))

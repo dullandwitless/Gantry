@@ -16,8 +16,7 @@
 //! ciphertext, so decrypting it directly fails — reads must go through the
 //! backend instead.
 //!
-//! Note: external backends require Enterprise Edition. The OSS version only
-//! supports the database backend.
+//! Note: only the database backend is implemented; external backends are stubs.
 
 use std::sync::Arc;
 
@@ -39,7 +38,7 @@ pub async fn is_vault_backend_configured(_db: &DB) -> Result<bool> {
 /// Get a secret value using the configured backend
 ///
 /// For database backend: decrypts `encrypted_value` using the workspace key
-/// For external backends (EE only): fetches from the backend at `path`,
+/// For external backends (stubs here): fetches from the backend at `path`,
 /// ignoring `encrypted_value` (which holds only a `$...:` marker)
 pub async fn get_secret_value(
     db: &DB,

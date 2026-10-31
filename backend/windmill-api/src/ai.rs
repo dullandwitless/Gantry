@@ -1615,7 +1615,7 @@ async fn proxy(
         if let Some(credentials) = configured_credentials(&db, &w_id, &provider).await? {
             break 'cred credentials;
         }
-        // Nothing configured: fall back to Windmill's free AI tier (EE-only) if a lent
+        // Nothing configured: fall back to Windmill's free AI tier (a stub that never opts in) if a lent
         // key is set and both the user's one-time grant and the instance's daily cap have
         // room. Errors once the grant is spent, the day is capped, or the user already has
         // a request in flight; None otherwise. Ineligible identities (e.g. service

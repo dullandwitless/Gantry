@@ -23,5 +23,5 @@
 //!     docker.io/nagyesta/lowkey-vault:7.3.0
 //!
 //! cargo test -p windmill-api-integration-tests \
-//!     --features private,enterprise --test fork_secret_replication_azure -- --ignored --nocapture
+//!     --test fork_secret_replication_azure -- --ignored --nocapture
 //! ```

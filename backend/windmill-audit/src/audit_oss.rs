@@ -94,7 +94,7 @@ pub async fn audit_log<'c, E: AuditExecutor<'c>>(
     mut _resource: Option<&str>,
     _parameters: Option<HashMap<&str, &str>>,
 ) -> Result<()> {
-    // Implementation is not open source as Audit logs is a Windmill Enterprise Edition feature
+    // Stub: not implemented.
     Ok(())
 }
 
@@ -106,7 +106,7 @@ pub async fn audit_log_many<'c, E: AuditExecutor<'c>>(
     _w_id: &str,
     _resources: &[String],
 ) -> Result<()> {
-    // Implementation is not open source as Audit logs is a Windmill Enterprise Edition feature
+    // Stub: not implemented.
     Ok(())
 }
 
@@ -116,12 +116,12 @@ pub async fn list_audit(
     _pagination: Pagination,
     _lq: ListAuditLogQuery,
 ) -> Result<Vec<AuditLog>> {
-    // Implementation is not open source as Audit logs is a Windmill Enterprise Edition feature
+    // Stub: not implemented.
     return Ok(vec![]);
 }
 
 pub async fn get_audit(tx: Transaction<'_, Postgres>, _id: i32, _w_id: &str) -> Result<AuditLog> {
-    // Implementation is not open source as Audit logs is a Windmill Enterprise Edition feature
+    // Stub: not implemented.
     tx.commit().await?;
     Err(Error::NotFound(
         "Audit log not not available in Windmill Community edition".to_string(),

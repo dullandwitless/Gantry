@@ -1,21 +1,19 @@
-//! # Per-workspace fairness for the shared worker pool (Enterprise feature)
+//! # Per-workspace fairness for the shared worker pool
 //!
-//! On multi-tenant deployments (notably `app.windmill.dev`, and any EE
-//! cluster with a single shared worker group) a single workspace flooding
+//! On multi-tenant deployments (a cluster with a single shared worker
+//! group) a single workspace flooding
 //! the queue with jobs can degrade quality of service for everyone else.
 //! This module computes the set of "overloaded" workspaces whose share of
 //! the worker pool must be capped, and the dispatch in `jobs.rs` uses a
 //! **duration-weighted stochastic admission rule** at pull time to enforce
 //! the cap as a *worker-second* share, not a pull-count share.
 //!
-//! The full algorithm lives in [`crate::workspace_fairness_ee`] behind the
-//! `private` feature — this OSS-facing module is the public surface that
-//! the pull dispatch and integration tests call. When EE is on, the symbols
-//! here transparently re-export the EE implementation. When EE is off, they
-//! are no-ops: `maybe_refresh_overloaded` does nothing, `should_admit_capped`
-//! always returns `true`, and the pull path is bit-identical to its
-//! pre-fairness shape. **Both runtime correctness and the entire reasoning
-//! below assume the EE module is compiled in**; the OSS build is a stub.
+//! **In Gantry this module is a stub.** It is the surface the pull dispatch
+//! and integration tests call, and its symbols are no-ops:
+//! `maybe_refresh_overloaded` does nothing, `should_admit_capped` always
+//! returns `true`, and the pull path is bit-identical to its pre-fairness
+//! shape. The sections below describe the design of the refresh and admission
+//! algorithm, which is not implemented here.
 //!
 //! Every numerical default mentioned below (`MAX_PERCENT = 50`,
 //! `DURATION_SECS = 10`, `MIN_TOTAL = 4`, `WORKER_PING_LIVE_SECS = 60`,
@@ -237,11 +235,11 @@
 //!   on-completion) *before* any PK lookups: 1.3 ms, 9× less I/O,
 //!   bounded by *live worker count*.
 //!
-//! ## 6. Enterprise gating
+//! ## 6. Settings gating
 //!
-//! The cap is an Enterprise feature. `windmill-api-settings` rejects
-//! `workspace_fairness_enabled = true` writes from non-EE builds, and on a
-//! single-tenant self-hosted deployment the default
+//! `windmill-api-settings` rejects `workspace_fairness_enabled = true` writes
+//! unless the license plan is Enterprise, which `get_license_plan` never
+//! returns in Gantry. On a single-tenant self-hosted deployment the default
 //! `workspace_fairness_enabled = false` keeps the pull path identical to
 //! the pre-fairness baseline. At runtime the dispatch checks the atomic
 //! only — when fairness is off, `maybe_refresh_overloaded` drains the
@@ -252,11 +250,11 @@
 mod oss_stubs {
     use sqlx::{Pool, Postgres};
 
-    /// No-op on OSS — workspace fairness is an Enterprise feature.
+    /// No-op: workspace fairness is not implemented.
     #[inline]
     pub fn maybe_refresh_overloaded(_db: &Pool<Postgres>) {}
 
-    /// No-op on OSS — always returns `true` so the dispatch never reaches
+    /// No-op: always returns `true` so the dispatch never reaches
     /// the fairness pull query (which is empty anyway, since
     /// `store_pull_query` only materialises it when fairness is enabled).
     #[inline]

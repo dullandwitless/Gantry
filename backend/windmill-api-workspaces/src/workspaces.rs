@@ -1398,7 +1398,7 @@ async fn get_git_sync_deploy_mode(
 
     let configured = !settings.repositories.is_empty();
 
-    // Auto-pull runs only in builds that compile the poller (`private`); without a
+    // Auto-pull has no poller in this build, so the match below never runs; without a
     // caller branch there is nothing to match. Either way deploy_on_push stays
     // false and the caller falls back (git push via CI, or wmill sync push).
     let Some(branch) = q.branch.as_deref() else {
@@ -11953,7 +11953,7 @@ async fn get_usage(Extension(db): Extension<DB>, Path(w_id): Path<String>) -> Re
     // On cloud, a fork's executions meter against its billing root, so report the root's usage here too;
     // otherwise the free-execs indicator would show the fork's own (often 0) count while enforcement
     // applies the root's shared quota. Gated on `*CLOUD_HOSTED` (not just the `cloud` feature, which is
-    // compiled into all EE builds): self-hosted doesn't meter usage this way. Off-fork it resolves to
+    // part of the `ee_core` bundle): self-hosted doesn't meter usage this way. Off-fork it resolves to
     // `w_id` itself anyway.
     #[cfg(feature = "cloud")]
     let w_id = if *CLOUD_HOSTED {

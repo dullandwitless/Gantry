@@ -6,9 +6,9 @@
  * every re-encrypted variable plus the encryption_key entry, so repos with
  * Secrets sync enabled receive the new ciphertexts in one commit.
  *
- * Run with enterprise features:
+ * Run with:
  * ```bash
- * cargo test --test workspace_encryption_key_git_sync --features enterprise,private
+ * cargo test --test workspace_encryption_key_git_sync
  * ```
  */
 

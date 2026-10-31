@@ -154,7 +154,7 @@ fn build_materialized_query(
     }
     let partitioned = ann.partition.is_some();
     let partition = partition_value.unwrap_or("").to_string();
-    // Partition *resolution* is enterprise; in its absence a partitioned
+    // Partition *resolution* is a stub that resolves nothing, so a partitioned
     // materialize only runs with an explicit `partition` arg. Fail loudly rather
     // than silently materialize the wrong (empty) slice.
     if partitioned && partition.is_empty() {
@@ -324,9 +324,8 @@ fn build_materialized_query(
         &resolved,
     )
     .map_err(Error::ExecutionErr)?;
-    // Enterprise seam: assembles the plan into the final statement list —
-    // verbatim on the public build (commit-then-test), restructured into
-    // write-audit-publish (guarded transaction, rollback on violation) on EE.
+    // Assembles the plan into the final statement list: verbatim
+    // (commit-then-test).
     let blocks =
         windmill_common::pipeline_advanced::finalize_materialize_query(mat_plan, &m.target_path);
 
@@ -1669,11 +1668,6 @@ pub async fn do_duckdb(
             // committed (like dbt), so the slice is recorded `Failed` and the
             // cascade stops. The error lists *every* test so the user sees the
             // whole picture, not just the first failure.
-            // Under enterprise write-audit-publish an in-transaction guard
-            // (the enterprise `finalize_materialize_query` restructure) already aborted a failing run before
-            // COMMIT — that surfaces on the Err path above with the same
-            // breakdown in the error string, and nothing was published; this
-            // post-commit path then only ever sees passing counts.
             let tests = extract_data_tests(&result);
             // Captured output schema (gap #2a) — recorded only on the successful
             // path below, not on the failure paths (a failed run shouldn't
@@ -3617,12 +3611,8 @@ mod tests {
     }
 
     // The rewritten SQL is the plan assembled by
-    // `pipeline_advanced::finalize_materialize_query`, so what it contains is
-    // build-dependent: the public assembly runs the plan verbatim (tests only
-    // in the post-commit summary breakdown), the enterprise assembly adds the
-    // in-transaction write-audit-publish guard (whose shape/placement is
-    // tested next to its implementation in windmill-common's
-    // `pipeline_advanced_ee`).
+    // `pipeline_advanced::finalize_materialize_query`, which runs the plan
+    // verbatim (tests only in the post-commit summary breakdown).
     #[test]
     fn materialize_rewrite_carries_data_test_summary() {
         let script = "-- materialize ducklake://main/orders\n\

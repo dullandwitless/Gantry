@@ -286,10 +286,8 @@ pub async fn push_scheduled_job<'c>(
         }
     }
 
-    // Managed ducklake maintenance schedule (enterprise): the runnable is a
-    // generated DuckDB script, not a deployed one — built in the EE module.
-    // None (CE build, or no enabled maintenance config for the path's lake)
-    // falls through to normal script resolution, so a user schedule that
+    // Managed ducklake maintenance schedule: the builder is a stub that
+    // always returns None, which falls through to normal script resolution, so a user schedule that
     // pre-dates the reserved prefix keeps running its script and a stale
     // managed row fails resolution with NotFound (auto-disabling it with
     // schedule.error recorded).

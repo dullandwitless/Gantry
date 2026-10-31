@@ -1,11 +1,9 @@
-//! OSS fallback for the asset-trigger cascade's AND-join / debounce / retry.
+//! Stub for the asset-trigger cascade's AND-join / debounce / retry.
 //!
-//! The richer cascade semantics are a `private` feature (see `cascade_ee`).
-//! In the public build they are absent and the cascade degrades to a plain
+//! The richer cascade semantics are not implemented: the cascade degrades to a plain
 //! OR fan-out: every join always fires immediately, no slots are recorded or
 //! reaped, debounce falls back to the subscriber's own script-level settings,
 //! and retry is never applied (the subscriber pushes as a bare `ScriptHash`).
-//! The real implementation lives in `windmill-ee-private`.
 
 use windmill_common::error::Result;
 use windmill_common::flows::Retry;
@@ -13,8 +11,7 @@ use windmill_common::runnable_settings::DebouncingSettings;
 use windmill_common::DB;
 
 /// Outcome of evaluating an AND-join barrier for one (subscriber, input).
-/// Kept identical to the EE definition so the core matcher in
-/// `asset_dispatch` compiles against either build.
+/// The core matcher in `asset_dispatch` matches on it.
 pub enum JoinDecision {
     /// Input does not advance the join (recorded as Skipped with `reason`).
     Skip(&'static str),

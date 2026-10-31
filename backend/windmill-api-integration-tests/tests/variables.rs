@@ -282,9 +282,9 @@ async fn test_variable_value_cache_is_identity_scoped(db: Pool<Postgres>) -> any
     Ok(())
 }
 
-/// Secret variables ARE cached (with their per-read side effects — the EE
+/// Secret variables ARE cached (with their per-read side effects — the
 /// `variables.decrypt_secret` audit and running-job secret registration — re-run on every
-/// hit; that re-emission is not observable in the OSS build since `audit_log` is a no-op).
+/// hit; that re-emission is not observable since `audit_log` is a no-op).
 /// We assert the caching itself: warm the cache, delete the row directly (no API/NOTIFY, so
 /// the in-memory cache survives), and re-read with `allow_cache=true` — the value is still
 /// returned from cache. A non-secret variable behaves identically (control).

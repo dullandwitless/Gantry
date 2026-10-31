@@ -60,7 +60,7 @@ pub async fn build_oauth_clients(
     _oauths_from_config: Option<HashMap<String, OAuthClient>>,
     _db: &DB,
 ) -> anyhow::Result<AllClients> {
-    // Implementation is not open source
+    // Stub: not implemented.
     return Ok(AllClients {
         logins: HashMap::default(),
         connects: HashMap::default(),
@@ -90,7 +90,7 @@ struct Logins {
     auto_login: Option<String>,
 }
 async fn list_logins() -> error::JsonResult<Logins> {
-    // Implementation is not open source
+    // Stub: not implemented.
     return Ok(Json(Logins { oauth: vec![], saml: None, auto_login: None }));
 }
 
@@ -108,7 +108,7 @@ async fn list_connects() -> error::JsonResult<Vec<String>> {
 #[allow(unused)]
 #[cfg(not(feature = "oauth2"))]
 async fn list_connects() -> windmill_common::error::JsonResult<Vec<String>> {
-    // Implementation is not open source
+    // Stub: not implemented.
     return Ok(axum::Json(vec![]));
 }
 
@@ -119,7 +119,7 @@ pub async fn _refresh_token(
     _db: &DB,
     _force: bool,
 ) -> error::Result<String> {
-    // Implementation is not open source
+    // Stub: not implemented.
     Err(error::Error::BadRequest(
         "Not implemented in Windmill's Open Source repository".to_string(),
     ))

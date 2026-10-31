@@ -39,6 +39,14 @@ the inline `enterprise`-gated snippets.
    needs manual review.
 4. Records the upstream commit in `UPSTREAM_COMMIT`.
 
+Files that carry a proprietary notice ("All Rights Reserved", "Unauthorized
+copying ... prohibited") are treated as proprietary regardless of where they sit
+in upstream's tree, and are never imported. Where other code depends on them,
+Gantry provides its own implementation, written only from the compile errors
+their absence causes (never from their contents). The four such files found so
+far are listed in `scripts/import-upstream.sh`; the git history was rewritten
+on 2026-10-31 so that it never contains them.
+
 `scripts/check-no-ee.sh` verifies no gated code remains and runs in CI.
 `scripts/prepare-sqlx.sh` regenerates `backend/.sqlx` from Gantry's own sources.
 

@@ -12,8 +12,7 @@
 //! `windmill_common::secret_backend`; this module keeps the API-specific bulk
 //! rename helper used when renaming users.
 //!
-//! Note: HashiCorp Vault integration requires Enterprise Edition.
-//! The OSS version only supports the database backend.
+//! Note: only the database backend is implemented.
 
 use windmill_common::{db::DB, error::Result};
 

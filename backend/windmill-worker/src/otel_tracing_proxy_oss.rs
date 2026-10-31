@@ -1,1 +1,1 @@
-//! OSS stubs for OTEL tracing proxy (EE feature)
+//! Stubs for the OTEL tracing proxy (not implemented)

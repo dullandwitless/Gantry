@@ -2,8 +2,8 @@
  * End-to-end integration tests for Windmill trigger listeners.
  *
  * Each test is `#[ignore]` because it requires a running external service
- * (MQTT broker, NATS server, Kafka broker, etc.). See individual test doc
- * comments for setup instructions.
+ * (MQTT broker, WebSocket server, Postgres with logical replication). See
+ * individual test doc comments for setup instructions.
  *
  * Quick start — use the helper scripts in `tests/fixtures/`:
  * ```bash
@@ -538,19 +538,3 @@ async fn test_postgres_slot_lsn_advances(db: Pool<Postgres>) -> anyhow::Result<(
 
     Ok(())
 }
-
-// ============================================================================
-// Kafka Trigger E2E (Enterprise)
-// ============================================================================
-
-// ============================================================================
-// NATS Trigger E2E (Enterprise)
-// ============================================================================
-
-// ============================================================================
-// SQS Trigger E2E (Enterprise)
-// ============================================================================
-
-// ============================================================================
-// GCP Pub/Sub Trigger E2E (Enterprise)
-// ============================================================================

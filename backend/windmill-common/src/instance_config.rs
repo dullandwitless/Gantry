@@ -176,7 +176,7 @@ pub struct InstanceConfig {
 // Global settings
 // ---------------------------------------------------------------------------
 
-/// Generate a schema for opaque JSON objects (used for EE-private settings).
+/// Generate a schema for opaque JSON objects (settings without a typed struct).
 /// Produces `{"type": "object", "nullable": true}` so the CRD passes K8s
 /// structural schema validation while still accepting any JSON object.
 #[cfg(feature = "instance_config_schema")]
@@ -373,7 +373,7 @@ pub struct GlobalSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_workload_identity_issuers: Option<Vec<AgentWorkloadIdentityIssuer>>,
 
-    // Opaque settings (EE-private structs or no clear schema)
+    // Opaque settings (no typed struct or no clear schema)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(
         feature = "instance_config_schema",
@@ -845,7 +845,7 @@ pub enum DucklakeCatalogResourceType {
 // ---------------------------------------------------------------------------
 
 /// Custom PostgreSQL databases managed by the instance. `user_pwd` is operator-configurable
-/// (resolved from a Kubernetes secretKeyRef by the EE operator); `databases` is runtime
+/// (resolvable from a Kubernetes secretKeyRef); `databases` is runtime
 /// setup status. The replication-role password lives in a separate hidden setting
 /// (`custom_instance_replication_pwd`), never in this operator-facing config row.
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -1323,7 +1323,7 @@ fn is_empty_or_null(value: &serde_json::Value) -> bool {
 pub const CE_MAX_RETENTION_PERIOD_SECS: i64 = 30 * 24 * 3600;
 
 /// Clamp `retention_period_secs` to `CE_MAX_RETENTION_PERIOD_SECS` on CE builds.
-/// Returns the (possibly clamped) value. On EE builds this is a no-op.
+/// Returns the (possibly clamped) value.
 pub fn clamp_retention_period(value: serde_json::Value) -> serde_json::Value {
     {
         if let Some(secs) = value.as_i64() {
@@ -1376,8 +1376,8 @@ pub fn diff_global_settings(
         // already treats both `""` and `null` as deletes).
         // Without this, the InstanceSettings YAML editor cannot delete keys
         // (Merge mode silently preserves missing/null values), and stale `""`
-        // rows linger and trip the EE registry gate, producing spurious
-        // "requires Enterprise" warnings on every CE job.
+        // rows linger and trip the private registry gate, producing spurious
+        // "configuration ignored" warnings on every job.
         if is_empty_or_null(desired_value) {
             if let Some(existing) = current.get(key) {
                 previous_values.insert(key.clone(), existing.clone());
@@ -2797,7 +2797,7 @@ mod tests {
 
     #[test]
     fn custom_instance_pg_databases_roundtrips_and_redacts_user_pwd() {
-        // user_pwd stays operator-configurable (EE secretKeyRef); databases is runtime status.
+        // user_pwd stays operator-configurable (secretKeyRef); databases is runtime status.
         let json = r#"{
             "user_pwd": "secret123",
             "databases": { "mydb": { "success": true, "tag": "production" } }

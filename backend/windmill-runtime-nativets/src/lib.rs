@@ -870,7 +870,7 @@ pub async fn eval_fetch_timeout(
                     // no sink persists, a later redaction in `job_logs` would go unexplained.
                     let logged = stream.is_none().then(|| masker.mask(&log).into_owned());
 
-                    // Mirror `process_streaming_log_lines` (EE) + the OTEL_JOB_LOGS
+                    // Mirror `process_streaming_log_lines` + the OTEL_JOB_LOGS
                     // hook from handle_child.rs, neither of which runs for nativets
                     // since nativets delivers logs in-process via the log channel.
                     for line in logged.as_deref().unwrap_or(&log).lines() {

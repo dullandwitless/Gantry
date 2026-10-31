@@ -1602,9 +1602,8 @@ mod schedule_push {
     }
 
     // Saving maintenance off must remove the managed row AND its queued
-    // occurrence in BOTH builds: the enterprise sync reconciles, and the
-    // public stub must not leave a job pushed under the enterprise edition
-    // to run after the admin disabled maintenance (EE-to-CE downgrade).
+    // occurrence: the stub must not leave an already-queued maintenance job
+    // to run after the admin disabled maintenance.
     #[sqlx::test(migrations = "../migrations", fixtures("base", "schedule_push"))]
     async fn test_sync_disable_clears_managed_row_and_queued_occurrence(
         db: Pool<Postgres>,

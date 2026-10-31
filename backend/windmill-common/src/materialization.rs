@@ -1,15 +1,13 @@
-//! CE materialization state — the per-partition status recorded by the managed
+//! Materialization state — the per-partition status recorded by the managed
 //! `// materialize` write (in windmill-worker), read by the partition-status
-//! grid and by the EE backfill worklist.
+//! grid.
 //!
-//! The write engine and this state are CE; only automatic partition
-//! *resolution* (`partition_ee`) and *backfill* orchestration
-//! (`pipeline_advanced_ee`) are enterprise. This module is the shared seam:
-//! the EE backfill enumerates the partitions in a range, diffs them against
-//! these rows to find the missing/failed set, and pushes one CE materialization
-//! job per gap (with an explicit `partition` arg — which runs idempotently and
-//! upserts the row here). Nothing about that orchestration lives in this file;
-//! it only needs the rows to exist, which is why recording is CE.
+//! Automatic partition *resolution* (`partition_oss`) and range *backfill*
+//! (`pipeline_advanced_oss`) are stubs. A backfill would enumerate the
+//! partitions in a range, diff them against these rows to find the
+//! missing/failed set, and push one materialization job per gap (with an
+//! explicit `partition` arg — which runs idempotently and upserts the row
+//! here). Nothing about that orchestration lives in this file.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

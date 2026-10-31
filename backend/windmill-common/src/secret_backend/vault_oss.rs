@@ -6,10 +6,10 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-//! HashiCorp Vault secret backend stubs (Open Source Edition)
+//! HashiCorp Vault secret backend stubs
 //!
 //! This module provides stub implementations for Vault integration.
-//! The actual Vault integration requires Enterprise Edition.
+//! Vault integration is not implemented.
 
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ use super::{
     VaultSettings,
 };
 
-/// Stub VaultBackend for OSS - all operations return EE required error
+/// Stub VaultBackend: every operation returns an error
 pub struct VaultBackend;
 
 impl VaultBackend {
@@ -57,8 +57,8 @@ impl SecretBackend for VaultBackend {
 
 /// Create the appropriate secret backend based on configuration
 ///
-/// In OSS, always returns DatabaseBackend regardless of config.
-/// Vault configuration is ignored with a warning.
+/// Always returns DatabaseBackend regardless of config.
+/// External backend configuration is ignored with a warning.
 pub async fn create_secret_backend(
     db: DB,
     config: &SecretBackendConfig,

@@ -1687,7 +1687,7 @@ async fn process_notify_event(
                     if let Err(e) = reload_license_key(&db.into()).await {
                         tracing::error!("Failed to reload license key: {e:#}");
                     }
-                    // The worker-group cache override is Enterprise-only, and nothing else
+                    // The worker-group cache override needs the Enterprise plan, and nothing else
                     // re-reads the plan for it: the periodic settings pass runs ahead of
                     // reload_license_key, so it would see the plan this event just replaced.
                     #[cfg(feature = "parquet")]

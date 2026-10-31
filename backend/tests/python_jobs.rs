@@ -1,3 +1,4 @@
+#[cfg(feature = "python")]
 use serde_json::json;
 #[cfg(feature = "python")]
 use sqlx::postgres::Postgres;
@@ -5,6 +6,7 @@ use sqlx::postgres::Postgres;
 use sqlx::Pool;
 #[cfg(feature = "python")]
 use windmill_common::scripts::ScriptLang;
+#[cfg(feature = "python")]
 use windmill_test_utils::*;
 
 // ============================================================================

@@ -772,8 +772,8 @@ async fn push_subscriber(
     let tag = script.tag;
     let concurrency_settings = script.runnable_settings.concurrency_settings;
 
-    // Debounce / retry semantics are a `private` feature (see `cascade`).
-    // OSS degrades both: debounce falls back to the subscriber's own
+    // The cascade's own debounce / retry semantics are not implemented (see
+    // `cascade`): debounce falls back to the subscriber's own
     // script-level settings, retry is never applied.
     let debouncing_settings = crate::cascade::cascade_debouncing_settings(
         subscriber_path,

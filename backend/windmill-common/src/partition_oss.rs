@@ -1,10 +1,8 @@
-//! OSS fallback for pipeline partition resolution.
+//! Stub for pipeline partition resolution.
 //!
-//! Partition resolution is a `private` feature (see `partition_ee`). In the
-//! public build it is absent: `resolve_partition` yields no partition, so the
-//! cascade runs partition-agnostically, and the args helpers degrade to a
-//! plain (non-partition-preserving) write. The real implementation lives in
-//! `windmill-ee-private`.
+//! Partition resolution is not implemented: `resolve_partition` yields no
+//! partition, so the cascade runs partition-agnostically, and the args helpers
+//! degrade to a plain (non-partition-preserving) write.
 
 use std::collections::HashMap;
 

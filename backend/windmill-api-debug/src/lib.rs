@@ -208,10 +208,6 @@ pub struct DebugRegistryConfig {
     pub message: Option<String>,
 }
 
-/// Placeholder an EE instance puts in an index URL for a token minted per install by
-/// `EPHEMERAL_TOKEN_CMD` (`windmill-worker`'s `handle_ephemeral_token`).
-const EPHEMERAL_TOKEN_MARKER: &str = "EPHEMERAL_TOKEN";
-
 /// Every `global_settings` key [`get_registry_config`] reads, in one query. A setting
 /// resolved there but missing here reads as unset, whatever the instance has stored.
 const REGISTRY_SETTINGS: [&str; 7] = [
@@ -311,15 +307,15 @@ async fn get_registry_config(
         bunfig_install_scopes: resolve(npm, BUNFIG_INSTALL_SCOPES_SETTING, "BUNFIG_INSTALL_SCOPES"),
         pip_index_url: resolve(python, PIP_INDEX_URL_SETTING, "PIP_INDEX_URL"),
         pip_extra_index_url: resolve(python, EXTRA_PIP_INDEX_URL_SETTING, "PIP_EXTRA_INDEX_URL"),
-        // Not a private-registry setting: a worker reads it on any edition, so it is
-        // served below the Enterprise gate too.
+        // Not a private-registry setting: a worker always reads it, so it is
+        // served below the private-registry gate too.
         uv_index_strategy: resolve(python, UV_INDEX_STRATEGY_SETTING, "UV_INDEX_STRATEGY"),
         message: None,
     };
 
     {
-        // A private registry is an Enterprise feature, and `read_ee_registry` drops these
-        // same settings on a CE worker, so a CE debug session installs from the public registries
+        // Private registries are not supported, and `read_ee_registry` drops these
+        // same settings on every worker, so a debug session installs from the public registries
         // and says why, instead of gaining a capability jobs on that instance don't have.
         let configured = config.npm_config_registry.is_some()
             || config.npmrc.is_some()

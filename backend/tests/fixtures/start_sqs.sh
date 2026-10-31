@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts LocalStack for SQS trigger_e2e::test_sqs_e2e (Enterprise)
+# Starts LocalStack for SQS trigger_e2e::test_sqs_e2e
 #
 # Usage:
 #   ./tests/fixtures/start_sqs.sh        # start
@@ -42,4 +42,4 @@ aws --endpoint-url="http://localhost:${PORT}" \
 echo "LocalStack SQS listening on localhost:${PORT} with queue 'windmill-e2e-test'"
 echo ""
 echo "Run the test:"
-echo "  AWS_ENDPOINT_URL=http://localhost:${PORT} cargo test --test trigger_e2e test_sqs_e2e --features sqs_trigger,enterprise,private -- --ignored --nocapture"
+echo "  AWS_ENDPOINT_URL=http://localhost:${PORT} cargo test --test trigger_e2e test_sqs_e2e --features sqs_trigger -- --ignored --nocapture"

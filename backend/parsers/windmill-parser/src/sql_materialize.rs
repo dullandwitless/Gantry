@@ -404,8 +404,8 @@ pub struct MaterializeCodegen<'a> {
 /// TRANSACTION;` as the injection slot for `ALTER TABLE … ADD/DROP COLUMN`
 /// DDL. The executor computes the drift with a pre-pass probe and replaces this
 /// literal in the assembled query text (with the DDL, or removes it when there
-/// is no drift). Classified `Write` so the EE write-audit-publish reassembly
-/// keeps it inside the transaction with the mutations; a plain no-op SELECT so
+/// is no drift). Classified `Write` so it belongs with the mutations
+/// inside the transaction; a plain no-op SELECT so
 /// that if it is somehow left un-replaced the run still succeeds unchanged.
 pub const SYNC_ALTER_SENTINEL: &str = "SELECT '__wm_sync_alter_sentinel__' AS _wm_sync;";
 

@@ -80,9 +80,8 @@ pub struct BackupStore {
 /// settings that say where its objects are, and not turned off by
 /// `ai_sessions_instance_storage_fallback`, which is on unless set to false. Named like a
 /// workspace storage, by that location, in a namespace of its own. Never on the Pro plan,
-/// checked on every call: a store loaded before a switch to Pro stays loaded. Never in a
-/// build without `private`, which has neither workspace storage nor the quota the fallback
-/// counts toward.
+/// checked on every call: a store loaded before a switch to Pro stays loaded. This build
+/// does not implement the fallback: it always returns `None`.
 ///
 /// Authorizes nothing, and the store reaches every workspace's objects: the caller must have
 /// authorized the user for the workspace and keep what it reads and writes under that

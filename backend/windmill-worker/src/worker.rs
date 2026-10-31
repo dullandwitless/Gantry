@@ -13,7 +13,7 @@ use anyhow::anyhow;
 use futures::TryFutureExt;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-// Re-export proxy env-var snapshots so callers (including EE modules)
+// Re-export proxy env-var snapshots so callers
 // can keep importing them via `crate::{NO_PROXY, HTTP_PROXY, HTTPS_PROXY}`.
 use windmill_common::client::AuthedClient;
 use windmill_common::jobs::InlineScriptTarget;
@@ -877,8 +877,8 @@ pub async fn read_ee_registry_with_workspace_override(
     };
     // An empty/whitespace-only value (from either source) means "unset" — a
     // workspace override of `""` still takes precedence over the global
-    // value, but neither triggers the spurious "requires Enterprise" warning
-    // on CE jobs.
+    // value, but neither triggers the spurious "private registry ignored"
+    // warning.
     let value = ws_value.or(global_value).filter(|s| !s.trim().is_empty());
     read_ee_registry(value, display_name, job_id, w_id, conn).await
 }
@@ -1290,7 +1290,7 @@ pub fn is_unshare_enabled() -> bool {
     }
 }
 
-/// Check if OTEL tracing proxy is enabled for a specific language (EE only)
+/// Check if OTEL tracing proxy is enabled for a specific language (always false)
 pub async fn is_otel_tracing_proxy_enabled_for_lang(lang: &ScriptLang) -> bool {
     false && {
         let settings = OTEL_TRACING_PROXY_SETTINGS.read().await;
@@ -1299,7 +1299,7 @@ pub async fn is_otel_tracing_proxy_enabled_for_lang(lang: &ScriptLang) -> bool {
 }
 
 /// Get OTEL trace context environment variables for a job (TRACEPARENT, OTEL_TRACE_ID, OTEL_SPAN_ID).
-/// Returns an empty vec when OTEL tracing is not enabled or on non-enterprise builds.
+/// Returns an empty vec when OTEL tracing is not enabled.
 ///
 /// When the request that enqueued the job carried a valid inbound `traceparent`
 /// (propagated via the job's [`LogContext`](windmill_common::log_context::LogContext)),
@@ -2130,7 +2130,7 @@ pub fn create_span_with_name(
 
     // Parent the job span on the inbound distributed trace when the request that
     // enqueued it (or its flow root) carried a W3C `traceparent`; otherwise on
-    // the UUID-derived context. See `otel_ee::set_job_span_parent`.
+    // the UUID-derived context. `otel_oss::set_job_span_parent` is a no-op stub.
     crate::otel_oss::set_job_span_parent(&span, arc_job, &rj);
     span
 }
@@ -4250,7 +4250,6 @@ fn resolve_init_script(state: InitScriptState) {
 
 /// Returns false when the init script will never succeed (it failed, or the worker is shutting
 /// down), in which case the caller must give up instead of preparing anything.
-// Only called from the dedicated worker paths, which are gated behind the `private` feature.
 #[allow(dead_code)]
 pub(crate) async fn wait_for_init_script_completed(
     killpill_rx: &mut tokio::sync::broadcast::Receiver<()>,
@@ -6250,33 +6249,13 @@ pub async fn run_language_executor(
             .await;
         }
     } else if language == Some(ScriptLang::Mssql) {
-        {
-            return Err(Error::ExecutionErr(
-                "Microsoft SQL server is only available with an enterprise license".to_string(),
-            ));
-        }
-
-        #[allow(unreachable_code)]
-        #[cfg(not(feature = "mssql"))]
-        {
-            return Err(Error::internal_err(
-                "Microsoft SQL server requires the mssql feature to be enabled".to_string(),
-            ));
-        }
+        return Err(Error::ExecutionErr(
+            "Microsoft SQL server is only available with an enterprise license".to_string(),
+        ));
     } else if language == Some(ScriptLang::OracleDB) {
-        {
-            return Err(Error::ExecutionErr(
-                "Oracle DB is only available with an enterprise license".to_string(),
-            ));
-        }
-
-        #[allow(unreachable_code)]
-        #[cfg(not(feature = "oracledb"))]
-        {
-            return Err(Error::internal_err(
-                "Oracle DB requires the oracledb feature to be enabled".to_string(),
-            ));
-        }
+        return Err(Error::ExecutionErr(
+            "Oracle DB is only available with an enterprise license".to_string(),
+        ));
     } else if language == Some(ScriptLang::DuckDb) {
         #[allow(unreachable_code)]
         #[cfg(not(feature = "duckdb"))]

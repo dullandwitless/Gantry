@@ -320,7 +320,7 @@ async fn test_script_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     .unwrap();
     assert_eq!(resp.status(), 200, "history_update: {}", resp.text().await?);
 
-    // --- toggle_workspace_error_handler (EE-gated, expect 400 in OSS) ---
+    // --- toggle_workspace_error_handler (expect 400) ---
     let resp = authed(client().post(script_url(
         port,
         "toggle_workspace_error_handler/p",

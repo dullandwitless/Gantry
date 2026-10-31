@@ -14,7 +14,7 @@
 //!     the allowance on top of them has a binary of its own.
 //!
 //! The token is inserted directly: how a guest session is minted is the identity
-//! provider's business (EE), what one can do is this file's.
+//! provider's business, what one can do is this file's.
 //!
 //! Users from the `base` fixture:
 //!   test-user   (admin,     token SECRET_TOKEN)

@@ -292,7 +292,7 @@ async fn fetch_database_size(db: &DB) -> windmill_common::error::Result<Database
 }
 
 async fn fetch_job_retention(db: &DB) -> windmill_common::error::Result<JobRetentionInfo> {
-    // Per-workspace retention overrides (EE) make "oldest completed job vs the instance retention"
+    // Per-workspace retention overrides make "oldest completed job vs the instance retention"
     // wrong as a single global signal: each override workspace has its own effective window, so its
     // intentionally-retained jobs must be judged against that window — not the instance one. We
     // therefore compute the ratio per scope and report the worst:

@@ -325,7 +325,7 @@ async fn cleanup_job_logs(
 ) -> error::Result<()> {
     let retention_secs = JOB_RETENTION_SECS.load(std::sync::atomic::Ordering::Relaxed);
 
-    // Per-workspace retention overrides (EE). Honor them exactly like the periodic monitor sweep:
+    // Per-workspace retention overrides (never loaded in this build). Honor them exactly like the periodic monitor sweep:
     // Phase 1 deletes on the instance window but EXCLUDES override workspaces, Phase 2 deletes each
     // override workspace on its own window. Fail closed if the override set was never loaded (e.g.
     // manual cleanup triggered right after startup) — sweeping globally with an unknown override set
@@ -686,7 +686,7 @@ async fn cleanup_s3_orphans(
         now - chrono::Duration::seconds(windmill_common::service_log_retention_secs());
 
     // Job-log orphans are only considered once past a job's effective retention window. That window
-    // is the instance one OR, for an override workspace (EE), its own — and jobs orphan their logs as
+    // is the instance one OR, for an override workspace, its own — and jobs orphan their logs as
     // soon as the SHORTEST applicable window elapses. Since this scan applies a single cutoff (the S3
     // path carries only the job id, not the workspace), use the MINIMUM positive window across the
     // instance window and every positive override so no window's orphans are missed. Crucially this

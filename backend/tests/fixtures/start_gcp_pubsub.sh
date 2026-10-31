@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts the GCP Pub/Sub emulator for trigger_e2e::test_gcp_e2e (Enterprise)
+# Starts the GCP Pub/Sub emulator for trigger_e2e::test_gcp_e2e
 #
 # Usage:
 #   ./tests/fixtures/start_gcp_pubsub.sh        # start
@@ -44,4 +44,4 @@ echo "  topic:        windmill-e2e-test"
 echo "  subscription: windmill-e2e-sub"
 echo ""
 echo "Run the test:"
-echo "  PUBSUB_EMULATOR_HOST=localhost:${PORT} cargo test --test trigger_e2e test_gcp_e2e --features gcp_trigger,enterprise,private -- --ignored --nocapture"
+echo "  PUBSUB_EMULATOR_HOST=localhost:${PORT} cargo test --test trigger_e2e test_gcp_e2e --features gcp_trigger -- --ignored --nocapture"

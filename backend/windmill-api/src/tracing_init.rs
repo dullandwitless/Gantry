@@ -106,7 +106,7 @@ impl<B> MakeSpan<B> for MyMakeSpan {
 /// Registered at the top of the router layer stack in `windmill-api/src/lib.rs`
 /// so every route — and critically, the `MyOnResponse::on_response` callback
 /// that TraceLayer invokes on the way out — runs inside the scope and thus
-/// flows through to exported OTEL LogRecords via the EE LogContextBridge.
+/// can flow through to exported OTEL LogRecords via an OTEL log bridge.
 pub async fn log_context_middleware(request: Request, next: Next) -> AxumResponse {
     let trace_id = request
         .headers()

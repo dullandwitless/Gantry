@@ -285,7 +285,6 @@ mod native_retry {
 
     // ------------------------------------------------------------------
     // Per-occurrence terminal status (drives on_failure_times / on_recovery).
-    // Mirrors the exact query in windmill-ee-private jobs_ee::apply_schedule_handlers.
     // ------------------------------------------------------------------
     // `is_retry` marks the seeded job as a native retry attempt (the explicit
     // native_retry_attempt marker), the same signal `apply_schedule_handlers`
@@ -359,9 +358,8 @@ mod native_retry {
         seed_job(&db, Uuid::new_v4(), Some(f), false, "success").await; // f's WAC inline child (unmarked)
         seed_job(&db, d, None, false, "failure").await; // current occurrence
 
-        // Exact expression from jobs_ee::apply_schedule_handlers: the EXISTS counts
-        // only marked native retry children, so neither handler nor WAC inline
-        // children count as a recovery.
+        // The EXISTS counts only marked native retry children, so neither handler
+        // nor WAC inline children count as a recovery.
         let rows = sqlx::query_as::<_, (Uuid, bool)>(
             "SELECT j.id, (status = 'success' OR EXISTS (
                     SELECT 1 FROM native_retry_attempt nra

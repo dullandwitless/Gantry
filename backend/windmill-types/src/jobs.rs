@@ -47,7 +47,7 @@ pub enum JobTriggerKind {
     // A run dispatched because an upstream pipeline script wrote an asset
     // this runnable subscribes to via `// on s3://...` annotations.
     Asset,
-    // A run pushed by the pipeline freshness watchdog (EE) because the
+    // A run pushed by the pipeline freshness watchdog because the
     // script's `// freshness` window elapsed without a successful run.
     Freshness,
     // A run launched by a deployed app's runtime (`execute_component`). `trigger`
@@ -456,8 +456,8 @@ pub struct CompletedJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[sqlx(default)]
     pub resolved: Option<bool>,
-    // None does NOT imply automatic: attribution is enterprise-only, so a manual resolution in
-    // CE is also None, and list responses omit it deliberately. Use `resolved_automatically`.
+    // None does NOT imply automatic: attribution is not recorded in this build, so a manual
+    // resolution is also None, and list responses omit it deliberately. Use `resolved_automatically`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[sqlx(default)]
     pub resolved_by: Option<String>,
@@ -468,8 +468,8 @@ pub struct CompletedJob {
     #[sqlx(default)]
     pub resolution_note: Option<String>,
     // True when a succeeding retry resolved this, rather than a person. Explicit rather than
-    // inferred from a NULL `resolved_by`, which is also NULL for a manual resolution outside
-    // enterprise (attribution is an EE feature).
+    // inferred from a NULL `resolved_by`, which is also NULL for a manual resolution (attribution
+    // is not recorded in this build).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[sqlx(default)]
     pub resolved_automatically: Option<bool>,
@@ -748,7 +748,7 @@ pub const RESERVED_CONTROL_ARGS: [&str; 3] =
 /// request that enqueued the job (run endpoints). It rides the `args` jsonb like
 /// [`ENTRYPOINT_OVERRIDE`]; normal scripts never see it because args are bound by
 /// declared parameter name. Read back at root-job completion to link the job's
-/// OTLP span to the originating distributed trace (EE/OTel only).
+/// OTLP span to the originating distributed trace.
 pub const WM_TRACEPARENT: &str = "_wm_traceparent";
 
 /// The entrypoint override (`_ENTRYPOINT_OVERRIDE` job arg ->
