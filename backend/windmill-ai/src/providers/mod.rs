@@ -43,7 +43,6 @@ pub(crate) fn completions_tools_need_reasoning_off(model: &str) -> bool {
 
 /// What the backend needs to know about a model's reasoning: the rows of `REASONING_RULES`
 /// in the frontend's `reasoningRegistry.ts`, cut down to the two facts the wire needs.
-/// `reasoningParity.json` next to that file is checked by both sides' tests.
 struct ReasoningRule {
     matches: fn(&str) -> bool,
     /// False when the provider rejects every disable, so the off sentinel must not be sent.
@@ -267,33 +266,6 @@ pub fn remember_chat_completions_only(base_url: &str, model: &str) {
 #[cfg(test)]
 mod reasoning_rule_tests {
     use super::*;
-
-    /// The frontend registry's test reads the same file. These rules see the model id
-    /// alone, so it holds only rows whose answer doesn't depend on the provider.
-    #[test]
-    fn agrees_with_the_frontend_registry() {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../../frontend/src/lib/components/copilot/reasoningParity.json"
-        ))
-        .unwrap();
-        for row in rows {
-            let model = row["model"].as_str().unwrap();
-            let can_disable = row["canDisable"].as_bool().unwrap();
-            let tools_need_off = row["completionsToolsNeedOff"].as_bool().unwrap();
-            let sent = effective_reasoning_effort(model, Some(REASONING_OFF_SENTINEL));
-            assert_eq!(sent.is_some(), can_disable, "{model}");
-            assert_eq!(
-                effective_reasoning_effort(model, Some("low")),
-                Some("low"),
-                "{model}"
-            );
-            assert_eq!(
-                completions_tools_need_reasoning_off(model),
-                tools_need_off && can_disable,
-                "{model}"
-            );
-        }
-    }
 
     #[test]
     fn reads_ids_the_frontend_resolves_first() {

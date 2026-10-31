@@ -1,0 +1,28 @@
+diff --git a/backend/windmill-queue/src/jobs.rs b/backend/windmill-queue/src/jobs.rs
+index b5c9eec..b032d52 100644
+--- a/backend/windmill-queue/src/jobs.rs
++++ b/backend/windmill-queue/src/jobs.rs
+@@ -8973,23 +8973,6 @@ mod preset_handler_path_tests {
+             "script/u/me/workspace-or-schedule-error-handler-slack"
+         ));
+     }
+-
+-    /// A preset version bumped in the frontend without being pinned here would silently run as
+-    /// the schedule's owner and lose access to the Slack bot token.
+-    #[test]
+-    fn frontend_presets_are_pinned() {
+-        let hub_paths: std::collections::HashMap<String, String> =
+-            serde_json::from_str(include_str!("../../../frontend/src/lib/hubPaths.json")).unwrap();
+-        for (name, path) in hub_paths {
+-            // Variable expiration handlers run as their own group whatever their path.
+-            if path.contains("-handler-") && !path.contains("variable-expiration") {
+-                assert!(
+-                    is_preset_handler_path(&path),
+-                    "{name}: {path} is not pinned"
+-                );
+-            }
+-        }
+-    }
+ }
+ 
+ #[cfg(test)]

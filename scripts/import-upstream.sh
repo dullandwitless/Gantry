@@ -53,6 +53,13 @@ for path in "${not_imported[@]}"; do rm -rf "${backend:?}/$path"; done
 
 cp "$upstream/openflow.openapi.yaml" "$repo_root/openflow.openapi.yaml"
 
+# Test data outside backend/ that backend tests include by relative path.
+shared_fixtures=(cli/test/fixtures/item_digest_vectors.json)
+for path in "${shared_fixtures[@]}"; do
+  mkdir -p "$repo_root/$(dirname "$path")"
+  cp "$upstream/$path" "$repo_root/$path"
+done
+
 cargo build --release --quiet --manifest-path "$repo_root/tools/cfg-strip/Cargo.toml"
 strip_args=()
 for f in "${disabled_features[@]}"; do strip_args+=(--disable "$f"); done
@@ -60,6 +67,13 @@ for f in "${disabled_features[@]}"; do strip_args+=(--disable "$f"); done
 # Exits non-zero while anything still needs manual review.
 status=0
 "$repo_root/tools/cfg-strip/target/release/cfg-strip" "${strip_args[@]}" "$backend" || status=$?
+
+# Fix-ups the stripper cannot make (e.g. tests that read upstream frontend
+# files, which Gantry never imports). Each must apply cleanly.
+for patch in "$repo_root"/patches/*.patch; do
+  [[ -e "$patch" ]] || continue
+  git -C "$repo_root" apply --whitespace=nowarn "$patch"
+done
 
 echo "$commit" > "$repo_root/UPSTREAM_COMMIT"
 echo "Imported upstream $commit"
