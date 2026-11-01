@@ -5,7 +5,7 @@ oauth2.json
 tracing.folded
 heaptrack*
 index/
-windmill-api/openapi-*.*
+windmill-api/openapi-bundled.yaml
 .duckdb/*
 *ee.rs
 generate_mcp_endpoints_tools/venv

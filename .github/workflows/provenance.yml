@@ -12,6 +12,22 @@ jobs:
       - name: No proprietary feature gates remain
         run: scripts/check-no-ee.sh
 
+  # The server embeds these generated files, so they are committed; this keeps
+  # them from drifting from openapi.yaml.
+  openapi-generated:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/windmill-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: ./build_openapi.sh
+      - name: Generated spec matches openapi.yaml
+        run: git diff --exit-code -- openapi-deref.yaml openapi-deref.json
+
   cfg-strip:
     runs-on: ubuntu-latest
     defaults:
