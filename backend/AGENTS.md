@@ -33,7 +33,7 @@ MUST **restart the backend with the appropriate features** for what you're worki
 
 Restart in the **same pane**, so the relaunch inherits that pane's `DATABASE_URL`, `BACKEND_PORT`
 and the rest of the worktree environment. Scope every kill to this worktree — **never**
-`pkill -f target/debug/windmill`, which kills every sibling worktree's backend.
+`pkill -f target/debug/gantry`, which kills every sibling worktree's backend.
 
 1. Find the backend pane by where it is running, not by index. Under herdr the two server panes
    sit in the worktree's `backend/` and `frontend/`, so match on `cwd`:
@@ -94,7 +94,7 @@ It gets reparented to `systemd --user` when its shell dies, so it survives every
 like a cleanup.
 
 Confirm all three before killing anything — a dozen sibling worktrees run their own backend, and
-`pkill -f windmill` (or `-f target/debug/windmill`) kills every one of them:
+`pkill -f gantry` (or `-f target/debug/gantry`) kills every one of them:
 
 ```bash
 ss -ltnp | grep ":$BACKEND_PORT"          # 1. which pid holds the port

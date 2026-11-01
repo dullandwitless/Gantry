@@ -574,7 +574,7 @@ async fn assume_bedrock_role(
     {
         let _ = (db, w_id, authed, role_arn, region, session_name);
         Err(Error::BadRequest(
-            "Assuming an AWS role through Windmill's OIDC provider requires an enterprise license"
+            "Assuming an AWS role through OIDC is not supported in Gantry"
                 .to_string(),
         ))
     }
@@ -621,7 +621,7 @@ async fn mint_anthropic_oidc_token(db: &DB, w_id: &str, authed: &ApiAuthed) -> R
     {
         let _ = (db, w_id, authed);
         Err(Error::BadRequest(
-            "Anthropic Workload Identity Federation through Windmill's OIDC provider requires an enterprise license"
+            "Anthropic Workload Identity Federation through OIDC is not supported in Gantry"
                 .to_string(),
         ))
     }

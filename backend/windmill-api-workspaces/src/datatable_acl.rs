@@ -302,7 +302,7 @@ fn ensure_managed(governing: &GoverningDatatable) -> Result<DatatableRoleCluster
     governing.role_cluster().ok_or_else(|| {
         Error::BadRequest(format!(
             "Data table '{}' is backed by a Postgres resource, so its access is managed on that \
-             server directly. Only a data table on a database Windmill manages has data table \
+             server directly. Only a data table on a database Gantry manages has data table \
              roles to grant to.",
             governing.name
         ))

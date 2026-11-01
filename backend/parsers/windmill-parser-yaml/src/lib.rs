@@ -610,7 +610,7 @@ fn extract_ssh_identity(value: &Yaml, ret: &mut Vec<String>) -> anyhow::Result<(
     for r in indentities {
         let Yaml::String(file_name) = r else {
             return Err(anyhow!(
-                "Git ssh identity file must be a string path to a Windmill variable/secret"
+                "Git ssh identity file must be a string path to a Gantry variable/secret"
             ));
         };
 

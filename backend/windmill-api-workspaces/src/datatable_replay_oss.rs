@@ -19,7 +19,7 @@ use {
 
 pub(crate) fn ensure_replay() -> Result<()> {
     Err(Error::BadRequest(
-        "Cloning a data table under roles is a Windmill Enterprise Edition feature: the copy \
+        "Cloning a data table under roles is not supported in Gantry: the copy \
          needs the source's owners and grants replayed. Fork it keeping the original database \
          instead."
             .to_string(),

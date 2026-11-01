@@ -36,13 +36,13 @@ pub async fn set_password(
     _ep: EditPassword,
 ) -> Result<String> {
     Err(Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
 pub fn hash_password(_argon2: Arc<Argon2<'_>>, _password: String) -> Result<String> {
     Err(Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
@@ -59,6 +59,6 @@ pub async fn submit_onboarding_data(
     Json(_data): Json<OnboardingData>,
 ) -> Result<String> {
     Err(Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }

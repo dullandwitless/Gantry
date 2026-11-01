@@ -2054,7 +2054,7 @@ async fn create_script_internal<'c>(
                 }
                 if !m.manual {
                     return Err(Error::BadRequest(
-                        "`// materialize dbt://…` must be `manual`: Windmill generates no \
+                        "`// materialize dbt://…` must be `manual`: Gantry generates no \
                          warehouse DDL, so the script issues its own write and only the outcome \
                          is recorded. Write \
                          `// materialize manual dbt://<warehouse>/<schema>/<name>`."

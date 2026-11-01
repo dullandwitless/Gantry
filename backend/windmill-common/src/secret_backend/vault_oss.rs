@@ -34,19 +34,19 @@ impl VaultBackend {
 impl SecretBackend for VaultBackend {
     async fn get_secret(&self, _workspace_id: &str, _path: &str) -> Result<String> {
         Err(Error::internal_err(
-            "HashiCorp Vault integration requires Enterprise Edition".to_string(),
+            "HashiCorp Vault integration is not supported in Gantry".to_string(),
         ))
     }
 
     async fn set_secret(&self, _workspace_id: &str, _path: &str, _value: &str) -> Result<()> {
         Err(Error::internal_err(
-            "HashiCorp Vault integration requires Enterprise Edition".to_string(),
+            "HashiCorp Vault integration is not supported in Gantry".to_string(),
         ))
     }
 
     async fn delete_secret(&self, _workspace_id: &str, _path: &str) -> Result<()> {
         Err(Error::internal_err(
-            "HashiCorp Vault integration requires Enterprise Edition".to_string(),
+            "HashiCorp Vault integration is not supported in Gantry".to_string(),
         ))
     }
 
@@ -67,28 +67,28 @@ pub async fn create_secret_backend(
         SecretBackendConfig::Database => Ok(Arc::new(DatabaseBackend::new(db))),
         SecretBackendConfig::HashiCorpVault(_) => {
             tracing::warn!(
-                "HashiCorp Vault is configured but requires Enterprise Edition. \
+                "HashiCorp Vault is configured but is not supported in Gantry. \
                  Falling back to database backend."
             );
             Ok(Arc::new(DatabaseBackend::new(db)))
         }
         SecretBackendConfig::AzureKeyVault(_) => {
             tracing::warn!(
-                "Azure Key Vault is configured but requires Enterprise Edition. \
+                "Azure Key Vault is configured but is not supported in Gantry. \
                  Falling back to database backend."
             );
             Ok(Arc::new(DatabaseBackend::new(db)))
         }
         SecretBackendConfig::AwsSecretsManager(_) => {
             tracing::warn!(
-                "AWS Secrets Manager is configured but requires Enterprise Edition. \
+                "AWS Secrets Manager is configured but is not supported in Gantry. \
                  Falling back to database backend."
             );
             Ok(Arc::new(DatabaseBackend::new(db)))
         }
         SecretBackendConfig::HttpStore(_) => {
             tracing::warn!(
-                "The HTTP secret store is configured but requires Enterprise Edition. \
+                "The HTTP secret store is configured but is not supported in Gantry. \
                  Falling back to database backend."
             );
             Ok(Arc::new(DatabaseBackend::new(db)))
@@ -99,7 +99,7 @@ pub async fn create_secret_backend(
 /// Test connection to Vault (OSS stub)
 pub async fn test_vault_connection(_settings: &VaultSettings, _db: Option<&DB>) -> Result<()> {
     Err(Error::internal_err(
-        "HashiCorp Vault integration requires Enterprise Edition".to_string(),
+        "HashiCorp Vault integration is not supported in Gantry".to_string(),
     ))
 }
 
@@ -109,7 +109,7 @@ pub async fn migrate_secrets_to_vault(
     _settings: &VaultSettings,
 ) -> Result<SecretMigrationReport> {
     Err(Error::internal_err(
-        "HashiCorp Vault integration requires Enterprise Edition".to_string(),
+        "HashiCorp Vault integration is not supported in Gantry".to_string(),
     ))
 }
 
@@ -119,14 +119,14 @@ pub async fn migrate_secrets_to_database(
     _settings: &VaultSettings,
 ) -> Result<SecretMigrationReport> {
     Err(Error::internal_err(
-        "HashiCorp Vault integration requires Enterprise Edition".to_string(),
+        "HashiCorp Vault integration is not supported in Gantry".to_string(),
     ))
 }
 
 /// Generate a JWT for Vault authentication (OSS stub)
 pub async fn generate_vault_jwt(_db: &DB, _vault_address: &str) -> Result<String> {
     Err(Error::internal_err(
-        "HashiCorp Vault integration requires Enterprise Edition".to_string(),
+        "HashiCorp Vault integration is not supported in Gantry".to_string(),
     ))
 }
 
@@ -138,6 +138,6 @@ pub async fn read_vault_external_secret(
     _key: Option<&str>,
 ) -> Result<String> {
     Err(Error::internal_err(
-        "HashiCorp Vault integration requires Enterprise Edition".to_string(),
+        "HashiCorp Vault integration is not supported in Gantry".to_string(),
     ))
 }

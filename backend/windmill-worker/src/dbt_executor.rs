@@ -1665,7 +1665,7 @@ async fn install_packages(
     .await?;
     let resolved_lock_digest = package_lock_digest(&p.project_dir).await?.ok_or_else(|| {
         Error::ExecutionErr(
-            "`dbt deps` completed without producing package-lock.yml; Windmill cannot pin this \
+            "`dbt deps` completed without producing package-lock.yml; Gantry cannot pin this \
              dependency resolution across workers"
                 .to_string(),
         )
@@ -2120,7 +2120,7 @@ async fn adapter_from_profiles_yml(
         only.ok_or_else(|| {
             Error::BadRequest(format!(
                 "{} selects its target with a template (`{target}`), which dbt renders and \
-                 Windmill does not, and defines several outputs. Set `profile.target` in the \
+                 Gantry does not, and defines several outputs. Set `profile.target` in the \
                  descriptor to say which one this script runs",
                 path.display()
             ))
@@ -2148,7 +2148,7 @@ async fn adapter_from_profiles_yml(
         None => {
             return Err(Error::BadRequest(format!(
                 "{} does not state its adapter as a literal `type` — templated, or absent. \
-                 Windmill cannot resolve it, and the adapter decides both the engine and the \
+                 Gantry cannot resolve it, and the adapter decides both the engine and the \
                  licence, so spell it literally in the target",
                 path.display()
             )))
@@ -2442,7 +2442,7 @@ fn reject_reserved_env<'a>(
     for k in env {
         if RESERVED_ENV_KEYS.iter().any(|r| r.eq_ignore_ascii_case(k)) {
             return Err(Error::BadRequest(format!(
-                "`{k}` is set by Windmill and cannot be overridden from {source}: it decides \
+                "`{k}` is set by Gantry and cannot be overridden from {source}: it decides \
                  where dbt writes the artifacts this runtime reads"
             )));
         }

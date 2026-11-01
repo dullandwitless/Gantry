@@ -1072,7 +1072,7 @@ async fn execute_windmill_tools(
             let module = tool
                 .module
                 .as_ref()
-                .ok_or_else(|| Error::internal_err("Windmill tool has no module".to_string()))?;
+                .ok_or_else(|| Error::internal_err("Gantry tool has no module".to_string()))?;
             messages.push(OpenAIMessage {
                 role: "tool".to_string(),
                 content: Some(OpenAIContent::Text(content.clone())),

@@ -65,7 +65,7 @@ async fn only_the_enterprise_edition_has_the_access_editor(
         assert_eq!(resp.status(), 400, "{action}");
         let body = resp.text().await?;
         assert!(
-            body.contains("Data table roles are a Windmill Enterprise Edition feature"),
+            body.contains("Data table roles are not supported in Gantry"),
             "{action}: {body}"
         );
     }

@@ -124,6 +124,6 @@ pub async fn get_audit(tx: Transaction<'_, Postgres>, _id: i32, _w_id: &str) -> 
     // Stub: not implemented.
     tx.commit().await?;
     Err(Error::NotFound(
-        "Audit log not not available in Windmill Community edition".to_string(),
+        "Audit logs are not supported in Gantry".to_string(),
     ))
 }

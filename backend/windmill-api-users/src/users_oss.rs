@@ -13,7 +13,7 @@ pub async fn impersonate_service_account(
     _req: ImpersonateServiceAccountRequest,
 ) -> windmill_common::error::Result<(StatusCode, String)> {
     Err(windmill_common::error::Error::BadRequest(
-        "Service accounts require Windmill Enterprise Edition".to_string(),
+        "Service accounts are not supported in Gantry".to_string(),
     ))
 }
 
@@ -21,7 +21,7 @@ pub(crate) async fn portal_cloud_trial_login(
     _email: &str,
 ) -> windmill_common::error::Result<crate::users::PortalTrialLogin> {
     Err(windmill_common::error::Error::FeatureUnavailable(
-        "Starting a pre-approved trial from Windmill Cloud requires Windmill Enterprise Edition"
+        "Starting a pre-approved trial from Windmill Cloud is not supported in Gantry"
             .to_string(),
     ))
 }

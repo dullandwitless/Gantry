@@ -252,7 +252,7 @@ pub fn private_git_host_hint(caller: GitRemoteCaller) -> Option<String> {
         format!(
             "Only workspace admins can reach a git server on a private network. To allow \
              every user, set the {ALLOW_LOCAL_GIT_REMOTES_ENV}=true environment variable on \
-             the Windmill servers"
+             the Gantry servers"
         )
     })
 }

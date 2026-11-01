@@ -888,7 +888,7 @@ async fn help_text(db: &DB, msg: &SlackMessage, note: Option<String>) -> Result<
         let text = if msg.channel_id.starts_with('D') {
             "Agents answer in the Slack channels they're shared in, not in direct messages."
         } else {
-            "No agent is shared in this channel. Anyone who can edit an agent in Windmill can share it here from its settings."
+            "No agent is shared in this channel. Anyone who can edit an agent in Gantry can share it here from its settings."
         };
         return Ok(format!("{note}{text}"));
     };
@@ -1017,7 +1017,7 @@ async fn answer(
         Some(share) if !share.anyone => {
             let Some(email) = email else {
                 return reply.send(
-                    "Windmill can't read your Slack email. A workspace admin needs to reconnect Slack in the workspace settings to grant it.".to_string(),
+                    "Gantry can't read your Slack email. A workspace admin needs to reconnect Slack in the workspace settings to grant it.".to_string(),
                     None,
                 )
                 .await;
@@ -1033,7 +1033,7 @@ async fn answer(
             let Some(member) = member else {
                 return reply.send(
                     format!(
-                        "Your Slack email isn't a member of the Windmill workspace *{w_id}*. Ask an admin to invite you."
+                        "Your Slack email isn't a member of the Gantry workspace *{w_id}*. Ask an admin to invite you."
                     ),
                     None,
                 )
@@ -1091,7 +1091,7 @@ async fn answer(
             Err(Error::NotFound(_)) if members_only => {
                 return reply
                     .send(
-                        format!("You don't have access to `{agent_path}` in Windmill."),
+                        format!("You don't have access to `{agent_path}` in Gantry."),
                         None,
                     )
                     .await;

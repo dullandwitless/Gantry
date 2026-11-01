@@ -1292,14 +1292,14 @@ fn is_empty_or_null(value: &serde_json::Value) -> bool {
 /// Maximum retention period in seconds for CE builds (30 days).
 pub const CE_MAX_RETENTION_PERIOD_SECS: i64 = 30 * 24 * 3600;
 
-/// Clamp `retention_period_secs` to `CE_MAX_RETENTION_PERIOD_SECS` on CE builds.
+/// Clamp `retention_period_secs` to `CE_MAX_RETENTION_PERIOD_SECS` .
 /// Returns the (possibly clamped) value.
 pub fn clamp_retention_period(value: serde_json::Value) -> serde_json::Value {
     {
         if let Some(secs) = value.as_i64() {
             if secs > CE_MAX_RETENTION_PERIOD_SECS {
                 tracing::warn!(
-                    "Clamping retention_period_secs from {} to {} (CE max: 30 days)",
+                    "Clamping retention_period_secs from {} to {} (max: 30 days)",
                     secs,
                     CE_MAX_RETENTION_PERIOD_SECS
                 );

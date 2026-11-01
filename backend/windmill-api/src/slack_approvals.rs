@@ -526,7 +526,7 @@ async fn transform_schemas(
 
     let link_label = match skin {
         ApprovalSkin::Detailed => "Flow suspension details",
-        ApprovalSkin::Minimal => "View in Windmill",
+        ApprovalSkin::Minimal => "View in Gantry",
     };
     let mut blocks = vec![serde_json::json!({
         "type": "section",

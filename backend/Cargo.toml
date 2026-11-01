@@ -87,7 +87,7 @@ authors = ["Ruben Fiszel <ruben@windmill.dev>"]
 edition = "2021"
 
 [[bin]]
-name = "windmill"
+name = "gantry"
 path = "./src/main.rs"
 
 [profile.dev]

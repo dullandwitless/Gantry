@@ -1659,13 +1659,13 @@ pub async fn instance_pg_disabled<'c>(executor: impl sqlx::PgExecutor<'c>) -> Re
 pub async fn ensure_instance_pg_available<'c>(executor: impl sqlx::PgExecutor<'c>) -> Result<()> {
     if *crate::worker::CLOUD_HOSTED {
         return Err(Error::BadRequest(
-            "Windmill's own database cannot back a data table or Ducklake catalog on Windmill Cloud"
+            "Gantry's own database cannot back a data table or Ducklake catalog on Windmill Cloud"
                 .to_string(),
         ));
     }
     if instance_pg_disabled(executor).await? {
         return Err(Error::BadRequest(
-            "Windmill's own database is disabled as a data table and Ducklake substrate on this \
+            "Gantry's own database is disabled as a data table and Ducklake substrate on this \
              instance. Use the external instance cluster, or turn it back on in the instance \
              settings."
                 .to_string(),
@@ -2069,8 +2069,8 @@ async fn resolve_datatable_connection_unchecked(
         // ones: every job, API call and trigger reaches a data table through here.
         if instance_pg_disabled(db).await? {
             return Err(Error::BadRequest(format!(
-                "data table {} is on Windmill's own database, which is disabled on this instance. \
-                 Move it to the external instance cluster or a Postgres resource, or turn Windmill's \
+                "data table {} is on Gantry's own database, which is disabled on this instance. \
+                 Move it to the external instance cluster or a Postgres resource, or turn Gantry's \
                  database back on in the instance settings.",
                 governing.name
             )));
@@ -3717,7 +3717,7 @@ pub fn lfs_entry_storage_ref(entry: &serde_json::Value) -> Option<String> {
 }
 
 pub const FILESYSTEM_STORAGE_DEV_ONLY_MSG: &str =
-    "Filesystem storage is only available in development builds of Windmill: it points the \
+    "Filesystem storage is only available in development builds of Gantry: it points the \
      workspace at a directory on the server's own disk rather than at a resource. Use an S3, \
      Azure Blob or Google Cloud Storage backend instead.";
 

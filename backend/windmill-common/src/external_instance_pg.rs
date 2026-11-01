@@ -336,7 +336,7 @@ pub async fn ensure_external_instance_database_registered(
         return Ok(());
     }
     Err(Error::BadRequest(format!(
-        "Windmill did not create a database named '{dbname}' on the external instance cluster. \
+        "Gantry did not create a database named '{dbname}' on the external instance cluster. \
          Create it from the instance settings first."
     )))
 }

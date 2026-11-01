@@ -242,7 +242,7 @@ async fn create_group(
     // Admins stay allowed: `wmill sync push` recreates exported groups through this endpoint.
     if !authed.is_admin && windmill_common::RESERVED_GROUP_NAMES.contains(&ng.name.as_str()) {
         return Err(Error::BadRequest(format!(
-            "Group name {} is reserved by Windmill; only an admin can create it",
+            "Group name {} is reserved by Gantry; only an admin can create it",
             ng.name
         )));
     }

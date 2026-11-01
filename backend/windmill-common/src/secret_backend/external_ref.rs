@@ -234,7 +234,7 @@ async fn authorize(
     if let (Some(managed), Some(conn)) = (&managed, &conn) {
         if is_managed_storage(managed, conn, &r.path) {
             return Err(Error::PermissionDenied(format!(
-                "External secret `vault://{}` points into the storage of Windmill's own Vault secret backend",
+                "External secret `vault://{}` points into the storage of Gantry's own Vault secret backend",
                 r.path
             )));
         }

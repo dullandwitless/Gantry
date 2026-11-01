@@ -341,7 +341,7 @@ async fn create_deployment_request(
     // Send a deployment-request email to each assignee.
     let base_url = (**BASE_URL.load()).clone();
     let subject = format!(
-        "[Windmill] @{} requested a deployment on fork {w_id}",
+        "[Gantry] @{} requested a deployment on fork {w_id}",
         authed.username
     );
     let body_text = format!(
@@ -432,7 +432,7 @@ async fn cancel_deployment_request(
     )
     .fetch_all(&db)
     .await?;
-    let subject = format!("[Windmill] Deployment request on fork {w_id} cancelled");
+    let subject = format!("[Gantry] Deployment request on fork {w_id} cancelled");
     let body_text = format!(
         "@{} cancelled the open deployment request on fork {w_id}.",
         authed.username
@@ -541,7 +541,7 @@ async fn close_deployment_request_merged(
     let mut recipients: BTreeSet<String> = assignee_emails.into_iter().collect();
     recipients.insert(row.requested_by_email);
     recipients.remove(&authed.email);
-    let subject = format!("[Windmill] Deployment request on fork {w_id} merged");
+    let subject = format!("[Gantry] Deployment request on fork {w_id} merged");
     let base_url = (**BASE_URL.load()).clone();
     let body_text = format!(
         "@{} merged the deployment request from @{} on fork {w_id}.\n\n{base_url}/?workspace={w_id}",
@@ -689,7 +689,7 @@ async fn create_deployment_request_comment(
     recipients.remove(&authed.email);
 
     let subject = format!(
-        "[Windmill] New comment on deployment request for fork {w_id} by @{}",
+        "[Gantry] New comment on deployment request for fork {w_id} by @{}",
         authed.username
     );
     let base_url = (**BASE_URL.load()).clone();

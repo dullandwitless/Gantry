@@ -61,7 +61,7 @@ impl CrossSiteGetGuard {
         Err(Error::PermissionDenied(
             "a cross-site GET request cannot run a Hub script with the session cookie, which takes \
              precedence over a `token` query parameter: pass the token in the `Authorization` \
-             header, or open the link from the instance itself or from a browser with no Windmill \
+             header, or open the link from the instance itself or from a browser with no Gantry \
              session"
                 .to_string(),
         ))

@@ -437,7 +437,7 @@ async fn provision_fusion(
     append_logs(
         job_id,
         w_id,
-        "\nFetching the dbt Fusion engine from dbt Labs (not bundled with Windmill; \
+        "\nFetching the dbt Fusion engine from dbt Labs (not bundled with Gantry; \
          subject to the dbt Fusion engine license agreement)...\n"
             .to_string(),
         conn,

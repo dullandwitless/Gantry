@@ -1721,7 +1721,7 @@ async fn drop_instance_database_keep_entry_on(
     let wmill_pg_creds = PgDatabase::parse_uri(&get_database_url().await?.as_str().await)?;
     if wmill_pg_creds.dbname.trim().eq_ignore_ascii_case(dbname) {
         return Err(error::Error::BadRequest(
-            "Cannot drop the main Windmill database".to_string(),
+            "Cannot drop the main Gantry database".to_string(),
         ));
     }
 

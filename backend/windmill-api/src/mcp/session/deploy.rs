@@ -82,7 +82,7 @@ fn refuse_staged_triggers(item_type: &str, path: &str, draft: &Value) -> Result<
         .is_some_and(|triggers| triggers.iter().any(|t| truthy(t.get("draftConfig"))));
     if staged {
         return Err(format!(
-            "Draft {item_type} \"{path}\" also stages trigger changes made in the Windmill editor, which \
+            "Draft {item_type} \"{path}\" also stages trigger changes made in the Gantry editor, which \
              cannot be deployed from here. Deploy it from the editor so they are not lost."
         ));
     }
@@ -1965,7 +1965,7 @@ fn search_entries(
 /// that is only valid in its own workspace, and the comparison reads the parent's
 /// items under the caller's rights there.
 async fn parent_comparison_unavailable(ctx: &Ctx<'_>) -> String {
-    let unavailable = "Comparing a fork with its parent workspace is not available on this server. Use diff without 'against' to compare drafts vs deployed versions, or the fork's compare page in Windmill for the comparison with the parent.";
+    let unavailable = "Comparing a fork with its parent workspace is not available on this server. Use diff without 'against' to compare drafts vs deployed versions, or the fork's compare page in Gantry for the comparison with the parent.";
     let Ok(user) = ctx.get("/workspaces/users").await else {
         return unavailable.to_string();
     };
@@ -2098,7 +2098,7 @@ pub(super) async fn show_deploy_review(ctx: &Ctx<'_>, args: &Value) -> ToolResul
         });
         if row.kind == "app" {
             // `deploy_workspace_item` deploys raw apps only.
-            item["note"] = json!("A classic app: deploy it from its editor in Windmill.");
+            item["note"] = json!("A classic app: deploy it from its editor in Gantry.");
         } else if let Some(error) = &m.error {
             item["error"] = json!(format!("Could not diff it: {error}"));
         } else if !m.parts.has_changes && !m.value_uncomparable {

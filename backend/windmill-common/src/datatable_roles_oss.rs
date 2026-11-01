@@ -17,7 +17,7 @@ use crate::error::Error;
 /// What every roles path answers. The frontend matches this exact
 /// sentence (`datatableUsableRoles.ts`) to read the refusal as "not under roles": reword both.
 pub fn datatable_roles_unavailable() -> Error {
-    Error::BadRequest("Data table roles are a Windmill Enterprise Edition feature".to_string())
+    Error::BadRequest("Data table roles are not supported in Gantry".to_string())
 }
 
 pub(crate) use ce::*;

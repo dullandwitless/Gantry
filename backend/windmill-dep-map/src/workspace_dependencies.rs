@@ -166,7 +166,7 @@ pub async fn trigger_dependents_to_recompute_dependencies_in_the_background(
                             workspace_id = %workspace_id,
                             path = %path,
                             error = %e,
-                            "CRITICAL: failed to get dependents for workspace dependencies - dependent runnables are not being redeployed. Please contact the Windmill team"
+                            "CRITICAL: failed to get dependents for workspace dependencies - dependent runnables are not being redeployed. Please report this as a bug"
                         );
                         return;
                     }
@@ -185,7 +185,7 @@ pub async fn trigger_dependents_to_recompute_dependencies_in_the_background(
                     workspace_id = %workspace_id,
                     path = %path,
                     error = %e,
-                    "CRITICAL: failed to trigger dependents to recompute dependencies - dependent runnables are not being redeployed. Please contact the Windmill team"
+                    "CRITICAL: failed to trigger dependents to recompute dependencies - dependent runnables are not being redeployed. Please report this as a bug"
                 );
             }
     });

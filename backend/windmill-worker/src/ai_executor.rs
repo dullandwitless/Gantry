@@ -1002,7 +1002,7 @@ pub async fn handle_ai_agent_job(
             }
             ToolValue::FlowModule(_) => {
                 // Regular Windmill flow module (script, flow, etc.) - convert to FlowModule
-                tracing::debug!("Windmill module: {:?}", tool.id);
+                tracing::debug!("Gantry module: {:?}", tool.id);
                 if let Some(description) = tool
                     .description
                     .as_ref()

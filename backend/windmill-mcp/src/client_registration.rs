@@ -213,7 +213,7 @@ pub async fn get_or_refresh_mcp_client(
     let (client_id, client_secret, expires_at) = if supports_dynamic_registration {
         let reg_endpoint = metadata.registration_endpoint.as_ref().unwrap();
         tracing::debug!("Performing DCR at {}", reg_endpoint);
-        let dcr = register_client(reg_endpoint, &redirect_uri, "Windmill").await?;
+        let dcr = register_client(reg_endpoint, &redirect_uri, "Gantry").await?;
 
         let expires_at = dcr.client_secret_expires_at.and_then(|ts| {
             if ts == 0 {

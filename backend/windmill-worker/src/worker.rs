@@ -845,7 +845,7 @@ pub async fn read_ee_registry<T>(
         append_logs(
             job_id,
             w_id,
-            format!("Private registry ({name}) configuration ignored: this feature requires Windmill Enterprise Edition\n"),
+            format!("Private registry ({name}) configuration ignored: this feature is not supported in Gantry\n"),
             conn,
         )
         .await;
@@ -905,7 +905,7 @@ pub async fn read_ee_registry_bool_with_workspace_override(
         append_logs(
             job_id,
             w_id,
-            format!("Private registry ({display_name}) configuration ignored: this feature requires Windmill Enterprise Edition\n"),
+            format!("Private registry ({display_name}) configuration ignored: this feature is not supported in Gantry\n"),
             conn,
         )
         .await;
@@ -1160,7 +1160,7 @@ pub fn check_no_network_imports(
         None => Ok(()),
         Some(import) => Err(windmill_common::error::Error::ExecutionErr(format!(
             "Script has the `no_network` annotation but imports the workspace script \
-            `{import}`, which {fetched_by} fetches from the Windmill API while the script runs, \
+            `{import}`, which {fetched_by} fetches from the Gantry API while the script runs, \
             and the script has no network. Remove `no_network`, or copy that code into the \
             script."
         ))),
@@ -4881,7 +4881,7 @@ pub async fn handle_queued_job(
                 && !job.kind.is_dependency()
             {
                 logs.push_str("---\n");
-                logs.push_str("WARNING: This job has concurrency limits enabled. Concurrency limits are an EE feature and the setting is ignored.\n");
+                logs.push_str("WARNING: This job has concurrency limits enabled. Concurrency limits are not supported in Gantry and the setting is ignored.\n");
                 logs.push_str("---\n");
             }
         }

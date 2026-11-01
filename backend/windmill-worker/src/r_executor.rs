@@ -75,7 +75,7 @@ pub async fn handle_r_job<'a>(
 
     if !std::path::Path::new(RSCRIPT_PATH.as_str()).exists() {
         return Err(Error::ExecutionErr(format!(
-            "Rscript binary not found at '{}'. R is only available in the windmill-full (CE) or windmill-ee-full (EE) Docker images.",
+            "R is not installed on this worker (Rscript not found at '{}'). Install R on the workers that run R jobs, or point RSCRIPT_PATH at it.",
             *RSCRIPT_PATH
         )));
     }

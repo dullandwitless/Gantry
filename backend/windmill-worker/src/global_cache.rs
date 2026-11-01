@@ -87,7 +87,7 @@ pub async fn save_cache(
             windmill_common::worker::atomic_copy_file(origin, local_cache_path)?;
         }
         Ok(format!(
-            "\nwrote cached binary: {} (backed by EE distributed object store: {_cached_to_s3})\n",
+            "\nwrote cached binary: {} (uploaded to the object store: {_cached_to_s3})\n",
             local_cache_path
         ))
     } else if _cached_to_s3 {

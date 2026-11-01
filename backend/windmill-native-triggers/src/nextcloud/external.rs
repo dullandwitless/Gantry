@@ -354,7 +354,7 @@ impl External for NextCloud {
                 Some("reconnect the Nextcloud account this uses with Reconnect next to it, or ask its owner or an admin to.")
             }
             StatusCode::FORBIDDEN => Some(
-                "Nextcloud grants webhook management to administrators only, and a Windmill \
+                "Nextcloud grants webhook management to administrators only, and a Gantry \
                  admin is a different thing. If the connected Nextcloud account is not an admin \
                  there and holds no delegated admin rights for the Webhooks setting, use one that \
                  does, such as the workspace's shared account.",

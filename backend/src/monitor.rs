@@ -1822,7 +1822,7 @@ async fn report_token_expiration(db: &DB, token: &TokenRow, expired: bool) {
             format!(
                 "API token {token_desc} of '{email_addr}' has expired and been deleted"
             ),
-            "Windmill: Your API token has expired",
+            "Gantry: Your API token has expired",
             format!(
                 "Your API token {token_desc} has expired and been deleted.\n\nPlease create a new token if you still need API access."
             ),
@@ -1830,7 +1830,7 @@ async fn report_token_expiration(db: &DB, token: &TokenRow, expired: bool) {
     } else {
         (
             format!("API token {token_desc} of '{email_addr}' is expiring soon"),
-            "Windmill: Your API token is expiring soon",
+            "Gantry: Your API token is expiring soon",
             format!(
                 "Your API token {token_desc} is expiring soon.\n\nPlease rotate or renew your token to avoid service disruption."
             ),
@@ -2110,7 +2110,7 @@ pub async fn delete_expired_items(db: &DB) -> () {
     .fetch_all(db)
     .await
     {
-        tracing::error!("Error deleting autoscaling event on CE: {:?}", e);
+        tracing::error!("Error deleting autoscaling events: {:?}", e);
     }
 
     // native_retry_attempt has no FK to v2_job (kept off the hot bulk delete).

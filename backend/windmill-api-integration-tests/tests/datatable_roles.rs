@@ -323,7 +323,7 @@ async fn a_data_table_under_roles_is_cloned_only_with_its_grants(
     .await?;
     assert_ne!(resp.status(), 200);
     let body = resp.text().await?;
-    assert!(body.contains("Enterprise Edition"), "{body}");
+    assert!(body.contains("not supported in Gantry"), "{body}");
     assert!(!database_exists(&db, target).await?);
     assert!(!workspace_exists(&db, "wm-fork-copy").await?);
     Ok(())
@@ -985,7 +985,7 @@ async fn an_operator_neither_writes_nor_runs_a_migration(db: Pool<Postgres>) -> 
     Ok(())
 }
 
-const ENTERPRISE_REFUSAL: &str = "Data table roles are a Windmill Enterprise Edition feature";
+const ENTERPRISE_REFUSAL: &str = "Data table roles are not supported in Gantry";
 
 #[sqlx::test(migrations = "../migrations", fixtures("base", "datatable_roles"))]
 async fn every_roles_route_is_an_enterprise_feature(db: Pool<Postgres>) -> anyhow::Result<()> {

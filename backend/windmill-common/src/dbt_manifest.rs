@@ -382,7 +382,7 @@ fn truncate_sql(code: &str) -> String {
     while end > 0 && !code.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n-- … truncated by Windmill …", &code[..end])
+    format!("{}\n-- … truncated by Gantry …", &code[..end])
 }
 
 /// One ingested dbt node, ready to be written to `dbt_node`.

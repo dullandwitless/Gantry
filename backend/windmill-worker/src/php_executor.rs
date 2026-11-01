@@ -50,12 +50,9 @@ fn ensure_php_tool_installed(tool: &str, path: &str) -> Result<()> {
         return Ok(());
     }
     Err(error::Error::ExecutionErr(format!(
-        "{tool} is not installed on this worker (looked for it at {path}). PHP and Composer are no \
-         longer included in the standard windmill and windmill-ee images: they ship only in the \
-         full images. To run PHP scripts, switch the workers that run PHP jobs to \
-         ghcr.io/windmill-labs/windmill-full (Community Edition) or \
-         ghcr.io/windmill-labs/windmill-ee-full (Enterprise Edition), or install PHP and Composer \
-         on them and point PHP_PATH and COMPOSER_PATH at them."
+        "{tool} is not installed on this worker (looked for it at {path}). To run PHP scripts, \
+         install PHP and Composer on the workers that run PHP jobs and point PHP_PATH and \
+         COMPOSER_PATH at them."
     )))
 }
 

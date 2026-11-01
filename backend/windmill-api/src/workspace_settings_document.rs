@@ -1605,7 +1605,7 @@ fn plan_document(
         .collect();
     if !unavailable.is_empty() {
         return Err(Error::BadRequest(format!(
-            "Only available on Windmill Enterprise Edition: {}",
+            "Not supported in Gantry: {}",
             unavailable.join(", ")
         )));
     }
@@ -1674,7 +1674,7 @@ fn datatable_permissions_write(
     let Some(cluster) = entry.and_then(role_cluster_of) else {
         return Err(vec![format!(
             "Data table '{name}' cannot be put under roles: only a data table this workspace \
-             governs, on a cluster Windmill manages, can"
+             governs, on a cluster Gantry manages, can"
         )]);
     };
     let Some(catalog) = names.of(cluster) else {

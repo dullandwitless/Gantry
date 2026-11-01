@@ -2056,7 +2056,7 @@ async fn edit_instance_groups(
     Json(_config): Json<serde_json::Value>,
 ) -> Result<String> {
     Err(Error::BadRequest(
-        "Instance groups are only available on Windmill Enterprise Edition".to_string(),
+        "Instance groups are not supported in Gantry".to_string(),
     ))
 }
 
@@ -5053,8 +5053,7 @@ async fn check_git_sync_access(db: &DB, w_id: &str) -> Result<()> {
 
     if user_count > CE_GIT_SYNC_MAX_USERS {
         return Err(Error::BadRequest(format!(
-            "Git sync is available for workspaces with up to {} members. \
-             Upgrade to Windmill Enterprise Edition for unlimited workspace members.",
+            "Git sync is available for workspaces with up to {} members.",
             CE_GIT_SYNC_MAX_USERS
         )));
     }
@@ -5130,7 +5129,7 @@ async fn edit_git_sync_config(
             .any(|r| r.auto_pull.as_ref().is_some_and(|a| a.enabled))
         {
             return Err(Error::BadRequest(
-                "Automatic pull from git is an Enterprise Edition feature".to_string(),
+                "Automatic pull from git is not supported in Gantry".to_string(),
             ));
         }
         if git_sync_settings
@@ -5139,7 +5138,7 @@ async fn edit_git_sync_config(
             .any(|r| r.use_individual_branch.unwrap_or(false))
         {
             return Err(Error::BadRequest(
-                "Promotion mode is an Enterprise Edition feature".to_string(),
+                "Promotion mode is not supported in Gantry".to_string(),
             ));
         }
         // Preserve server-owned auto-pull state (webhook id/secret, synced sha, last
@@ -5257,13 +5256,13 @@ async fn edit_git_sync_repository(
         .is_some_and(|a| a.enabled)
     {
         return Err(Error::BadRequest(
-            "Automatic pull from git is an Enterprise Edition feature".to_string(),
+            "Automatic pull from git is not supported in Gantry".to_string(),
         ));
     }
 
     if new_config.repository.use_individual_branch.unwrap_or(false) {
         return Err(Error::BadRequest(
-            "Promotion mode is an Enterprise Edition feature".to_string(),
+            "Promotion mode is not supported in Gantry".to_string(),
         ));
     }
 
@@ -5298,7 +5297,7 @@ async fn edit_git_sync_repository(
             .any(|r| r.git_repo_resource_path == new_config.git_repo_resource_path);
         if is_new && !git_sync_settings.repositories.is_empty() {
             return Err(Error::BadRequest(
-                "Multiple git sync repositories is an Enterprise Edition feature".to_string(),
+                "Multiple git sync repositories are not supported in Gantry".to_string(),
             ));
         }
     }
@@ -5522,7 +5521,7 @@ async fn edit_deploy_ui_config(
     Path(_w_id): Path<String>,
 ) -> Result<String> {
     return Err(Error::BadRequest(
-        "Deployment UI is only available on Windmill Enterprise Edition".to_string(),
+        "Deployment UI is not supported in Gantry".to_string(),
     ));
 }
 
@@ -5537,7 +5536,7 @@ async fn edit_default_app(
     Json(_new_config): Json<EditDefaultApp>,
 ) -> Result<String> {
     return Err(Error::BadRequest(
-        "Setting a workspace default app is only available on Windmill Enterprise Edition"
+        "Setting a workspace default app is not supported in Gantry"
             .to_string(),
     ));
 }
@@ -11372,9 +11371,9 @@ async fn invite_user(
 
     if !workspace_invite_emails_disabled(&db).await? {
         send_email_if_possible(
-            &format!("Invited to Windmill's workspace: {w_id}"),
+            &format!("Invited to Gantry's workspace: {w_id}"),
             &format!(
-                "You have been granted access to Windmill's workspace {w_id}
+                "You have been granted access to Gantry's workspace {w_id}
 
 If you do not have an account on {}, login with SSO or ask an admin to create an account for you.",
                 (**BASE_URL.load()).clone()
@@ -11611,9 +11610,9 @@ async fn add_user(
 
     if !workspace_invite_emails_disabled(&db).await? {
         send_email_if_possible(
-            &format!("Added to Windmill's workspace: {w_id}"),
+            &format!("Added to Gantry's workspace: {w_id}"),
             &format!(
-                "You have been granted access to Windmill's workspace {w_id} by {}
+                "You have been granted access to Gantry's workspace {w_id} by {}
 
 If you do not have an account on {}, login with SSO or ask an admin to create an account for you.",
                 authed.email,

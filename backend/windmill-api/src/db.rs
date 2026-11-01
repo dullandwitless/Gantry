@@ -454,7 +454,7 @@ pub async fn wait_for_migrations(
         .expect("No migrations found") as i64;
 
     tracing::info!(
-        "This worker is on Windmill version {GIT_VERSION} (migration version {latest_version}). Only servers run migrations. Waiting for a server with version >= {GIT_VERSION} to apply the migration..."
+        "This worker is on Gantry version {GIT_VERSION} (migration version {latest_version}). Only servers run migrations. Waiting for a server with version >= {GIT_VERSION} to apply the migration..."
     );
 
     let mut attempts = 0;
@@ -475,7 +475,7 @@ pub async fn wait_for_migrations(
             }
             Ok(_) => {
                 tracing::info!(
-                    "Database not up to date yet. This worker (Windmill {GIT_VERSION}, migration version {latest_version}) is waiting for a server with version >= {GIT_VERSION} to run the migration. Rechecking in 3s..."
+                    "Database not up to date yet. This worker (Gantry {GIT_VERSION}, migration version {latest_version}) is waiting for a server with version >= {GIT_VERSION} to run the migration. Rechecking in 3s..."
                 );
             }
             Err(e) => {

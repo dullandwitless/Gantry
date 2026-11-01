@@ -74,6 +74,9 @@ for f in "${disabled_features[@]}"; do strip_args+=(--disable "$f"); done
 status=0
 "$repo_root/tools/cfg-strip/target/release/cfg-strip" "${strip_args[@]}" "$backend" || status=$?
 
+# User-visible product name and feature-gate messages (see tools/rebrand.py).
+python3 "$repo_root/tools/rebrand.py" "$backend"
+
 # Fix-ups the stripper cannot make (e.g. tests that read upstream frontend
 # files, which Gantry never imports). Each must apply cleanly.
 for patch in "$repo_root"/patches/*.patch; do
