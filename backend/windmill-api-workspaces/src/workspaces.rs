@@ -5040,46 +5040,16 @@ fn cleanup_legacy_git_sync_settings_in_memory(
     }
 }
 
-const CE_GIT_SYNC_MAX_USERS: i64 = 2;
-
-async fn check_git_sync_access(db: &DB, w_id: &str) -> Result<()> {
-    let user_count: i64 = sqlx::query_scalar!(
-        "SELECT COUNT(*) FROM usr WHERE workspace_id = $1 AND disabled = false",
-        w_id
-    )
-    .fetch_one(db)
-    .await?
-    .unwrap_or(0);
-
-    if user_count > CE_GIT_SYNC_MAX_USERS {
-        return Err(Error::BadRequest(format!(
-            "Git sync is available for workspaces with up to {} members.",
-            CE_GIT_SYNC_MAX_USERS
-        )));
-    }
-    Ok(())
-}
-
-async fn get_git_sync_enabled(
-    _authed: ApiAuthed,
-    Extension(db): Extension<DB>,
-    Path(w_id): Path<String>,
-) -> JsonResult<serde_json::Value> {
-    let user_count: i64 = sqlx::query_scalar!(
-        "SELECT COUNT(*) FROM usr WHERE workspace_id = $1 AND disabled = false",
-        &w_id
-    )
-    .fetch_one(&db)
-    .await?
-    .unwrap_or(0);
-
-    let enabled = user_count <= CE_GIT_SYNC_MAX_USERS;
+/// Git sync has no member limit, but syncing itself is not implemented yet
+/// (`windmill_git_sync::handle_deployment_metadata` is a stub), so this reports it
+/// as unavailable rather than inviting configuration that would do nothing.
+async fn get_git_sync_enabled(_authed: ApiAuthed) -> JsonResult<serde_json::Value> {
     Ok(Json(serde_json::json!({
-        "enabled": enabled,
-        "reason": if enabled { Some("free_tier") } else { None::<&str> },
-        "max_repos": if enabled { Some(1) } else { None::<i32> },
-        "user_count": user_count,
-        "max_users": CE_GIT_SYNC_MAX_USERS,
+        "enabled": false,
+        "reason": "not_implemented",
+        "max_repos": None::<i32>,
+        "user_count": None::<i64>,
+        "max_users": None::<i64>,
     })))
 }
 
@@ -5090,7 +5060,6 @@ async fn edit_git_sync_config(
     Json(new_config): Json<EditGitSyncConfig>,
 ) -> Result<String> {
     require_admin(authed.is_admin, &authed.username)?;
-    check_git_sync_access(&db, &w_id).await?;
 
     let mut tx = db.begin().await?;
 
@@ -5228,7 +5197,6 @@ async fn edit_git_sync_repository(
     Json(mut new_config): Json<EditGitSyncRepository>,
 ) -> Result<String> {
     require_admin(authed.is_admin, &authed.username)?;
-    check_git_sync_access(&db, &w_id).await?;
 
     // Validate the resource path format
     validate_git_repo_resource_path(&new_config.git_repo_resource_path)?;
@@ -5416,7 +5384,6 @@ async fn delete_git_sync_repository(
 ) -> Result<String> {
     require_admin(authed.is_admin, &authed.username)?;
 
-    // No check_git_sync_access here — admins should always be able to delete/clean up repos
     if request.git_repo_resource_path.is_empty() {
         return Err(Error::BadRequest(
             "Resource path cannot be empty".to_string(),

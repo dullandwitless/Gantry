@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
-# Imports the AGPLv3 backend from an upstream Windmill checkout into this repo,
-# removing every piece of code the upstream LICENSE marks as proprietary
-# (anything gated on the "enterprise"/"private" Cargo features).
+# Imports the AGPLv3 backend from an upstream Windmill checkout, removing every
+# piece of code the upstream LICENSE marks as proprietary (anything gated on the
+# "enterprise"/"private" Cargo features).
 #
-# Usage: scripts/import-upstream.sh <path-to-upstream-checkout>
+# Usage: scripts/import-upstream.sh <path-to-upstream-checkout> <target-root>
+#
+# <target-root> is a checkout of the `upstream` branch; its backend/ is
+# replaced wholesale, so never point it at a checkout of main. To bring an
+# upstream release into Gantry, use scripts/sync-upstream.sh, which runs this
+# and merges the result.
 #
 # The frontend is deliberately NOT imported: Gantry's UI is a clean-room
 # implementation. Never copy anything from upstream frontend/ into this repo.
 set -euo pipefail
 
-upstream=${1:?usage: $0 <path-to-upstream-checkout>}
+usage="usage: $0 <path-to-upstream-checkout> <target-root>"
+upstream=${1:?$usage}
+target=$(cd "${2:?$usage}" && pwd)
+# Tools and patches come from this script's own checkout, not the target's.
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-backend="$repo_root/backend"
+backend="$target/backend"
 
 # Features whose code is proprietary under upstream's LICENSE.
 disabled_features=(enterprise private enterprise_saml)
@@ -34,7 +42,8 @@ not_imported=(
   # States that it reproduces queries from the proprietary repository.
   windmill-queue/tests/native_retry_test.rs
   # Carry "All Rights Reserved" proprietary headers despite their location;
-  # replaced by Gantry's own windmill-common/src/secret_backend/http_store.rs.
+  # replaced by Gantry's own windmill-common/src/secret_backend/http_store.rs
+  # (patches/0003).
   windmill-common/src/secret_backend/aws_sm_oss.rs
   windmill-common/src/secret_backend/azure_kv_oss.rs
   windmill-common/src/secret_backend/http_store_oss.rs
@@ -57,13 +66,13 @@ cp -r "$upstream/backend" "$backend"
 rm -rf "$backend/target"
 for path in "${not_imported[@]}"; do rm -rf "${backend:?}/$path"; done
 
-cp "$upstream/openflow.openapi.yaml" "$repo_root/openflow.openapi.yaml"
+cp "$upstream/openflow.openapi.yaml" "$target/openflow.openapi.yaml"
 
 # Test data outside backend/ that backend tests include by relative path.
 shared_fixtures=(cli/test/fixtures/item_digest_vectors.json)
 for path in "${shared_fixtures[@]}"; do
-  mkdir -p "$repo_root/$(dirname "$path")"
-  cp "$upstream/$path" "$repo_root/$path"
+  mkdir -p "$target/$(dirname "$path")"
+  cp "$upstream/$path" "$target/$path"
 done
 
 cargo build --release --quiet --manifest-path "$repo_root/tools/cfg-strip/Cargo.toml"
@@ -81,12 +90,12 @@ python3 "$repo_root/tools/rebrand.py" "$backend"
 # files, which Gantry never imports). Each must apply cleanly.
 for patch in "$repo_root"/patches/*.patch; do
   [[ -e "$patch" ]] || continue
-  git -C "$repo_root" apply --whitespace=nowarn "$patch"
+  git -C "$target" apply --whitespace=nowarn "$patch"
 done
 
-echo "$commit" > "$repo_root/UPSTREAM_COMMIT"
+echo "$commit" > "$target/UPSTREAM_COMMIT"
 echo "Imported upstream $commit"
 if (( status != 0 )); then
-  echo "Review the locations above, then run scripts/check-no-ee.sh" >&2
+  echo "Review the locations above before merging" >&2
 fi
 exit "$status"

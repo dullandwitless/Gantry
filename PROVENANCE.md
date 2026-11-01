@@ -25,19 +25,28 @@ the inline `enterprise`-gated snippets.
 
 ## How the backend is imported
 
-`scripts/import-upstream.sh <upstream-checkout>`:
+Upstream releases arrive through the `upstream` branch, which only ever holds
+the output of the import pipeline, one commit per upstream release. `main`
+merges it, so an upstream change applies on top of Gantry's own edits instead
+of replacing them. `scripts/sync-upstream.sh <upstream-checkout>` does the
+whole round: it runs the pipeline into a temporary checkout of `upstream`,
+commits the result there and merges it into the current branch.
+
+The pipeline, `scripts/import-upstream.sh <upstream-checkout> <target>`:
 
 1. Refuses a checkout containing any `*_ee.rs` file.
 2. Copies `backend/`, minus the paths listed in the script (EE tooling, the
    sqlx query cache, upstream contributor docs, one test that states it
-   reproduces proprietary queries).
+   reproduces proprietary queries, files with proprietary notices).
 3. Runs `tools/cfg-strip` with `enterprise`, `private` and `enterprise_saml`
    disabled. It deletes, from source, every item, statement, field, variant,
    match arm, argument and attribute that those features gate, folds `cfg!`
    uses to constants, removes the features from every `Cargo.toml`, and drops
    optional dependencies only they enabled. It exits non-zero while anything
    needs manual review.
-4. Records the upstream commit in `UPSTREAM_COMMIT`.
+4. Runs `tools/rebrand.py`, which renames the product in user-visible strings.
+5. Applies `patches/`: fix-ups the tools cannot make.
+6. Records the upstream commit in `UPSTREAM_COMMIT`.
 
 Files that carry a proprietary notice ("All Rights Reserved", "Unauthorized
 copying ... prohibited") are treated as proprietary regardless of where they sit

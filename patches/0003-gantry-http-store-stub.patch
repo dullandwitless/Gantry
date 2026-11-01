@@ -1,0 +1,57 @@
+diff --git a/backend/windmill-common/src/secret_backend/http_store.rs b/backend/windmill-common/src/secret_backend/http_store.rs
+new file mode 100644
+index 0000000..6943db7
+--- /dev/null
++++ b/backend/windmill-common/src/secret_backend/http_store.rs
+@@ -0,0 +1,20 @@
++/*
++ * Copyright: The Gantry contributors 2026
++ * This file and its contents are licensed under the AGPLv3 License.
++ * Please see the included NOTICE for copyright information and
++ * LICENSE-AGPL for a copy of the license.
++ */
++
++//! The HTTP secret store backend is not implemented in Gantry.
++
++use crate::error::{Error, Result};
++
++use super::HttpStoreSettings;
++
++/// Rejects HTTP secret store settings: the backend is not implemented, and
++/// accepting them would leave secrets silently served from the database.
++pub fn validate_http_store_settings(_settings: &HttpStoreSettings) -> Result<()> {
++    Err(Error::BadRequest(
++        "The HTTP secret store backend is not supported".to_string(),
++    ))
++}
+diff --git a/backend/windmill-common/src/secret_backend/mod.rs b/backend/windmill-common/src/secret_backend/mod.rs
+index 17dad5d..6f3e472 100644
+--- a/backend/windmill-common/src/secret_backend/mod.rs
++++ b/backend/windmill-common/src/secret_backend/mod.rs
+@@ -19,24 +19,15 @@ pub mod external_ref;
+ pub use resolver::*;
+ pub use external_ref::*;
+ 
+-pub mod azure_kv_oss;
++pub mod http_store;
+ pub mod vault_oss;
+ 
+-pub mod aws_sm_oss;
+-
+-pub mod http_store_oss;
+-
+ #[cfg(test)]
+ mod tests;
+ 
++pub use http_store::*;
+ pub use vault_oss::*;
+ 
+-pub use azure_kv_oss::*;
+-
+-pub use aws_sm_oss::*;
+-
+-pub use http_store_oss::*;
+-
+ use std::collections::BTreeMap;
+ 
+ use async_trait::async_trait;
