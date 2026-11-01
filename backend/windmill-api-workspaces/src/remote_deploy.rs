@@ -307,7 +307,7 @@ async fn set_target(
 ) -> Result<String> {
     {
         return Err(Error::BadRequest(
-            "Deploying to another instance is only available on Windmill Enterprise Edition"
+            "Deploying to another instance is not supported in Gantry"
                 .to_string(),
         ));
     }
@@ -451,7 +451,7 @@ async fn connect(
     }
     let whoami: RemoteWhoami = response.json().await.map_err(|e| {
         Error::BadGateway(format!(
-            "{} did not answer like a Windmill instance: {}",
+            "{} did not answer like a Gantry instance: {}",
             target.base_url,
             error_source_chain(&e)
         ))

@@ -34,6 +34,6 @@ pub async fn send_email_plain_text(
 
 pub fn send_email_if_possible(_subject: &str, _content: &str, _to: &str) {
     tracing::warn!(
-        "send_email_if_possible is not implemented in Windmill's Open Source repository"
+        "send_email_if_possible is not implemented in Gantry"
     );
 }

@@ -368,7 +368,7 @@ async fn try_delete_github_webhook(
                 .delete(&url)
                 .bearer_auth(access_token)
                 .header("Accept", "application/json")
-                .header("User-Agent", "Windmill")
+                .header("User-Agent", "Gantry")
                 .send()
                 .await;
         }

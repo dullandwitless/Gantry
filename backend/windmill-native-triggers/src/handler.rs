@@ -646,7 +646,7 @@ async fn delete_native_trigger_handler<T: External>(
                     } else {
                         "."
                     };
-                    format!("{m}{end} The trigger was kept in Windmill, so it can still fire.")
+                    format!("{m}{end} The trigger was kept in Gantry, so it can still fire.")
                 })
             })?,
         Err(e @ (Error::NotFound(_) | Error::BadRequest(_))) => tracing::warn!(

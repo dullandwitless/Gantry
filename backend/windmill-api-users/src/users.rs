@@ -4523,9 +4523,9 @@ async fn request_password_reset(
         let reset_link = format!("{}/user/reset-password?token={}", base_url, token);
 
         // Send the email
-        let subject = "Windmill Password Reset";
+        let subject = "Gantry Password Reset";
         let content = format!(
-            "You have requested a password reset for your Windmill account.\n\n\
+            "You have requested a password reset for your Gantry account.\n\n\
             Click the link below to reset your password:\n\
             {}\n\n\
             This link will expire in 1 hour.\n\n\

@@ -36,7 +36,7 @@ pub(super) fn definitions() -> [(&'static str, &'static str, Value); 4] {
     [
         (
             "show_run",
-            "Show a run to the user as a live card in the conversation: status, result, steps and logs, refreshing until it finishes, with a link to it in Windmill and a button to cancel it while it runs. Call it after starting a run the user asked for, or when they ask to see one. Do not call it for runs you start to check your own work: read those with get_run.",
+            "Show a run to the user as a live card in the conversation: status, result, steps and logs, refreshing until it finishes, with a link to it in Gantry and a button to cancel it while it runs. Call it after starting a run the user asked for, or when they ask to see one. Do not call it for runs you start to check your own work: read those with get_run.",
             json!({
                 "type": "object",
                 "properties": {
@@ -91,7 +91,7 @@ pub(super) fn definitions() -> [(&'static str, &'static str, Value); 4] {
         ),
         (
             "show_item",
-            "Show the user a workspace item as a card in the conversation: a script, flow, schedule, trigger, resource or app, with its key settings and a link to it in Windmill (its editor, for a draft). Call it when the user asks to see an item; to read one yourself, use read_workspace_item.",
+            "Show the user a workspace item as a card in the conversation: a script, flow, schedule, trigger, resource or app, with its key settings and a link to it in Gantry (its editor, for a draft). Call it when the user asks to see an item; to read one yourself, use read_workspace_item.",
             json!({
                 "type": "object",
                 "properties": {

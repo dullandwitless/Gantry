@@ -1498,7 +1498,7 @@ pub async fn install_bun_lockfile(
                 {
                     let key = fallback.key();
                     let msg = format!(
-                        "\nWARNING: npm refused {}:\n  {}\nRetrying with {key}=all, which Windmill \
+                        "\nWARNING: npm refused {}:\n  {}\nRetrying with {key}=all, which Gantry \
                          sets by default for now. This default will be removed in a future \
                          release: to keep fetching them, set `{key}=all` in the npm config (the \
                          npmrc instance or workspace setting on Enterprise Edition, or the \
@@ -1925,7 +1925,7 @@ async fn pull_codebase(w_id: &str, id: &str, job_dir: &str) -> Result<PulledCode
             }
         } else {
             return Err(error::Error::ExecutionErr(
-                "codebase is an EE feature".to_string(),
+                "codebase is not supported in Gantry".to_string(),
             ));
         }
     }

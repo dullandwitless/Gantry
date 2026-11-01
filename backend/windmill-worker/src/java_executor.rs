@@ -152,7 +152,7 @@ async fn get_java_home_with_ws_settings(
                 append_logs(
                     job_id,
                     w_id,
-                    "Private registry (maven settings.xml) configuration ignored: this feature requires Windmill Enterprise Edition\n".to_string(),
+                    "Private registry (maven settings.xml) configuration ignored: this feature is not supported in Gantry\n".to_string(),
                     conn,
                 )
                 .await;

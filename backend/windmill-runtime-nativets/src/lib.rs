@@ -803,7 +803,7 @@ pub async fn eval_fetch_timeout(
     let ann = get_annotation(&ts_expr);
 
     if ann.proxy.is_some() {
-        return Err(Error::ExecutionErr("Proxy is an EE feature".to_string()).into());
+        return Err(Error::ExecutionErr("Proxy is not supported in Gantry".to_string()).into());
     }
 
     let mut extra_logs = String::new();

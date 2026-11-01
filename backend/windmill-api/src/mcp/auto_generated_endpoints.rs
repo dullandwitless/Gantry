@@ -1344,7 +1344,7 @@ is, a different one moves it there and archives the old path"),
                                 },
                                 "sandbox": {
                                         "type": "boolean",
-                                        "description": "Publisher opt-in to app sandbox isolation (alpha). When true the app is isolated from each viewer's Windmill session. When false/absent the app runs same-origin with the viewer's full session (the default, pre-isolation behavior).\n"
+                                        "description": "Publisher opt-in to app sandbox isolation (alpha). When true the app is isolated from each viewer's Gantry session. When false/absent the app runs same-origin with the viewer's full session (the default, pre-isolation behavior).\n"
                                 },
                                 "frontend_sdk_scopes": {
                                         "type": "array",
@@ -1461,7 +1461,7 @@ is, a different one moves it there and archives the old path"),
                                 },
                                 "sandbox": {
                                         "type": "boolean",
-                                        "description": "Publisher opt-in to app sandbox isolation (alpha). When true the app is isolated from each viewer's Windmill session. When false/absent the app runs same-origin with the viewer's full session (the default, pre-isolation behavior).\n"
+                                        "description": "Publisher opt-in to app sandbox isolation (alpha). When true the app is isolated from each viewer's Gantry session. When false/absent the app runs same-origin with the viewer's full session (the default, pre-isolation behavior).\n"
                                 },
                                 "frontend_sdk_scopes": {
                                         "type": "array",
@@ -1983,7 +1983,7 @@ You should get the schema of the script or flow before creating the schedule to 
         "properties": {
                 "path": {
                         "type": "string",
-                        "description": "The unique Windmill path for this schedule. Must be of the form `u/<user>/<path>` or `f/<folder>/<path>`."
+                        "description": "The unique Gantry path for this schedule. Must be of the form `u/<user>/<path>` or `f/<folder>/<path>`."
                 },
                 "schedule": {
                         "type": "string",

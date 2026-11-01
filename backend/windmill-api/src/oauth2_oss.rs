@@ -121,7 +121,7 @@ pub async fn _refresh_token(
 ) -> error::Result<String> {
     // Implementation is not open source
     Err(error::Error::BadRequest(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 

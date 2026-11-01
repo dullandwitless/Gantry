@@ -456,7 +456,7 @@ pub async fn assume_role_with_oidc_token(
             .await
             .map_err(|e| {
                 Error::internal_err(format!(
-                    "Failed to assume AWS role {} with Windmill's OIDC token: {}",
+                    "Failed to assume AWS role {} with Gantry's OIDC token: {}",
                     role_arn,
                     format_bedrock_error(&e)
                 ))

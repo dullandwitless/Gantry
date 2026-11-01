@@ -10,8 +10,8 @@ fn main() {
     #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         winresource::WindowsResource::new()
-            .set("ProductName", "Windmill")
-            .set("FileDescription", "Windmill")
+            .set("ProductName", "Gantry")
+            .set("FileDescription", "Gantry")
             .set("CompanyName", "Windmill Labs, Inc.")
             .set("LegalCopyright", "Copyright Windmill Labs, Inc.")
             .compile()

@@ -484,7 +484,7 @@ impl<B: McpBackend> ServerHandler for Runner<B> {
         // Not `Implementation::from_build_env()`: its `env!` expands inside rmcp, so it
         // would name the SDK crate rather than this server.
         let server_info = Implementation::new("windmill", env!("CARGO_PKG_VERSION"))
-            .with_title("Windmill")
+            .with_title("Gantry")
             .with_website_url("https://windmill.dev");
 
         InitializeResult::new(
@@ -495,7 +495,7 @@ impl<B: McpBackend> ServerHandler for Runner<B> {
         )
         .with_server_info(server_info)
         .with_instructions(
-            "This server provides a list of scripts and flows the user can run on Windmill. \
+            "This server provides a list of scripts and flows the user can run on Gantry. \
                  Each flow and script is a tool callable with their respective arguments.",
         )
     }

@@ -567,14 +567,14 @@ async fn new_pg_connection(
         PgAuthMode::Iam => {
             {
                 return Err(Error::ExecutionErr(
-                    "IAM RDS authentication requires Windmill Enterprise Edition".to_string(),
+                    "IAM RDS authentication is not supported in Gantry".to_string(),
                 ));
             }
         }
         PgAuthMode::WorkloadIdentity => {
             {
                 return Err(Error::ExecutionErr(
-                    "Azure workload identity authentication requires Windmill Enterprise Edition"
+                    "Azure workload identity authentication is not supported in Gantry"
                         .to_string(),
                 ));
             }

@@ -7052,7 +7052,7 @@ pub enum WebhookRun {
 }
 
 const NATIVE_TRIGGER_DISABLED_MSG: &str =
-    "This trigger is disabled in Windmill, so no job was created";
+    "This trigger is disabled in Gantry, so no job was created";
 
 #[allow(unused)]
 pub async fn get_args_and_trigger_metadata(
@@ -10587,7 +10587,7 @@ pub fn start_job_update_sse_stream(
 
             #[allow(unused_variables)]
             if let Some(poll_delay_ms) = poll_delay_ms {
-                tracing::warn!("Settable poll delay requires EE");
+                tracing::warn!("Settable poll delay is not supported in Gantry");
             }
 
             if last_ping.elapsed().as_secs() > 5 {

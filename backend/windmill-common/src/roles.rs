@@ -469,7 +469,7 @@ pub fn validate_overrides(instance: &[RoleDefinition], overrides: &RoleOverrides
         validate_role_name(name)?;
         if !custom_roles_built() && !instance.iter().any(|d| &d.name == name) {
             return Err(Error::BadRequest(format!(
-                "role `{name}` is not defined: adding workspace roles requires Windmill Enterprise Edition"
+                "role `{name}` is not defined: adding workspace roles is not supported in Gantry"
             )));
         }
     }
@@ -492,7 +492,7 @@ pub fn check_frozen_overrides(
     for (name, o) in next {
         if !instance.iter().any(|d| &d.name == name) && previous.get(name) != Some(o) {
             return Err(Error::BadRequest(format!(
-                "changing workspace role `{name}` requires a valid Windmill Enterprise Edition license"
+                "changing workspace role `{name}` is not supported in Gantry"
             )));
         }
     }
@@ -888,7 +888,7 @@ pub async fn validate_instance_roles_write(
     // Resetting stays open so a downgraded instance can always drop the setting.
     if !custom_roles_enabled() && *current != next && next != default_instance_roles() {
         return Err(Error::BadRequest(
-            "changing workspace roles requires a valid Windmill Enterprise Edition license"
+            "changing workspace roles is not supported in Gantry"
                 .to_string(),
         ));
     }

@@ -50,7 +50,7 @@ pub async fn get_workspace_s3_resource<'c>(
 }
 
 pub fn get_random_file_name(_file_extension: Option<String>) -> String {
-    unimplemented!("Not implemented in Windmill's Open Source repository")
+    unimplemented!("Not implemented in Gantry")
 }
 
 use windmill_common::db::DbWithOptAuthed;
@@ -63,7 +63,7 @@ pub async fn get_s3_resource<'c>(
     _job_id: Option<Uuid>,
 ) -> error::Result<ObjectStoreResource> {
     Err(error::Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
@@ -76,7 +76,7 @@ pub async fn upload_file_from_req(
     _max_size: Option<usize>,
 ) -> error::Result<(PutResult, usize)> {
     Err(error::Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
@@ -89,7 +89,7 @@ pub async fn upload_file_internal(
     _max_size: Option<usize>,
 ) -> error::Result<(PutResult, usize)> {
     Err(error::Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
@@ -142,7 +142,7 @@ pub async fn download_s3_file_internal(
     _query: DownloadFileQuery,
 ) -> error::Result<Response> {
     Err(error::Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
@@ -152,7 +152,7 @@ pub async fn read_object_streamable(
     _file_key: &str,
 ) -> error::Result<Response> {
     Err(error::Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
@@ -165,7 +165,7 @@ pub async fn delete_s3_file_internal(
     _query: DeleteS3FileQuery,
 ) -> error::Result<()> {
     Err(error::Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
@@ -255,7 +255,7 @@ mod app_s3_display_stubs {
         _query: LoadFileMetadataQuery,
     ) -> error::Result<LoadFileMetadataResponse> {
         Err(error::Error::internal_err(
-            "Not implemented in Windmill's Open Source repository".to_string(),
+            "Not implemented in Gantry".to_string(),
         ))
     }
 
@@ -267,7 +267,7 @@ mod app_s3_display_stubs {
         _query: LoadFilePreviewQuery,
     ) -> error::Result<LoadFilePreviewResponse> {
         Err(error::Error::internal_err(
-            "Not implemented in Windmill's Open Source repository".to_string(),
+            "Not implemented in Gantry".to_string(),
         ))
     }
 
@@ -280,7 +280,7 @@ mod app_s3_display_stubs {
         _query: LoadCountQuery,
     ) -> error::Result<TableCount> {
         Err(error::Error::internal_err(
-            "Not implemented in Windmill's Open Source repository".to_string(),
+            "Not implemented in Gantry".to_string(),
         ))
     }
 
@@ -294,7 +294,7 @@ mod app_s3_display_stubs {
         _is_parquet: bool,
     ) -> error::Result<Box<RawValue>> {
         Err(error::Error::internal_err(
-            "Not implemented in Windmill's Open Source repository".to_string(),
+            "Not implemented in Gantry".to_string(),
         ))
     }
 
@@ -306,7 +306,7 @@ mod app_s3_display_stubs {
         _query: DownloadFileQuery,
     ) -> error::Result<Response> {
         Err(error::Error::internal_err(
-            "Not implemented in Windmill's Open Source repository".to_string(),
+            "Not implemented in Gantry".to_string(),
         ))
     }
 }
@@ -320,7 +320,7 @@ pub async fn get_large_file_storage(
     _storage: Option<String>,
 ) -> windmill_common::error::Result<Option<windmill_types::s3::LargeFileStorage>> {
     Err(windmill_common::error::Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }
 
@@ -336,6 +336,6 @@ pub async fn get_workspace_s3_resource_and_check_paths<'c>(
     Option<windmill_types::s3::ObjectStoreResource>,
 )> {
     Err(windmill_common::error::Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "Not implemented in Gantry".to_string(),
     ))
 }

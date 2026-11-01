@@ -316,7 +316,7 @@ pub async fn reload_cache_object_store_override(
     // Enterprise must drop one loaded while it still was.
     if !matches!(get_license_plan().await, LicensePlan::Enterprise) {
         tracing::error!(
-            "Object store cache override requires an enterprise license, ignoring it for this worker group"
+            "Object store cache override is not supported in Gantry, ignoring it for this worker group"
         );
         if CACHE_OBJECT_STORE_OVERRIDDEN.swap(false, Ordering::Relaxed) {
             clear_cache_object_store_override().await;
@@ -1279,8 +1279,8 @@ impl AmbientAwsCredentials {
                 "no S3 access key/secret key is configured and no ambient AWS credentials could \
                  be loaded through the AWS SDK default chain (env vars, profile, ECS/EC2 instance \
                  role): {cause}. If an EC2/ECS instance role is expected to be used, the instance \
-                 metadata service must be reachable from the process running Windmill — on EC2 the \
-                 AWS Rust SDK only supports IMDSv2, so when Windmill runs in a Docker container \
+                 metadata service must be reachable from the process running Gantry — on EC2 the \
+                 AWS Rust SDK only supports IMDSv2, so when Gantry runs in a Docker container \
                  the instance metadata hop limit (HttpPutResponseHopLimit) must be at least 2",
                 cause = format!("{:#}", anyhow::Error::new(e))
             )
@@ -1544,7 +1544,7 @@ pub async fn upload_artifact_to_store(
         } else {
             {
                 return Err(error::Error::ExecutionErr(
-                    "codebase is an EE feature".to_string(),
+                    "codebase is not supported in Gantry".to_string(),
                 ));
             }
         },

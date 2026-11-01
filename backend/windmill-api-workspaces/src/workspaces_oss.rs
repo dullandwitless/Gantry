@@ -21,6 +21,6 @@ pub async fn create_service_account(
     _nu: NewServiceAccount,
 ) -> windmill_common::error::Result<(StatusCode, String)> {
     Err(windmill_common::error::Error::BadRequest(
-        "Service accounts require Windmill Enterprise Edition".to_string(),
+        "Service accounts require Gantry Enterprise Edition".to_string(),
     ))
 }

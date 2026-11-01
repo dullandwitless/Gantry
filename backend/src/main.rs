@@ -406,14 +406,14 @@ async fn cache_hub_resource_types() -> anyhow::Result<()> {
 }
 
 fn print_help() {
-    println!("Windmill - a fast, open-source workflow engine and job runner.");
+    println!("Gantry - a fast, open-source workflow engine and job runner.");
     println!();
     println!("Usage:");
     println!("  windmill [SUBCOMMAND]");
     println!();
     println!("Subcommands:");
     println!("  help | -h | --help   Show this help information and exit");
-    println!("  version              Show Windmill version and exit");
+    println!("  version              Show Gantry version and exit");
     println!("  cache [hubPaths.json]  Pre-cache hub scripts (default: ./hubPaths.json)");
     println!("  cache-rt             Pre-cache hub resource types");
     println!("  sync-config <file>   Sync instance config from a YAML file to the database");
@@ -449,7 +449,7 @@ fn print_help() {
     println!();
     println!("Notes:");
     println!("- Advanced and less commonly used settings are managed via the database and are omitted here.");
-    println!("- At startup, Windmill logs currently set configuration keys for visibility.");
+    println!("- At startup, Gantry logs currently set configuration keys for visibility.");
 }
 
 async fn otel_environment(conn: &Connection) -> String {
@@ -558,7 +558,7 @@ async fn windmill_main() -> anyhow::Result<()> {
             return Ok(());
         }
         "-v" | "--version" | "version" => {
-            println!("Windmill {}", GIT_VERSION);
+            println!("Gantry {}", GIT_VERSION);
             return Ok(());
         }
         "prepare-deps" => {
@@ -613,7 +613,7 @@ async fn windmill_main() -> anyhow::Result<()> {
         #[cfg(feature = "operator")]
         "operator" => {
             let early_logs = tracing::subscriber::set_default(tracing_subscriber::fmt().finish());
-            tracing::info!("Starting Windmill Kubernetes operator...");
+            tracing::info!("Starting Gantry Kubernetes operator...");
             tracing::info!("Connecting to database...");
 
             let db = crate::db_connect::operator_connection(
@@ -906,7 +906,7 @@ async fn windmill_main() -> anyhow::Result<()> {
     tracing::info!(
         "
 ##############################
-Windmill Community Edition {GIT_VERSION}
+Gantry {GIT_VERSION}
 ##############################"
     );
 

@@ -213,7 +213,7 @@ impl<B: McpBackend> SessionRunner<B> {
                     ));
                 }
                 format!(
-                    "This connection works across several Windmill workspaces: {listed}. Every \
+                    "This connection works across several Gantry workspaces: {listed}. Every \
                      tool takes a `workspace_id` naming the one it acts in; list_workspaces lists \
                      them. Before your first action in a workspace, call get_workspace_context \
                      with its id: it gives your username there (the `<username>` in the paths \
@@ -232,7 +232,7 @@ impl<B: McpBackend> ServerHandler for SessionRunner<B> {
     /// Without instructions: those are built per caller, in `initialize` and `discover`.
     fn get_info(&self) -> ServerInfo {
         let server_info = Implementation::new("windmill", env!("CARGO_PKG_VERSION"))
-            .with_title("Windmill")
+            .with_title("Gantry")
             .with_website_url("https://windmill.dev");
         InitializeResult::new(
             ServerCapabilities::builder()

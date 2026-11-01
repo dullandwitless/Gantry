@@ -29,7 +29,7 @@ use windmill_trigger_http::{
 
 lazy_static::lazy_static! {
     static ref DEFAULT_OPENAPI_INFO_OBJECT: Info = Info {
-        title: "Windmill API".to_string(),
+        title: "Gantry API".to_string(),
         version: "1.0.0".to_string(),
         ..Default::default()
     };

@@ -129,7 +129,7 @@ lazy_static::lazy_static! {
                 }
 
                 {
-                    panic!("Agent mode is only available in the EE, ignoring...");
+                    panic!("Agent mode is not supported in Gantry, ignoring...");
                 }
             } else if &x == "indexer" {
                 tracing::info!("Binary is in 'indexer' mode");
@@ -298,7 +298,7 @@ pub fn sanitize_db_error(e: sqlx::Error) -> Error {
         }
         Some("23514") if db_err.constraint() == Some("variable_oauth_no_value_expiry") => {
             Error::BadRequest(
-                "A variable linked to an OAuth account cannot have a value expiry: Windmill \
+                "A variable linked to an OAuth account cannot have a value expiry: Gantry \
                  refreshes its token"
                     .to_string(),
             )

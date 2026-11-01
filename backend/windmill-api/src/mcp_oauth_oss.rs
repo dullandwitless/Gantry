@@ -28,7 +28,7 @@ mod oss_impl {
 
     pub async fn get_client_metadata() -> Json<ClientMetadata> {
         Json(ClientMetadata {
-            client_name: "Windmill",
+            client_name: "Gantry",
             redirect_uris: vec![],
             grant_types: vec!["authorization_code", "refresh_token"],
             response_types: vec!["code"],
@@ -55,7 +55,7 @@ mod oss_impl {
         Json(_req): Json<DiscoverRequest>,
     ) -> JsonResult<DiscoverResponse> {
         Err(error::Error::BadRequest(
-            "Not implemented in Windmill's Open Source repository".to_string(),
+            "Not implemented in Gantry".to_string(),
         ))
     }
 
@@ -71,7 +71,7 @@ mod oss_impl {
         Query(_params): Query<StartPopupParams>,
     ) -> Result<Redirect, error::Error> {
         Err(error::Error::BadRequest(
-            "Not implemented in Windmill's Open Source repository".to_string(),
+            "Not implemented in Gantry".to_string(),
         ))
     }
 

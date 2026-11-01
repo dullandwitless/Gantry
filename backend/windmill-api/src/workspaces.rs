@@ -245,17 +245,17 @@ async fn get_copilot_info(
 }
 
 pub async fn get_critical_alerts() -> Error {
-    Error::NotFound("Critical Alerts require EE".to_string())
+    Error::NotFound("Critical Alerts is not supported in Gantry".to_string())
 }
 
 pub async fn acknowledge_critical_alert() -> Error {
-    Error::NotFound("Critical Alerts require EE".to_string())
+    Error::NotFound("Critical Alerts is not supported in Gantry".to_string())
 }
 
 pub async fn acknowledge_all_critical_alerts() -> Error {
-    Error::NotFound("Critical Alerts require EE".to_string())
+    Error::NotFound("Critical Alerts is not supported in Gantry".to_string())
 }
 
 pub async fn mute_critical_alerts() -> Error {
-    Error::NotFound("Critical Alerts require EE".to_string())
+    Error::NotFound("Critical Alerts is not supported in Gantry".to_string())
 }

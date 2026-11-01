@@ -263,7 +263,7 @@ pub async fn test_email(
     if !SMTP_ENABLED {
         return Err(error::Error::Generic(
             axum::http::StatusCode::NOT_IMPLEMENTED,
-            "This Windmill build was compiled without SMTP support, so no email can be sent."
+            "This Gantry build was compiled without SMTP support, so no email can be sent."
                 .to_string(),
         ));
     }
@@ -274,7 +274,7 @@ pub async fn test_email(
     // provider; a tighter budget times out before the server ever states why it refused.
     let client_timeout = Duration::from_secs(20);
     send_email_plain_text(
-        "Test email from Windmill",
+        "Test email from Gantry",
         "Test email content",
         vec![to],
         smtp,
@@ -427,7 +427,7 @@ async fn validate_object_storage_test(settings: &ObjectSettings) -> error::Resul
         ObjectSettings::Filesystem(_) => {
             return Err(error::Error::NotAuthorized(
                 "Testing a local filesystem object store requires a super admin: it runs on the \
-                 Windmill server and reads and writes the server's local disk. Ask a super admin \
+                 Gantry server and reads and writes the server's local disk. Ask a super admin \
                  to run it."
                     .to_string(),
             ));
@@ -435,14 +435,14 @@ async fn validate_object_storage_test(settings: &ObjectSettings) -> error::Resul
         ObjectSettings::AwsOidc(_) => {
             return Err(error::Error::NotAuthorized(format!(
                 "Testing OIDC-based object storage requires a super admin: it runs on the \
-                 Windmill server with the server's own identity. {ALTERNATIVE}"
+                 Gantry server with the server's own identity. {ALTERNATIVE}"
             )));
         }
         ObjectSettings::S3(s3) => {
             if !(non_empty(&s3.access_key) && non_empty(&s3.secret_key)) {
                 return Err(error::Error::NotAuthorized(format!(
                     "Testing S3 storage without an explicit access key and secret key requires a \
-                     super admin: it runs on the Windmill server, which would use its own ambient \
+                     super admin: it runs on the Gantry server, which would use its own ambient \
                      credentials. {ALTERNATIVE}"
                 )));
             }
@@ -470,7 +470,7 @@ async fn validate_object_storage_test(settings: &ObjectSettings) -> error::Resul
             if !non_empty(&azure.access_key) {
                 return Err(error::Error::NotAuthorized(format!(
                     "Testing Azure storage without an explicit access key requires a super admin: \
-                     it runs on the Windmill server, which would use its own ambient credentials. \
+                     it runs on the Gantry server, which would use its own ambient credentials. \
                      {ALTERNATIVE}"
                 )));
             }
@@ -490,7 +490,7 @@ async fn validate_object_storage_test(settings: &ObjectSettings) -> error::Resul
             if windmill_object_store::gcs_service_account_key_is_blank(&gcs.service_account_key) {
                 return Err(error::Error::NotAuthorized(format!(
                     "Testing GCS storage without a service account key requires a super admin: \
-                     it runs on the Windmill server, which would use its own ambient credentials. \
+                     it runs on the Gantry server, which would use its own ambient credentials. \
                      {ALTERNATIVE}"
                 )));
             }
@@ -553,7 +553,7 @@ async fn validate_public_endpoint(endpoint: &str) -> error::Result<()> {
             // answer, and this message is only ever shown to the caller being constrained.
             return Err(error::Error::NotAuthorized(format!(
                 "Testing object storage at '{host}', which resolves to a private, loopback, or \
-                 link-local address, requires a super admin: this test runs on the Windmill \
+                 link-local address, requires a super admin: this test runs on the Gantry \
                  server, which is not allowed to probe internal addresses for non-super-admins. \
                  Ask a super admin to run it, or test the resource from a script, which runs on \
                  a worker."
@@ -1575,19 +1575,19 @@ pub async fn create_customer_portal_session() -> Result<String> {
 }
 
 pub async fn test_critical_channels() -> Result<String> {
-    Ok("Critical channels require EE".to_string())
+    Ok("Critical channels is not supported in Gantry".to_string())
 }
 
 pub async fn get_critical_alerts() -> error::Error {
-    error::Error::NotFound("Critical Alerts require EE".to_string())
+    error::Error::NotFound("Critical Alerts is not supported in Gantry".to_string())
 }
 
 pub async fn acknowledge_critical_alert() -> error::Error {
-    error::Error::NotFound("Critical Alerts require EE".to_string())
+    error::Error::NotFound("Critical Alerts is not supported in Gantry".to_string())
 }
 
 pub async fn acknowledge_all_critical_alerts() -> error::Error {
-    error::Error::NotFound("Critical Alerts require EE".to_string())
+    error::Error::NotFound("Critical Alerts is not supported in Gantry".to_string())
 }
 
 #[derive(Deserialize, Debug, Serialize)]
@@ -2096,7 +2096,7 @@ fn custom_instance_user_connect_error(host: &str, dbname: &str, e: error::Error)
         error::Error::BadConfig(format!(
             "DATABASE_URL reaches Postgres through a connection pooler ({host}) that picks the \
              server to route to from the login name, and it refused custom_instance_user, the \
-             role Windmill uses for instance databases ({cause}). Instance databases cannot be \
+             role Gantry uses for instance databases ({cause}). Instance databases cannot be \
              used through this pooler: use your own Postgres database instead, or point \
              DATABASE_URL at the Postgres server directly rather than at the pooler."
         ))

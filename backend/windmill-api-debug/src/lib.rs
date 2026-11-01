@@ -333,7 +333,7 @@ async fn get_registry_config(
         config.pip_extra_index_url = None;
         if configured {
             config.message = Some(
-                "Private registry configuration ignored: this feature requires Windmill Enterprise Edition"
+                "Private registry configuration ignored: this feature is not supported in Gantry"
                     .to_string(),
             );
         }

@@ -589,7 +589,7 @@ pub(crate) async fn prepare_deferral(
     if p.templated_location {
         return Err(Error::BadRequest(
             "this project's profile selects its schema or database with a template, which dbt \
-             renders and Windmill does not — so two environments cannot be told apart and a \
+             renders and Gantry does not — so two environments cannot be told apart and a \
              deferral could resolve through the wrong one's manifest. Spell the target's schema \
              and database literally to use `defer`"
                 .to_string(),

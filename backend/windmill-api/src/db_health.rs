@@ -668,7 +668,7 @@ fn compute_connection_sizing(
 
     let message = if live_instances == 0 {
         format!(
-            "No live workers detected. Each Windmill server and worker instance opens up to {server_pool} connections ({pool_source}). Size max_connections as (servers + worker instances) × {server_pool} + ~20% headroom, and at least {MIN_RECOMMENDED_MAX_CONNECTIONS}."
+            "No live workers detected. Each Gantry server and worker instance opens up to {server_pool} connections ({pool_source}). Size max_connections as (servers + worker instances) × {server_pool} + ~20% headroom, and at least {MIN_RECOMMENDED_MAX_CONNECTIONS}."
         )
     } else {
         let per_instance = if database_connections_override.is_some() {
@@ -684,7 +684,7 @@ fn compute_connection_sizing(
             String::new()
         };
         format!(
-            "{live_workers} live worker(s) across {live_instances} instance(s) can open up to ~{estimated_worker_connections} connections ({per_instance}; {pool_source}). Each Windmill server adds up to {server_pool}. Recommended max_connections ≥ {recommended} for a single server; add {server_pool} per additional server.{agent_note}"
+            "{live_workers} live worker(s) across {live_instances} instance(s) can open up to ~{estimated_worker_connections} connections ({per_instance}; {pool_source}). Each Gantry server adds up to {server_pool}. Recommended max_connections ≥ {recommended} for a single server; add {server_pool} per additional server.{agent_note}"
         )
     };
 

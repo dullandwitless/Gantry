@@ -386,8 +386,8 @@ async fn test_resolve_completed_jobs_scoping(db: Pool<Postgres>) -> anyhow::Resu
     .await?;
     assert_eq!(row.0, "failure", "resolving must not change job status");
     {
-        assert_eq!(row.1, None, "attribution is an EE feature");
-        assert_eq!(row.2, None, "notes are an EE feature");
+        assert_eq!(row.1, None, "attribution is not supported in Gantry");
+        assert_eq!(row.2, None, "notes are not supported in Gantry");
     }
 
     // Re-resolving without a note must keep the existing one: a bulk selection routinely

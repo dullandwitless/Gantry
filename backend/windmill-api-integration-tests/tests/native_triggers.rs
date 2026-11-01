@@ -1132,7 +1132,7 @@ async fn test_native_trigger_enabled_toggle(db: Pool<Postgres>) -> anyhow::Resul
     );
     assert!(
         native_trigger_is_enabled(&db, "test-workspace", ServiceName::Nextcloud, "unknown").await?,
-        "a trigger Windmill has no row for is not treated as paused"
+        "a trigger Gantry has no row for is not treated as paused"
     );
 
     Ok(())

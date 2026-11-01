@@ -76,7 +76,7 @@ pub async fn store_secret_value(
             Ok(format!("$http_store:{}", path))
         }
         "http_store" => Err(Error::BadRequest(format!(
-            "Secrets are read from an external HTTP secret store, which Windmill cannot write to. \
+            "Secrets are read from an external HTTP secret store, which Gantry cannot write to. \
              Set the value of {path} in the store and save this secret with an empty value to \
              reference it."
         ))),
@@ -219,7 +219,7 @@ pub async fn rename_vault_secret(
     }
     if is_vault_stored_value(current_value) {
         tracing::warn!(
-            "Variable has $vault: prefix but Vault requires Enterprise Edition. \
+            "Variable has $vault: prefix but Vault is not supported in Gantry. \
              Updating DB reference to {}",
             new_path
         );
@@ -227,7 +227,7 @@ pub async fn rename_vault_secret(
     }
     if is_azure_kv_stored_value(current_value) {
         tracing::warn!(
-            "Variable has $azure_kv: prefix but Azure Key Vault requires Enterprise Edition. \
+            "Variable has $azure_kv: prefix but Azure Key Vault is not supported in Gantry. \
              Updating DB reference to {}",
             new_path
         );
@@ -235,7 +235,7 @@ pub async fn rename_vault_secret(
     }
     if is_aws_sm_stored_value(current_value) {
         tracing::warn!(
-            "Variable has $aws_sm: prefix but AWS Secrets Manager requires Enterprise Edition. \
+            "Variable has $aws_sm: prefix but AWS Secrets Manager is not supported in Gantry. \
              Updating DB reference to {}",
             new_path
         );

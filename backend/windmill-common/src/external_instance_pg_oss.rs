@@ -13,7 +13,7 @@ use crate::error::Error;
 
 pub fn external_instance_pg_unavailable() -> Error {
     Error::BadRequest(
-        "External instance databases are a Windmill Enterprise Edition feature".to_string(),
+        "External instance databases are not supported in Gantry".to_string(),
     )
 }
 

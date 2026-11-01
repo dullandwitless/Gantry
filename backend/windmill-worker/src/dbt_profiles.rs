@@ -533,7 +533,7 @@ pub fn render_profile(
     // Windmill has no facts about cannot be rendered from one at all.
     let adapter = adapter.known().ok_or_else(|| {
         Error::BadRequest(format!(
-            "no Windmill resource translates into a `{}` target; point the warehouse at a \
+            "no Gantry resource translates into a `{}` target; point the warehouse at a \
              `dbt_profile` resource, whose value is the profiles.yml block itself",
             adapter.dbt_type()
         ))

@@ -31,7 +31,7 @@ async fn test_instance_datatable_refused_once_instance_pg_disabled(
 
     let refused = get_datatable_resource_from_db_unchecked(&db, "dtoff-ws", "main")
         .await
-        .expect_err("an instance data table must not resolve while Windmill's database is off");
+        .expect_err("an instance data table must not resolve while Gantry's database is off");
     assert!(
         refused.to_string().contains("disabled on this instance"),
         "unexpected error: {refused}"

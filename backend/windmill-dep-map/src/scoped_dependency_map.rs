@@ -386,7 +386,7 @@ SELECT importer_node_id, imported_path, imported_lockfile_hash
             kind = importer_kind,
             node_id = importer_node_id,
             workspace_id = w_id,
-            "discovered orphan entry in `dependency_map`. It will be healed automatically, however please report this issue to Windmill Team. It is also advised to rebuild maps in workspace settings in troubleshooting.",
+            "discovered orphan entry in `dependency_map`. It will be healed automatically, however please report this as a bug. It is also advised to rebuild maps in workspace settings in troubleshooting.",
         );
 
         if let Err(err) = sqlx::query!(
@@ -560,7 +560,7 @@ SELECT importer_node_id, imported_path, imported_lockfile_hash
             tracing::info!(workspace_id = w_id, "Rebuilding dependency map");
 
             if *WMDEBUG_NO_DMAP_DISSOLVE {
-                tracing::warn!("WMDEBUG_NO_DMAP_DISSOLVE usually should not be used. Behavior might be unstable. Please contact Windmill Team for support.")
+                tracing::warn!("WMDEBUG_NO_DMAP_DISSOLVE usually should not be used. Behavior might be unstable. Please report this as a bug.")
             }
 
             *LOCKED.write().await = true;

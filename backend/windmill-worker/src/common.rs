@@ -2095,7 +2095,7 @@ pub async fn save_in_cache(
 
 pub(crate) fn deno_not_installed_error() -> Error {
     Error::ExecutionErr(format!(
-        "Deno is not installed on this worker (looked for it at {}). The standard Windmill images \
+        "Deno is not installed on this worker (looked for it at {}). The standard Gantry images \
          no longer ship Deno: official support for it on those images was discontinued after Deno \
          announced the end of development of the Deno runtime (https://deno.com/blog/cloudflare). \
          We recommend migrating this script to Bun. To keep running Deno scripts, use the \

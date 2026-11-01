@@ -9,5 +9,5 @@ pub async fn validate_license_key(
     Option<windmill_common::ee_oss::OfflineMetadata>,
 )> {
     // Implementation is not open source
-    Err(anyhow!("License can't be validated in Windmill CE"))
+    Err(anyhow!("License keys are not used by Gantry"))
 }

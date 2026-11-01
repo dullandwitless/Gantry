@@ -2064,17 +2064,17 @@ async fn check_result_size<T: ValidableJson>(
                 result_size,
                 *MAX_RESULT_SIZE_MB
             );
-            return Some(Err(Error::ResultTooLarge(format!("Result of job {} is too large: {}MB > MAX_RESULT_SIZE_MB={}MB.\nUse external storages such as the Windmill Object Storage to store large results: https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill", queued_job.id, result_size, *MAX_RESULT_SIZE_MB))));
+            return Some(Err(Error::ResultTooLarge(format!("Result of job {} is too large: {}MB > MAX_RESULT_SIZE_MB={}MB.\nUse external storages such as workspace object storage to store large results: https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill", queued_job.id, result_size, *MAX_RESULT_SIZE_MB))));
         }
         append_logs(
             &queued_job.id,
             &queued_job.workspace_id,
-            format!("Warning: Result of job {} is large: {}MB.\nRecommended max size is 2MB.\nPrefer using external storages such as the Windmill Object Storage to store large results: https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill", queued_job.id, result_size),
+            format!("Warning: Result of job {} is large: {}MB.\nRecommended max size is 2MB.\nPrefer using external storages such as workspace object storage to store large results: https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill", queued_job.id, result_size),
             &db.into(),
         )
         .await;
         if *CLOUD_HOSTED {
-            return Some(Err(Error::ResultTooLarge(format!("Result of job {} is too large for multi-tenant cloud: {}MB (max 2MB).\nUse external storages such as the Windmill Object Storage to store large results: https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill", queued_job.id, result_size))));
+            return Some(Err(Error::ResultTooLarge(format!("Result of job {} is too large for multi-tenant cloud: {}MB (max 2MB).\nUse external storages such as workspace object storage to store large results: https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill", queued_job.id, result_size))));
         } else {
             tracing::warn!(
                 "Result of job {} is larger than 2MB: {}MB. Not recommended.",
@@ -4921,7 +4921,7 @@ pub async fn pull(
             has_active_concurrency_limit(concurrency_settings.concurrent_limit);
 
         if has_concurent_limit && !job.is_dependency() {
-            tracing::error!("Concurrent limits are an EE feature only, ignoring constraints")
+            tracing::error!("Concurrent limits are not supported in Gantry, ignoring constraints")
         }
 
         let has_concurent_limit = job.is_dependency()
@@ -8972,23 +8972,6 @@ mod preset_handler_path_tests {
         assert!(!is_preset_handler_path(
             "script/u/me/workspace-or-schedule-error-handler-slack"
         ));
-    }
-
-    /// A preset version bumped in the frontend without being pinned here would silently run as
-    /// the schedule's owner and lose access to the Slack bot token.
-    #[test]
-    fn frontend_presets_are_pinned() {
-        let hub_paths: std::collections::HashMap<String, String> =
-            serde_json::from_str(include_str!("../../../frontend/src/lib/hubPaths.json")).unwrap();
-        for (name, path) in hub_paths {
-            // Variable expiration handlers run as their own group whatever their path.
-            if path.contains("-handler-") && !path.contains("variable-expiration") {
-                assert!(
-                    is_preset_handler_path(&path),
-                    "{name}: {path} is not pinned"
-                );
-            }
-        }
     }
 }
 

@@ -107,7 +107,7 @@ impl McpClient {
         let client_info = ClientInfo::new(
             ClientCapabilities::default(),
             Implementation::new("windmill-ai-agent", env!("CARGO_PKG_VERSION"))
-                .with_title("Windmill AI Agent"),
+                .with_title("Gantry AI Agent"),
         );
 
         // Initialize the connection

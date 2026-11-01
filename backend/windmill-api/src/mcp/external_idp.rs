@@ -284,7 +284,7 @@ async fn resolve(
         refuse(
             Some(w_id),
             format!(
-                "{email} is not a member of workspace {w_id}. Users must sign in to Windmill once \
+                "{email} is not a member of workspace {w_id}. Users must sign in to Gantry once \
                  before using an MCP client"
             ),
         )
