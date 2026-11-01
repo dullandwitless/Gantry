@@ -347,8 +347,6 @@ pub struct GlobalSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smtp_settings: Option<SmtpSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub indexer_settings: Option<IndexerSettings>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub oauths: Option<BTreeMap<String, OAuthClientEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub otel: Option<OtelSettings>,
@@ -497,34 +495,6 @@ pub struct SmtpSettings {
     pub smtp_disable_tls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smtp_clicktracking_off: Option<bool>,
-}
-
-// ---------------------------------------------------------------------------
-// Indexer
-// ---------------------------------------------------------------------------
-
-/// Full-text search indexer configuration.
-#[derive(Deserialize, Serialize, Clone, Debug, Default)]
-#[cfg_attr(feature = "instance_config_schema", derive(schemars::JsonSchema))]
-pub struct IndexerSettings {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub writer_memory_budget: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_job_max_batch_size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_log_max_batch_size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_index_period: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_log_index_period: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_indexed_job_log_size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_index_time_window_secs: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub should_clear_job_index: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub should_clear_log_index: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

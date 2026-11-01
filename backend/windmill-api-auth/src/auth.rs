@@ -1104,11 +1104,7 @@ fn maybe_get_workspace_id_from_path(path_vec: &[&str]) -> Option<String> {
     {
         Some(path_vec[4].to_owned())
     } else {
-        if path_vec.len() >= 5 && path_vec[0] == "" && path_vec[2] == "srch" && path_vec[3] == "w" {
-            Some(path_vec[4].to_owned())
-        } else {
-            None
-        }
+        None
     };
 
     workspace_id

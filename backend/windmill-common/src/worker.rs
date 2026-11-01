@@ -32,7 +32,6 @@ use crate::{
     error::{self, to_anyhow},
     external_ip::UNKNOWN_IP,
     global_settings::CUSTOM_TAGS_SETTING,
-    indexer::TantivyIndexerSettings,
     server::Smtp,
     utils::{merge_nested_raw_values_to_array, merge_raw_values_to_array},
     KillpillSender, DB,
@@ -522,7 +521,6 @@ lazy_static::lazy_static! {
 
 
     pub static ref SMTP_CONFIG: arc_swap::ArcSwap<Option<Smtp>> = arc_swap::ArcSwap::from_pointee(None);
-    pub static ref INDEXER_CONFIG: arc_swap::ArcSwap<TantivyIndexerSettings> = arc_swap::ArcSwap::from_pointee(TantivyIndexerSettings::default());
 
 
     pub static ref CLOUD_HOSTED: bool = std::env::var("CLOUD_HOSTED").is_ok();

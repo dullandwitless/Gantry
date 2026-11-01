@@ -60,7 +60,6 @@ pub mod folders;
 pub mod global_settings;
 pub mod guest_jwt;
 pub mod hub_resource_types;
-pub mod indexer;
 pub mod instance_config;
 pub mod job_metrics;
 pub mod log_context;
@@ -209,8 +208,7 @@ pub fn otel_traces_retention_secs() -> i64 {
 /// How long a service log line stays retrievable, in seconds.
 ///
 /// The outer bound on everything service-log: the `log_file` rows, the raw files in object
-/// storage, the columnar store queried by retrieval, and — through
-/// [`indexer::service_log_index_window_secs`] — the search index.
+/// storage, and the columnar store queried by retrieval.
 pub fn service_log_retention_secs() -> i64 {
     SERVICE_LOG_RETENTION_SECS.load(std::sync::atomic::Ordering::Relaxed)
 }

@@ -284,7 +284,6 @@ fn extract_domain_from_route(
     // Examples:
     // - /api/w/workspace/jobs/123 -> jobs domain (workspaced)
     // - /api/teams/sync -> teams domain (global)
-    // - /api/srch/index/search -> indexer domain (global)
     let parts: Vec<&str> = route_path.split('/').collect();
 
     let (domain, kind, route_suffix) = if parts.len() >= 5 && parts[1] == "api" && parts[2] == "w" {

@@ -80,7 +80,6 @@ use windmill_common::{
         WORKSPACE_FAIRNESS_ENABLED_SETTING, WORKSPACE_FAIRNESS_MAX_PERCENT_SETTING,
         WORKSPACE_FAIRNESS_MIN_TOTAL_SETTING, WORKSPACE_MAX_QUEUED_JOBS_SETTING,
     },
-    indexer::load_indexer_config,
     jobs::delete_jobs,
     jwt::JWT_SECRET,
     oauth2::REQUIRE_PREEXISTING_USER_FOR_OAUTH,
@@ -95,7 +94,7 @@ use windmill_common::{
         CONCURRENCY_KEY_MAX_QUEUED, CONCURRENCY_KEY_MAX_QUEUED_DEFAULT,
         DEFAULT_DEV_WORKSPACE_TAG_SUFFIX, DEFAULT_TAGS_PER_WORKSPACE, DEFAULT_TAGS_WORKSPACES,
         DEPENDENCY_JOB_TAG, DEV_WORKSPACE_ISOLATION, DEV_WORKSPACE_ISOLATION_SKIP_NON_DEV_FORKS,
-        DEV_WORKSPACE_TAG_SUFFIX, FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX, INDEXER_CONFIG,
+        DEV_WORKSPACE_TAG_SUFFIX, FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX,
         PREVIEW_TAGS_OVERRIDE, SMTP_CONFIG, WINDMILL_DIR, WORKER_CONFIG, WORKER_GROUP,
         WORKSPACE_FAIRNESS_DURATION_SECS, WORKSPACE_FAIRNESS_ENABLED,
         WORKSPACE_FAIRNESS_MAX_PERCENT, WORKSPACE_FAIRNESS_MIN_TOTAL, WORKSPACE_MAX_QUEUED_JOBS,
@@ -545,9 +544,8 @@ pub async fn initial_load(
         |v: Option<String>| async move { HUB_API_SECRET.store(std::sync::Arc::new(v)) },
     );
 
-    // Outside the `server_mode` guard below: every mode reads this. A worker registers its
-    // rotated log files against the cutoff, and a dedicated indexer trims the search index to a
-    // window derived from it — neither is a server.
+    // Outside the `server_mode` guard below: every mode reads this. A worker, which is not a
+    // server, registers its rotated log files against the cutoff.
     pass.setting(SERVICE_LOG_RETENTION_SECS_SETTING, true, |v| async move {
         windmill_common::set_service_log_retention_secs(parse_setting_value::<i64>(
             v,
@@ -1500,9 +1498,7 @@ fn last_log_file_sent() -> Option<NaiveDateTime> {
 /// the file that was still open and the appender reopens that minute in append mode,
 /// so a restart inside it would otherwise strand everything written afterwards.
 ///
-/// A row rewritten this way restores the object and sums the counters, but it keeps the
-/// `indexed_at` it already had, so one the indexers have taken is not offered again and
-/// the lines added by the rewrite stay out of search.
+/// A row rewritten this way restores the object and sums the counters.
 async fn init_last_log_file_sent(conn: &Connection, hostname: &str) {
     let Some(db) = conn.as_sql() else {
         return;
@@ -1542,16 +1538,14 @@ async fn send_log_files_to_object_store(
             continue;
         }
         // A run coming back from a long outage still finds its predecessor's files on
-        // disk. Registering one past the retention cutoff inserts a row
-        // `delete_expired_items` drops on its next pass, once the indexers have already
-        // paid to parse it.
+        // disk. Registering one past the retention cutoff would only insert a row
+        // `delete_expired_items` drops on its next pass.
         if ts < retention_cutoff {
             continue;
         }
         // Stop at the first failure rather than moving on, so a file is never
-        // registered before an older one that has not made it to the store yet.
-        // The indexers do not depend on that ordering — every row is offered until
-        // it is marked — but a gap here would still be visible while it lasts.
+        // registered before an older one that has not made it to the store yet;
+        // a gap would be visible to readers while it lasts.
         if !send_log_file_to_object_store(hostname, mode, worker_group, conn, &file_name, ts).await
         {
             break;
@@ -5080,16 +5074,6 @@ pub async fn reload_smtp_config(db: &Pool<Postgres>) {
     } else {
         tracing::info!("Reloading smtp config...");
         SMTP_CONFIG.store(std::sync::Arc::new(smtp_config.unwrap()));
-    }
-}
-
-pub async fn reload_indexer_config(db: &Pool<Postgres>) {
-    let indexer_config = load_indexer_config(&db).await;
-    if let Err(e) = indexer_config {
-        tracing::error!("Error reloading indexer config: {:?}", e)
-    } else {
-        tracing::info!("Reloading indexer config...");
-        INDEXER_CONFIG.store(std::sync::Arc::new(indexer_config.unwrap()));
     }
 }
 

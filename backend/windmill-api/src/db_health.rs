@@ -541,7 +541,7 @@ async fn fetch_connection_pool(db: &DB) -> windmill_common::error::Result<Connec
     .await?;
 
     // Matches how db_connect.rs reads it: when DATABASE_CONNECTIONS is set it caps
-    // every process's pool (server, indexer, worker) regardless of worker count.
+    // every process's pool (server or worker) regardless of worker count.
     let database_connections_override = std::env::var("DATABASE_CONNECTIONS")
         .ok()
         .and_then(|n| n.parse::<i64>().ok())
@@ -614,7 +614,7 @@ async fn fetch_connection_pool(db: &DB) -> windmill_common::error::Result<Connec
 /// derive a recommended `max_connections` floor.
 ///
 /// Pool sizing mirrors `db_connect.rs`: when `DATABASE_CONNECTIONS` is set it
-/// caps *every* process's pool (server, indexer, worker) at that value, so each
+/// caps *every* process's pool (server or worker) at that value, so each
 /// worker instance opens up to that many connections. Otherwise each worker
 /// instance shares a pool of `DEFAULT_MAX_CONNECTIONS_WORKER + (workers - 1)`
 /// (fleet ceiling `(worker_pool - 1) * instances + workers`) and each server

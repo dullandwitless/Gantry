@@ -9,7 +9,7 @@ use anyhow::Context;
 use monitor::{
     flush_pending_log_files_to_object_store, load_base_url, load_otel,
     reload_critical_alerts_on_db_oversize, reload_delete_logs_periodically_setting,
-    reload_indexer_config, reload_instance_python_version_setting, reload_maven_repos_setting,
+    reload_instance_python_version_setting, reload_maven_repos_setting,
     reload_maven_settings_xml_setting, reload_no_default_maven_setting,
     reload_nuget_config_setting, reload_powershell_repo_pat_setting,
     reload_powershell_repo_url_setting, reload_ruby_repos_setting,
@@ -46,7 +46,7 @@ use windmill_common::{
         EXPOSE_DEBUG_METRICS_SETTING, EXPOSE_METRICS_SETTING, EXTRA_PIP_INDEX_URL_SETTING,
         FORK_WORKSPACE_TAG_APPEND_FORK_SUFFIX_SETTING, HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING,
         HTTP_ROUTE_WORKSPACED_ROUTE_SETTING, HUB_API_SECRET_SETTING, HUB_BASE_URL_SETTING,
-        INDEXER_SETTING, INSTANCE_EVENTS_WEBHOOK_SETTING, INSTANCE_PYTHON_VERSION_SETTING,
+        INSTANCE_EVENTS_WEBHOOK_SETTING, INSTANCE_PYTHON_VERSION_SETTING,
         JOB_DEFAULT_TIMEOUT_SECS_SETTING, JOB_ISOLATION_SETTING, JWT_SECRET_SETTING,
         KEEP_JOB_DIR_SETTING, LICENSE_KEY_SETTING, MAVEN_REPOS_SETTING, MAVEN_SETTINGS_XML_SETTING,
         MCP_DISABLE_TOKEN_QUERY_PARAM_SETTING, MONITOR_LOGS_ON_OBJECT_STORE_SETTING,
@@ -425,7 +425,7 @@ fn print_help() {
     println!("  MODE = standalone                      Mode: standalone | worker | server | agent");
     println!("  BASE_URL = http://localhost:8000       Public base URL of your instance (overridden by instance settings)");
     println!(
-        "  PORT = {}                              HTTP port (server/indexer/MCP modes)",
+        "  PORT = {}                              HTTP port (server/MCP modes)",
         DEFAULT_PORT
     );
     println!(
@@ -1651,9 +1651,6 @@ async fn process_notify_event(
                 }
                 TEAMS_SETTING => {
                     tracing::info!("Teams setting changed.");
-                }
-                INDEXER_SETTING => {
-                    reload_indexer_config(db).await;
                 }
                 TIMEOUT_WAIT_RESULT_SETTING => reload_timeout_wait_result_setting(conn).await,
                 RETENTION_PERIOD_SECS_SETTING => reload_retention_period_setting(conn).await,

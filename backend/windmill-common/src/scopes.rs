@@ -293,7 +293,6 @@ pub enum ScopeDomain {
     AiEvals, // AI agent eval datasets
     SlackAgents, // AI agents answering in Slack channels
 
-    Indexer,
     Teams,   // Microsoft Teams integration
     GitSync, // Git synchronization
 
@@ -364,7 +363,6 @@ impl ScopeDomain {
             Self::Acls => "acls",
             Self::RawApps => "raw_apps",
             Self::AgentWorkers => "agent_workers",
-            Self::Indexer => "indexer",
             Self::Teams => "teams",
             Self::GitSync => "git_sync",
             Self::Mcp => "mcp",
@@ -409,7 +407,6 @@ impl ScopeDomain {
             "ai" => Some(Self::AI),
             "ai_evals" => Some(Self::AiEvals),
             "slack_agents" => Some(Self::SlackAgents),
-            "indexer" | "srch" => Some(Self::Indexer),
             "teams" => Some(Self::Teams),
             "native_triggers" => Some(Self::NativeTriggers),
             "triggers_history" => Some(Self::TriggersHistory),

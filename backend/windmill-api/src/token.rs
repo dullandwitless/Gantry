@@ -136,7 +136,6 @@ fn build_standard_scope_domains() -> Vec<ScopeDomain> {
         ),
         ("oidc", "OIDC", "OIDC management", false),
         ("acls", "ACLs", "Access Control List management", false),
-        ("indexer", "Indexer", "Search indexer management", false),
         ("teams", "Teams", "Team management", false),
         (
             "git_sync",

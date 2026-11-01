@@ -61,7 +61,6 @@ pub const SCIM_TOKEN_SETTING: &str = "scim_token";
 pub const SAML_METADATA_SETTING: &str = "saml_metadata";
 pub const SMTP_SETTING: &str = "smtp_settings";
 pub const TEAMS_SETTING: &str = "teams";
-pub const INDEXER_SETTING: &str = "indexer_settings";
 pub const EXTERNAL_INSTANCE_PG_SETTING: &str = "external_instance_pg";
 /// Turns off Windmill's own Postgres as a data table and Ducklake substrate. Absent means on,
 /// which is what every instance that predates the setting expects.
@@ -522,7 +521,6 @@ pub const AGENT_WORKER_BLOCKED_SETTINGS: &[&str] = &[
     OBJECT_STORE_CONFIG_SETTING,
     AI_CONFIG_SETTING,
     TEAMS_SETTING,
-    INDEXER_SETTING,
     // Server-only configs that may embed credentials, webhook URLs or tokens and
     // are never loaded by an agent worker.
     CRITICAL_ERROR_CHANNELS_SETTING,
@@ -1434,7 +1432,6 @@ mod tests {
             OBJECT_STORE_CONFIG_SETTING,
             AI_CONFIG_SETTING,
             TEAMS_SETTING,
-            INDEXER_SETTING,
             CRITICAL_ERROR_CHANNELS_SETTING,
             INSTANCE_EVENTS_WEBHOOK_SETTING,
             OTEL_SETTING,

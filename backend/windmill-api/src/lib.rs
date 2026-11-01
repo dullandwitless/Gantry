@@ -99,7 +99,6 @@ mod group_history;
 mod groups;
 mod health;
 mod hub_publish;
-mod indexer_oss;
 mod integration;
 mod internal_db;
 mod live_migrations;
@@ -794,7 +793,6 @@ pub async fn run_server(
                 .nest("/embeddings", embeddings::global_service())
                 .nest("/ai", ai::global_service())
                 .nest("/docs", docs::global_service())
-                .nest("/indexer", indexer_oss::management_service())
                 .nest("/mcp/w/{workspace_id}/list_tools", mcp_list_tools_service)
                 .nest("/mcp/toolset", mcp_toolset_service)
                 .nest("/db_health", db_health::global_service())
@@ -836,11 +834,6 @@ pub async fn run_server(
                     Router::new()
                 })
                 .nest("/jobs", jobs::global_root_service())
-                .nest(
-                    "/srch/w/{workspace_id}/index",
-                    indexer_oss::workspaced_service(),
-                )
-                .nest("/srch/index", indexer_oss::global_service())
                 .nest("/oidc", oidc_oss::global_service())
                 .nest("/debug", windmill_api_debug::global_service())
                 .nest(
@@ -1309,8 +1302,8 @@ const SERVER_HEARTBEAT_TASK: &str = "server_heartbeat";
 /// traffic-serving instances waiting to restart can detect this one is healthy.
 ///
 /// Only `server_mode` processes announce, since only they are peers worth waiting for:
-/// `spawn_graceful_killpill` holds a shutdown open to keep the API answered, and a worker,
-/// indexer or MCP process coming up is no evidence that it is.
+/// `spawn_graceful_killpill` holds a shutdown open to keep the API answered, and a worker
+/// or MCP process coming up is no evidence that it is.
 ///
 /// The row is keyed per host and `owner` per process, and both halves carry weight.
 /// `INSTANCE_NAME` is random per start, so a row keyed on it never conflicts and
