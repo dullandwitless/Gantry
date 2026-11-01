@@ -263,16 +263,6 @@ async fn set_request_client(
     windmill_common::trigger_history::scope_client(client, next.run(req)).await
 }
 
-#[cfg(not(feature = "tantivy"))]
-type IndexReader = ();
-
-#[cfg(not(feature = "tantivy"))]
-type ServiceLogIndexReader = ();
-
-#[cfg(feature = "tantivy")]
-type IndexReader = windmill_indexer::completed_runs_oss::IndexReader;
-#[cfg(feature = "tantivy")]
-type ServiceLogIndexReader = windmill_indexer::service_logs_oss::ServiceLogIndexReader;
 
 /// Worker name derived from the agent JWT token, used to authenticate volume operations.
 /// Defined unconditionally so volume endpoint handlers can reference it regardless of
@@ -350,8 +340,6 @@ async fn inject_agent_authed(
 
 pub async fn run_server(
     db: DB,
-    job_index_reader: Option<IndexReader>,
-    log_index_reader: Option<ServiceLogIndexReader>,
     listener: tokio::net::TcpListener,
     mut killpill_rx: tokio::sync::broadcast::Receiver<()>,
     port_tx: tokio::sync::oneshot::Sender<String>,
@@ -387,9 +375,6 @@ pub async fn run_server(
         .layer(Extension(db.clone()))
         .layer(Extension(user_db.clone()))
         .layer(Extension(auth_cache.clone()))
-        .layer(Extension(job_index_reader))
-        .layer(Extension(log_index_reader))
-        // .layer(Extension(index_writer))
         .layer(CookieManagerLayer::new())
         .layer(Extension(WebhookShared::new(
             killpill_rx.resubscribe(),

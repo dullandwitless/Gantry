@@ -122,7 +122,6 @@ pub mod workspaces;
 
 pub const DEFAULT_MAX_CONNECTIONS_SERVER: u32 = 50;
 pub const DEFAULT_MAX_CONNECTIONS_WORKER: u32 = 5;
-pub const DEFAULT_MAX_CONNECTIONS_INDEXER: u32 = 5;
 
 pub const DEFAULT_HUB_BASE_URL: &str = "https://hub.windmill.dev";
 pub const PRIVATE_HUB_MIN_VERSION: i32 = 10_000_000;

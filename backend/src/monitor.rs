@@ -1433,7 +1433,7 @@ async fn list_rotated_log_files(hostname: &str) -> Vec<(NaiveDateTime, String)> 
 
 fn get_worker_group(mode: &Mode) -> Option<String> {
     let worker_group = WORKER_GROUP.clone();
-    if worker_group.is_empty() || mode == &Mode::Server || mode == &Mode::Indexer {
+    if worker_group.is_empty() || mode == &Mode::Server {
         None
     } else {
         Some(worker_group)

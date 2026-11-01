@@ -1906,8 +1906,7 @@ async fn pull_codebase(w_id: &str, id: &str, job_dir: &str) -> Result<PulledCode
     } else {
         let object_store: Option<()> = None;
 
-        if &windmill_common::utils::MODE_AND_ADDONS.mode
-            == &windmill_common::utils::Mode::Standalone
+        if *windmill_common::utils::MODE == windmill_common::utils::Mode::Standalone
             && object_store.is_none()
         {
             let bun_cache_path = format!(

@@ -102,8 +102,7 @@ lazy_static::lazy_static! {
             .unwrap_or_else(|| rd_string(5))
     });
 
-    pub static ref MODE_AND_ADDONS: ModeAndAddons = {
-        let mut search_addon = false;
+    pub static ref MODE: Mode = {
         let mode = std::env::var("MODE")
         .map(|x| x.to_lowercase())
         .map(|x| {
@@ -131,19 +130,8 @@ lazy_static::lazy_static! {
                 {
                     panic!("Agent mode is only available in the EE, ignoring...");
                 }
-            } else if &x == "indexer" {
-                tracing::info!("Binary is in 'indexer' mode");
-                #[cfg(not(feature = "tantivy"))]
-                {
-                    eprintln!("Cannot start the indexer because tantivy is not included in this binary/image. Make sure you are using the EE image if you want to access the full text search features.");
-                    panic!("Indexer mode requires compiling with the tantivy feature flag.");
-                }
-                #[cfg(feature = "tantivy")]
-                Mode::Indexer
-            } else if &x == "standalone+search"{
-                search_addon = true;
-                    println!("Binary is in 'standalone' mode with search enabled");
-                    Mode::Standalone
+            } else if &x == "indexer" || &x == "standalone+search" {
+                panic!("MODE={x} is not supported: Gantry has no full-text search indexer");
             } else if &x == "mcp" {
                 println!("Binary is in 'mcp' mode");
                 Mode::MCP
@@ -167,19 +155,10 @@ lazy_static::lazy_static! {
             }
             Mode::Worker
         };
-        ModeAndAddons {
-            indexer: search_addon,
-            mode,
-        }
+        mode
     };
 
     pub static ref HUB_API_SECRET: arc_swap::ArcSwap<Option<String>> = arc_swap::ArcSwap::from_pointee(None);
-}
-
-#[derive(Clone)]
-pub struct ModeAndAddons {
-    pub indexer: bool,
-    pub mode: Mode,
 }
 
 #[derive(Deserialize, Clone)]
@@ -711,7 +690,6 @@ pub enum Mode {
     Agent,
     Server,
     Standalone,
-    Indexer,
     MCP,
 }
 
@@ -722,7 +700,6 @@ impl std::fmt::Display for Mode {
             Mode::Agent => write!(f, "agent"),
             Mode::Server => write!(f, "server"),
             Mode::Standalone => write!(f, "standalone"),
-            Mode::Indexer => write!(f, "indexer"),
             Mode::MCP => write!(f, "mcp"),
         }
     }

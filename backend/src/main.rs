@@ -72,7 +72,7 @@ use windmill_common::{
     stats_oss::schedule_stats,
     triggers::TriggerKind,
     utils::{
-        checked_worker_name, resolve_worker_suffix, Mode, GIT_VERSION, HOSTNAME, MODE_AND_ADDONS,
+        checked_worker_name, resolve_worker_suffix, Mode, GIT_VERSION, HOSTNAME, MODE,
     },
     worker::{
         is_native_mode_from_env, reload_custom_tags_setting, validate_worker_lifecycle_env,
@@ -512,8 +512,7 @@ async fn windmill_main() -> anyhow::Result<()> {
 
     let hostname = HOSTNAME.to_owned();
 
-    let mode_and_addons = MODE_AND_ADDONS.clone();
-    let mode = mode_and_addons.mode;
+    let mode = MODE.clone();
 
     if mode == Mode::Standalone {
         println!("Running in standalone mode");
@@ -652,7 +651,7 @@ async fn windmill_main() -> anyhow::Result<()> {
     };
 
     #[allow(unused_mut)]
-    let mut num_workers = if mode == Mode::Server || mode == Mode::Indexer || mode == Mode::MCP {
+    let mut num_workers = if mode == Mode::Server || mode == Mode::MCP {
         0
     } else if is_native_mode_from_env() {
         NATIVE_MODE_RESOLVED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -690,10 +689,9 @@ async fn windmill_main() -> anyhow::Result<()> {
         .unwrap_or(false)
         && (mode == Mode::Server || mode == Mode::Standalone);
 
-    let indexer_mode = mode == Mode::Indexer;
     let mcp_mode = mode == Mode::MCP;
 
-    let default_bind_addr = if server_mode || indexer_mode || mcp_mode {
+    let default_bind_addr = if server_mode || mcp_mode {
         DEFAULT_SERVER_BIND_ADDR
     } else {
         DEFAULT_WORKER_BIND_ADDR
@@ -747,7 +745,7 @@ async fn windmill_main() -> anyhow::Result<()> {
         .is_some_and(|x| x == "1" || x == "true");
 
     if let Some(db) = conn.as_sql() {
-        if !is_agent && !indexer_mode && !mcp_mode {
+        if !is_agent && !mcp_mode {
             let skip_migration = std::env::var("SKIP_MIGRATION")
                 .map(|val| val == "true")
                 .unwrap_or(false);
@@ -892,7 +890,6 @@ async fn windmill_main() -> anyhow::Result<()> {
 
         let db = crate::db_connect::connect_db(
             server_mode,
-            indexer_mode,
             worker_mode,
             num_workers,
         )
@@ -912,13 +909,13 @@ Windmill Community Edition {GIT_VERSION}
 
     display_config(&ENV_SETTINGS);
 
-    if server_mode || worker_mode || indexer_mode || mcp_mode {
+    if server_mode || worker_mode || mcp_mode {
         let port_var = std::env::var("PORT")
             .or_else(|_| std::env::var("BACKEND_PORT"))
             .ok()
             .and_then(|x| x.parse().ok());
 
-        let port = if server_mode || indexer_mode || mcp_mode {
+        let port = if server_mode || mcp_mode {
             port_var.unwrap_or(DEFAULT_PORT as u16)
         } else {
             port_var.unwrap_or(0)
@@ -991,129 +988,11 @@ Windmill Community Edition {GIT_VERSION}
             .create(&*WINDMILL_DIR)
             .expect("could not create initial server dir");
 
-        #[cfg(feature = "tantivy")]
-        let should_index_jobs = mode == Mode::Indexer || mode_and_addons.indexer;
-
-        #[cfg(feature = "tantivy")]
-        if should_index_jobs {
-            if let Some(db) = conn.as_sql() {
-                reload_indexer_config(&db).await;
-            }
-        }
-
-        #[cfg(feature = "tantivy")]
-        let (index_reader, index_writer) = if should_index_jobs {
-            if let Some(db) = conn.as_sql() {
-                let mut indexer_rx = killpill_rx.resubscribe();
-
-                let (mut reader, mut writer) = (None, None);
-                tokio::select! {
-                _ = indexer_rx.recv() => {
-                    tracing::info!("Received killpill, aborting index initialization");
-                },
-                res = windmill_indexer::completed_runs_oss::init_index(&db) => {
-                    let res = res?;
-                    if let Some(r) = res {
-                        reader = Some(r.0);
-                        writer = Some(r.1);
-                    }
-                }
-
-                }
-                (reader, writer)
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-
-        #[cfg(feature = "tantivy")]
-        let indexer_f = {
-            let indexer_rx = killpill_rx.resubscribe();
-            let index_writer2 = index_writer.clone();
-            async {
-                if let Some(db) = conn.as_sql() {
-                    if let Some(index_writer) = index_writer2 {
-                        windmill_indexer::completed_runs_oss::run_indexer(
-                            db.clone(),
-                            index_writer,
-                            indexer_rx,
-                        )
-                        .await?;
-                    }
-                }
-                Ok(())
-            }
-        };
-
-        #[cfg(all(feature = "tantivy", feature = "parquet"))]
-        let (log_index_reader, log_index_writer) = if should_index_jobs {
-            if let Some(db) = conn.as_sql() {
-                let mut indexer_rx = killpill_rx.resubscribe();
-
-                let (mut reader, mut writer) = (None, None);
-                tokio::select! {
-                    _ = indexer_rx.recv() => {
-                        tracing::info!("Received killpill, aborting index initialization");
-                    },
-                    res = windmill_indexer::service_logs_oss::init_index(&db, killpill_tx.clone()) => {
-                        let res = res?;
-                        if let Some(r) = res {
-                            reader = Some(r.0);
-                            writer = Some(r.1);
-                        }
-                    }
-
-                }
-                (reader, writer)
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-
-        #[cfg(all(feature = "tantivy", feature = "parquet"))]
-        let log_indexer_f = {
-            let log_indexer_rx = killpill_rx.resubscribe();
-            // Moved, not cloned: sealing a chunk takes sole ownership of its
-            // tantivy writer, which a second live handle would silently prevent.
-            let moved_log_index_writer = log_index_writer;
-            async {
-                if let Some(db) = conn.as_sql() {
-                    if let Some(log_index_writer) = moved_log_index_writer {
-                        windmill_indexer::service_logs_oss::run_indexer(
-                            db.clone(),
-                            log_index_writer,
-                            log_indexer_rx,
-                        )
-                        .await?;
-                    }
-                }
-                Ok(())
-            }
-        };
-
-        #[cfg(not(feature = "tantivy"))]
-        let index_reader = None;
-
-        #[cfg(not(feature = "tantivy"))]
-        let indexer_f = async { Ok(()) as anyhow::Result<()> };
-
-        #[cfg(not(all(feature = "tantivy", feature = "parquet")))]
-        let log_index_reader = None;
-
-        #[cfg(not(all(feature = "tantivy", feature = "parquet")))]
-        let log_indexer_f = async { Ok(()) as anyhow::Result<()> };
-
         let server_f = async {
             if !is_agent {
                 if let Some(db) = conn.as_sql() {
                     windmill_api::run_server(
                         db.clone(),
-                        index_reader,
-                        log_index_reader,
                         listener,
                         server_killpill_rx,
                         base_internal_tx,
@@ -1429,9 +1308,7 @@ Windmill Community Edition {GIT_VERSION}
                 monitor_f,
                 server_f,
                 metrics_f,
-                otel_tracing_proxy_f,
-                indexer_f,
-                log_indexer_f
+                otel_tracing_proxy_f
             )?;
         }
     } else {

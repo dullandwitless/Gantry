@@ -6,7 +6,7 @@ use windmill_common::{
 // Single source of truth in windmill_common so the DB-health sizing guidance
 // (windmill-api/src/db_health.rs) and the actual pool sizing here can't drift.
 pub use windmill_common::{
-    DEFAULT_MAX_CONNECTIONS_INDEXER, DEFAULT_MAX_CONNECTIONS_SERVER, DEFAULT_MAX_CONNECTIONS_WORKER,
+    DEFAULT_MAX_CONNECTIONS_SERVER, DEFAULT_MAX_CONNECTIONS_WORKER,
 };
 #[cfg(feature = "operator")]
 pub const DEFAULT_MAX_CONNECTIONS_OPERATOR: u32 = 2;
@@ -40,7 +40,6 @@ pub async fn operator_connection(
 
 pub async fn connect_db(
     server_mode: bool,
-    indexer_mode: bool,
     worker_mode: bool,
     num_workers: i32,
 ) -> anyhow::Result<sqlx::Pool<sqlx::Postgres>> {
@@ -53,8 +52,6 @@ pub async fn connect_db(
         Err(_) => {
             if server_mode {
                 DEFAULT_MAX_CONNECTIONS_SERVER
-            } else if indexer_mode {
-                DEFAULT_MAX_CONNECTIONS_INDEXER
             } else {
                 DEFAULT_MAX_CONNECTIONS_WORKER + (num_workers.max(1) as u32) - 1
             }

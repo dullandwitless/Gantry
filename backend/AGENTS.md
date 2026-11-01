@@ -120,7 +120,7 @@ only what you need — build time scales with the set.
 | `duckdb` | DuckDB script executor (also needs the runner binary — see above). | DuckDB scripts, DuckLake. |
 | `python` `rust` `php` `java` `ruby` `csharp` `nu` `deno_core` `mysql` `mssql` `bigquery` `snowflake` `oracledb` `rlang` | Each enables that language/DB runtime for job execution. | Running jobs in that language. |
 | `mcp` | MCP gateway routes (baseline `quickjs` does NOT include it → MCP routes 404). | MCP work. |
-| `websocket` `http_trigger` `kafka` `nats` `mqtt_trigger` `sqs_trigger` `gcp_trigger` `azure_trigger` `postgres_trigger` `native_trigger` | Each native trigger kind; none on by default (creating one 404s without its feature). | Working on / exercising that trigger. |
+| `websocket` `http_trigger` `mqtt_trigger` `postgres_trigger` `amqp_trigger` `native_trigger` | Each native trigger kind; none on by default (creating one 404s without its feature). | Working on / exercising that trigger. |
 | `no_auth` | Treats every request as an admin superadmin (`CLOUD_HOSTED`-guarded). | Local auth-free experiments only. |
 
 Convenience bundles (`ce`, `ee`, `oss`, …) exist in `[features]` but are heavy — prefer the

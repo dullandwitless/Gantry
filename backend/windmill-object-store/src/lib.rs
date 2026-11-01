@@ -1530,8 +1530,7 @@ pub async fn upload_artifact_to_store(
 ) -> error::Result<()> {
     let object_store: Option<()> = None;
     Ok(
-        if &windmill_common::utils::MODE_AND_ADDONS.mode
-            == &windmill_common::utils::Mode::Standalone
+        if *windmill_common::utils::MODE == windmill_common::utils::Mode::Standalone
             && object_store.is_none()
         {
             let path = format!("{}/{}", standalone_dir, path);

@@ -135,8 +135,6 @@ impl ApiServer {
         tracing::info!("starting api server for name={name}");
         let task = tokio::task::spawn(windmill_api::run_server(
             db.clone(),
-            None,
-            None,
             listener,
             rx,
             port_tx,

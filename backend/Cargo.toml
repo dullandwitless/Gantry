@@ -19,16 +19,11 @@ members = [
     "./windmill-api-sse",
     "./windmill-api-jobs",
     "./windmill-trigger",
-    "./windmill-trigger-kafka",
     "./windmill-trigger-postgres",
     "./windmill-trigger-mqtt",
     "./windmill-trigger-amqp",
     "./windmill-trigger-websocket",
     "./windmill-trigger-email",
-    "./windmill-trigger-nats",
-    "./windmill-trigger-sqs",
-    "./windmill-trigger-gcp",
-    "./windmill-trigger-azure",
     "./windmill-trigger-http",
     "./windmill-native-triggers",
     "./windmill-alerting",
@@ -57,7 +52,6 @@ members = [
     "./windmill-git-sync",
     "./windmill-autoscaling",
     "./windmill-operator",
-    "./windmill-indexer",
     "./windmill-macros",
     "./windmill-oauth",
     "./parsers/windmill-parser",
@@ -120,8 +114,6 @@ strip = "none"
 [features]
 default = []
 agent_worker_server = ["windmill-api/agent_worker_server", "dep:windmill-api-agent-workers", "windmill-test-utils/agent_worker_server"]
-local_reports = ["windmill-common/local_reports"]
-stripe = ["windmill-api/stripe"]
 benchmark = ["windmill-api/benchmark", "windmill-worker/benchmark", "windmill-queue/benchmark", "windmill-common/benchmark", "windmill-api-agent-workers?/benchmark"]
 embedding = ["windmill-api/embedding"]
 parquet = ["windmill-api/parquet", "windmill-common/parquet", "windmill-object-store/parquet", "windmill-worker/parquet"]
@@ -132,17 +124,9 @@ quickjs = ["windmill-worker/quickjs", "windmill-api/quickjs"]
 openidconnect = ["windmill-api/openidconnect", "windmill-common/openidconnect", "windmill-object-store/openidconnect"]
 cloud = ["windmill-queue/cloud", "windmill-worker/cloud", "windmill-common/cloud", "windmill-api/cloud"]
 jemalloc = ["windmill-common/jemalloc", "dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tikv-jemalloc-ctl"]
-# `tantivy` is the only feature that enables windmill-indexer. That crate now holds only stubs
-# whose `init_index` and `run_indexer` return an error, so this feature adds no full-text
-# search. Any other feature wanting one of its features has to use the optional
-# `windmill-indexer?/` form.
-tantivy = ["dep:windmill-indexer", "windmill-api/tantivy", "windmill-indexer/parquet", "windmill-common/tantivy", "parquet"]
 sqlx = ["windmill-worker/sqlx"]
 deno_core = ["windmill-worker/deno_core", "dep:windmill-runtime-nativets", "windmill-test-utils/deno_core"]
 deno_core_mac = ["deno_core", "windmill-worker/libffi_mac"]
-kafka = ["windmill-api/kafka"]
-kafka-gssapi = ["windmill-api/kafka-gssapi"]
-nats = ["windmill-api/nats"]
 otel = ["windmill-common/otel", "windmill-worker/otel"]
 dind = ["windmill-worker/dind"]
 websocket = ["windmill-api/websocket"]
@@ -153,9 +137,6 @@ bedrock = ["windmill-ai/bedrock", "windmill-api/bedrock", "windmill-worker/bedro
 mqtt_trigger = ["windmill-api/mqtt_trigger"]
 amqp_trigger = ["windmill-api/amqp_trigger"]
 native_trigger = ["windmill-api/native_trigger"]
-sqs_trigger = ["windmill-api/sqs_trigger", "windmill-common/aws_auth", "openidconnect"]
-gcp_trigger = ["windmill-api/gcp_trigger"]
-azure_trigger = ["windmill-api/azure_trigger"]
 smtp = ["windmill-api/smtp", "windmill-common/smtp", "windmill-queue/smtp"]
 license = ["windmill-api/license", "windmill-api-settings/license"]
 oauth2 = ["windmill-api/oauth2"]
@@ -197,18 +178,17 @@ oss_core = [
     "quickjs"
 ]
 ce_core = ["oss_core", "operator"]
-ee_core = ["stripe", "prometheus", "cloud",
-    "kafka", "sqs_trigger", "nats", "gcp_trigger", "azure_trigger",
+ee_core = ["prometheus", "cloud",
     "jemalloc", "otel", "operator"
 ]
-ee_server = ["tantivy", "agent_worker_server", "local_reports"]
+ee_server = ["agent_worker_server"]
 # Edition meta-features: CE variants
 oss = ["oss_core", "all_languages", "no_auth"]
 ce_rpi = ["ce_core", "all_languages"]
 ce = ["ce_rpi", "jemalloc", "dind", "agent_worker_server"]
 # Edition meta-features: EE variants
-ee = ["ce", "ee_core", "ee_server", "kafka-gssapi"]
-ee_rhel = ["ce_core", "ee_core", "kafka-gssapi", "all_languages"]
+ee = ["ce", "ee_core", "ee_server"]
+ee_rhel = ["ce_core", "ee_core", "all_languages"]
 # The Windows binary is worker-only, but a non-agent worker runs windmill-api on
 # localhost (main.rs run_server, `if !is_agent`) and jobs call back into it, so
 # it needs every feature its own plumbing or its jobs invoke in-process; drop
@@ -216,8 +196,8 @@ ee_rhel = ["ce_core", "ee_core", "kafka-gssapi", "all_languages"]
 worker_windows_core = ["operator", "parquet", "quickjs", "prometheus", "otel", "jemalloc", "windmill-worker/mcp", "windmill-store/mcp", "windmill-worker/bedrock", "openidconnect", "run_inline", "windmill-api/instance_smtp", "oauth2"]
 ee_windows = ["worker_windows_core", "all_languages_windows"]
 all_sqlx_features = ["all_languages", "embedding", "parquet", "prometheus", "flow_testing",
- "openidconnect", "cloud", "jemalloc", "tantivy", "sqlx", "kafka", "kafka-gssapi", "nats", "otel", "dind", "websocket", "http_trigger",
-  "postgres_trigger", "mcp", "mqtt_trigger", "amqp_trigger", "sqs_trigger", "gcp_trigger", "azure_trigger", "smtp", "stripe",
+ "openidconnect", "cloud", "jemalloc", "sqlx", "otel", "dind", "websocket", "http_trigger",
+  "postgres_trigger", "mcp", "mqtt_trigger", "amqp_trigger", "smtp",
    "license", "oauth2", "zip", "static_frontend", "scoped_cache", "agent_worker_server", "bedrock", "native_trigger", "quickjs",
    "windmill-git-sync/all_sqlx_features"]
 
@@ -284,7 +264,6 @@ windmill-api-scripts.workspace = true
 windmill-api-settings.workspace = true
 windmill-audit.workspace = true
 windmill-worker.workspace = true
-windmill-indexer = { workspace = true, optional = true }
 windmill-operator = { workspace = true, optional = true }
 futures.workspace = true
 tracing.workspace = true
@@ -339,11 +318,6 @@ serial_test = "3"
 windmill-trigger-websocket.workspace = true
 windmill-trigger-postgres.workspace = true
 windmill-trigger-mqtt.workspace = true
-windmill-trigger-kafka.workspace = true
-windmill-trigger-nats.workspace = true
-windmill-trigger-sqs.workspace = true
-windmill-trigger-gcp.workspace = true
-windmill-trigger-azure.workspace = true
 windmill-api-auth.workspace = true
 tower-cookies.workspace = true
 windmill-api-users.workspace = true
@@ -354,9 +328,6 @@ tempfile.workspace = true
 tar.workspace = true
 windmill-parser-ts.workspace = true
 rumqttc.workspace = true
-rdkafka.workspace = true
-async-nats.workspace = true
-aws-sdk-sqs.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
 hmac.workspace = true
@@ -377,7 +348,6 @@ windmill-object-store = { path = "./windmill-object-store" }
 windmill-audit = { path = "./windmill-audit" }
 windmill-git-sync = { path = "./windmill-git-sync" }
 windmill-operator = { path = "./windmill-operator" }
-windmill-indexer = {path = "./windmill-indexer"}
 windmill-mcp = {path = "./windmill-mcp"}
 windmill-oauth = {path = "./windmill-oauth"}
 windmill-macros = {path = "./windmill-macros"}
@@ -390,16 +360,11 @@ windmill-api-groups = { path = "./windmill-api-groups" }
 windmill-api-sse = { path = "./windmill-api-sse" }
 windmill-api-jobs = { path = "./windmill-api-jobs" }
 windmill-trigger = { path = "./windmill-trigger" }
-windmill-trigger-kafka = { path = "./windmill-trigger-kafka" }
 windmill-trigger-postgres = { path = "./windmill-trigger-postgres" }
 windmill-trigger-mqtt = { path = "./windmill-trigger-mqtt" }
 windmill-trigger-amqp = { path = "./windmill-trigger-amqp" }
 windmill-trigger-websocket = { path = "./windmill-trigger-websocket" }
 windmill-trigger-email = { path = "./windmill-trigger-email" }
-windmill-trigger-nats = { path = "./windmill-trigger-nats" }
-windmill-trigger-sqs = { path = "./windmill-trigger-sqs" }
-windmill-trigger-gcp = { path = "./windmill-trigger-gcp" }
-windmill-trigger-azure = { path = "./windmill-trigger-azure" }
 windmill-trigger-http = { path = "./windmill-trigger-http" }
 windmill-native-triggers = { path = "./windmill-native-triggers" }
 windmill-alerting = { path = "./windmill-alerting" }
@@ -550,7 +515,6 @@ libffi-sys = { version = "2.3.0", features = ["system"]}
 # `external-account` is off in the crate's defaults, which compiles out the token source for
 # Workload Identity Federation credentials — the keyless setup for running outside GCP. Without it
 # an ADC file of that type is rejected as an unsupported account type.
-google-cloud-pubsub = { version = "0.30.0", features = ["external-account"] }
 google-cloud-googleapis = {version = "0.16.1", features = ["pubsub"]}
 # TODO: remove once deno fixes the issue on their end
 # https://github.com/denoland/deno/issues/28557
@@ -643,10 +607,7 @@ tokio-native-tls = "^0"
 openssl = "=0.10"
 mail-parser = "^0"
 matchit = "=0.7.3"
-rdkafka = { version = "0.36.2", features = ["cmake-build", "ssl-vendored", "curl-static"] }
-rdkafka-sys = "=4.9.0"
 pg_escape = "0.1.1"
-async-nats = "0.38.0"
 nkeys = "0.4.4"
 nu-parser = { version = "0.101.0", default-features = false }
 globset = "0.4.16"
@@ -671,7 +632,6 @@ aws-sdk-bedrock = "1.129.0"
 aws-sdk-bedrockruntime = "=1.122.0"
 aws-credential-types = "^1"
 aws-smithy-types = "^1"
-aws-sdk-sqs = "^1.89.0"
 aws-sdk-sts = "^1.91.0"
 aws-sdk-sso = "=1.77.0"
 aws-sdk-ssooidc = "=1.78.0"
@@ -705,7 +665,6 @@ tikv-jemalloc-ctl = { version = "^0.5" }
 triomphe = "^0"
 pin-project-lite = "^0"
 
-tantivy = { git="https://github.com/windmill-labs/tantivy", rev="ea3b818c7b93db0c2b5db4f5e7ffef38f339060a" }
 
 backon = "1.3.0"
 

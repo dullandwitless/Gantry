@@ -41,8 +41,6 @@ hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
 rumqttc.workspace = true
-rdkafka.workspace = true
-async-nats.workspace = true
 axum.workspace = true
 rmcp = { workspace = true, optional = true }
 serial_test = "3"

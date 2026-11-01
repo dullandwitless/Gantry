@@ -14,11 +14,6 @@ port=${PGPORT:-55432}
 
 pg_bin=${PG_BIN:-$(dirname "$(command -v pg_ctl 2>/dev/null || ls -d /usr/lib/postgresql/*/bin/pg_ctl | tail -1)")}
 datadir=$(mktemp -d)
-cleanup() {
-  "$pg_bin/pg_ctl" -D "$datadir" -m immediate stop >/dev/null 2>&1 || true
-  rm -rf "$datadir"
-}
-trap cleanup EXIT
 
 run_pg() {
   # Postgres refuses to run as root.
@@ -30,11 +25,19 @@ run_pg() {
   fi
 }
 
+cleanup() {
+  run_pg "$pg_bin/pg_ctl" -D "$datadir" -m immediate stop >/dev/null 2>&1 || true
+  rm -rf "$datadir"
+}
+trap cleanup EXIT
+
 run_pg "$pg_bin/initdb" -D "$datadir" -U postgres --auth=trust >/dev/null
 run_pg "$pg_bin/pg_ctl" -D "$datadir" -o "-p $port -k /tmp" -l "$datadir/log" -w start >/dev/null
 
 export DATABASE_URL="postgres://postgres@localhost:$port/gantry"
 export SQLX_OFFLINE=false
+# A one-off full build; incremental artifacts would only fill the disk.
+export CARGO_INCREMENTAL=0
 cd "$backend"
 sqlx database create
 sqlx migrate run --source migrations
