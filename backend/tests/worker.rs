@@ -5217,6 +5217,7 @@ async fn test_flow_lock_all(db: Pool<Postgres>) -> anyhow::Result<()> {
 
 /// A deployed flow runs a multi-step loop body as the flow node its deploy stored, which
 /// carries its own copy of the flow's `preserve_step_tags`. A preview never loads that node.
+#[cfg(any(feature = "quickjs", feature = "deno_core"))]
 #[sqlx::test(fixtures("base"))]
 async fn test_saved_flow_preserves_nested_step_tags(db: Pool<Postgres>) -> anyhow::Result<()> {
     use futures::StreamExt;

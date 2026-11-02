@@ -32,6 +32,9 @@
 //!   - an Operator's job token for a job that is not running, whether finished or
 //!     merely queued, is rejected.
 
+// Inline preview only exists with the run_inline feature.
+#![cfg(feature = "run_inline")]
+
 use serde_json::json;
 use sqlx::{Pool, Postgres};
 use windmill_common::auth::create_jwt_token;

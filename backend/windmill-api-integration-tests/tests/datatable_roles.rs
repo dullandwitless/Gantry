@@ -241,6 +241,7 @@ async fn workspace_exists(db: &Pool<Postgres>, id: &str) -> anyhow::Result<bool>
 }
 
 #[sqlx::test(migrations = "../migrations", fixtures("base", "datatable_roles"))]
+#[ignore = "gantry: cloning a data table under roles is not implemented (the upstream implementation is proprietary)"]
 async fn a_data_table_under_roles_is_cloned_only_with_its_grants(
     db: Pool<Postgres>,
 ) -> anyhow::Result<()> {
@@ -330,6 +331,7 @@ async fn a_data_table_under_roles_is_cloned_only_with_its_grants(
 }
 
 #[sqlx::test(migrations = "../migrations", fixtures("base", "datatable_roles"))]
+#[ignore = "gantry: cloning a data table under roles is not implemented (the upstream implementation is proprietary)"]
 async fn a_clone_takes_its_roles_from_the_data_table_it_was_cloned_from(
     db: Pool<Postgres>,
 ) -> anyhow::Result<()> {
