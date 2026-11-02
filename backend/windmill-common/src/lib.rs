@@ -643,17 +643,12 @@ pub async fn serve_metrics(
     if !metrics_endpoint && !ready_worker_endpoint {
         return Ok(());
     }
-    use axum::{
-        routing::{get, post},
-        Router,
-    };
+    use axum::{routing::get, Router};
     use hyper::StatusCode;
     let router = Router::new();
 
     let router = if metrics_endpoint {
-        router
-            .route("/metrics", get(metrics))
-            .route("/reset", post(reset))
+        router.route("/metrics", get(metrics))
     } else {
         router
     };
@@ -700,11 +695,6 @@ async fn metrics() -> Result<String, Error> {
     Ok(prometheus::TextEncoder::new()
         .encode_to_string(&metric_families)
         .map_err(anyhow::Error::from)?)
-}
-
-#[cfg(feature = "prometheus")]
-async fn reset() -> () {
-    todo!()
 }
 
 /// Parse the canonical Python `logging.basicConfig()` line format

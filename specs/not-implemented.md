@@ -19,6 +19,8 @@ reason). It names features, not how upstream builds them.
 - **Concurrency limits**: [concurrency-limits.md](concurrency-limits.md).
 - **Settable poll delay** for job update streams:
   [job-update-poll-delay.md](job-update-poll-delay.md).
+- **Prometheus metrics** (`METRICS_ADDR`, `expose_metrics`), with the `prometheus`
+  cargo feature: [prometheus-metrics.md](prometheus-metrics.md).
 
 ## Identity and access
 
@@ -30,7 +32,7 @@ reason). It names features, not how upstream builds them.
 ## Operations and observability
 
 - Audit log export (object storage, OpenTelemetry).
-- Prometheus metrics (`METRICS_ADDR`); OpenTelemetry export and the tracing proxy.
+- OpenTelemetry export and the tracing proxy.
 - Critical alerts and alert channels; usage stats.
 
 ## Execution

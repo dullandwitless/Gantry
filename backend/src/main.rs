@@ -1273,14 +1273,28 @@ Gantry {GIT_VERSION}
             Ok(()) as anyhow::Result<()>
         };
 
+        // specs/prometheus-metrics.md
         let metrics_f = async {
-            let enabled = METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
-
-            if enabled {
-                tracing::error!("METRICS_ADDR is set, but metrics are not supported in Gantry; ignoring it");
+            if !METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
             }
-
-            Ok(()) as anyhow::Result<()>
+            #[cfg(feature = "prometheus")]
+            {
+                windmill_common::serve_metrics(
+                    *windmill_common::METRICS_ADDR,
+                    killpill_tx.subscribe(),
+                    worker_mode,
+                    true,
+                )
+                .await
+            }
+            #[cfg(not(feature = "prometheus"))]
+            {
+                tracing::error!(
+                    "Metrics are enabled, but this build was compiled without the prometheus feature; not serving them"
+                );
+                Ok(())
+            }
         };
 
         let otel_tracing_proxy_f = async {
