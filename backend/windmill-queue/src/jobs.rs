@@ -1756,6 +1756,7 @@ async fn commit_completed_job<T: Serialize + Send + Sync + ValidableJson>(
                     completed_job.id
                 ))
             })?;
+            crate::jobs_oss::wake_next_deferred(&mut *tx, &concurrency_key).await?;
         }
 
         if let Err(e) = sqlx::query_scalar!(
@@ -4917,36 +4918,92 @@ pub async fn pull(
         .1
         .maybe_fallback(None, job.concurrent_limit, job.concurrency_time_window_s);
 
-        let has_concurent_limit =
-            has_active_concurrency_limit(concurrency_settings.concurrent_limit);
-
-        if has_concurent_limit && !job.is_dependency() {
-            tracing::error!("Concurrent limits are not supported in Gantry, ignoring constraints")
+        // A resuming suspended flow was admitted when it first started, and a canceled job
+        // only needs to be pulled to be completed as canceled.
+        if let Some(limit) = active_limit(concurrency_settings.concurrent_limit)
+            .filter(|_| !suspended && job.canceled_by.is_none() && !*DISABLE_CONCURRENCY_LIMIT)
+        {
+            let window_s = concurrency_settings.concurrency_time_window_s.unwrap_or(0);
+            match admit_pulled_job(db, &job, limit, window_s).await? {
+                PulledAdmission::Admitted => {}
+                PulledAdmission::Deferred => continue,
+                PulledAdmission::MissingKey => {
+                    return Ok(PulledJobResult {
+                        job: Some(job),
+                        suspended,
+                        missing_concurrency_key: true,
+                        error_while_preprocessing: None,
+                    });
+                }
+            }
         }
 
-        let has_concurent_limit = job.is_dependency()
-            && has_active_concurrency_limit(job.concurrent_limit)
-            && false
-            && !*WMDEBUG_NO_DEBOUNCING;
-        // if we don't have private flag, we don't have concurrency limit
+        #[cfg(feature = "prometheus")]
+        if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            QUEUE_PULL_COUNT.inc();
+        }
+        otel_incr_queue_pull_count();
+        return Ok(PulledJobResult {
+            job: Some(job),
+            suspended,
+            missing_concurrency_key: false,
+            error_while_preprocessing: None,
+        });
+    }
+}
 
-        // concurrency check. If more than X jobs for this path are already running, we re-queue and pull another job from the queue
-        let pulled_job = job;
-        if pulled_job.runnable_path.is_none()
-            || !has_concurent_limit
-            || pulled_job.canceled_by.is_some()
-        {
-            #[cfg(feature = "prometheus")]
-            if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-                QUEUE_PULL_COUNT.inc();
-            }
-            otel_incr_queue_pull_count();
-            return Ok(PulledJobResult {
-                job: Some(pulled_job),
-                suspended,
-                missing_concurrency_key: false,
-                error_while_preprocessing: None,
-            });
+enum PulledAdmission {
+    Admitted,
+    /// Put back in the queue; the worker should pull another job.
+    Deferred,
+    /// The job has a limit but no recorded concurrency key.
+    MissingKey,
+}
+
+/// Applies the job's concurrency limit to a job the pull query has just marked running
+/// (`specs/concurrency-limits.md` §4): admits it, or puts it back in the queue until a slot
+/// can free.
+async fn admit_pulled_job(
+    db: &DB,
+    job: &PulledJob,
+    limit: i32,
+    window_s: i32,
+) -> error::Result<PulledAdmission> {
+    let Some(key) = concurrency_key(db, &job.id).await? else {
+        return Ok(PulledAdmission::MissingKey);
+    };
+
+    let mut tx = db.begin().await?;
+    let admission = crate::jobs_oss::admit(&mut tx, job.id, &key, limit, window_s).await?;
+    match admission {
+        crate::jobs_oss::Admission::Admitted => {
+            crate::jobs_oss::clear_deferred_marker(&mut tx, job.id).await?;
+            tx.commit().await?;
+            Ok(PulledAdmission::Admitted)
+        }
+        crate::jobs_oss::Admission::Deferred { until } => {
+            crate::jobs_oss::defer(&mut tx, job.id, until).await?;
+            tx.commit().await?;
+            tracing::info!(
+                "Job {} deferred until {until} by the concurrency limit of key {key}",
+                job.id
+            );
+            let rule = if window_s > 0 {
+                format!("{limit} per {window_s}s")
+            } else {
+                format!("{limit} at a time")
+            };
+            append_logs(
+                &job.id,
+                &job.workspace_id,
+                format!(
+                    "Deferred until {} by the concurrency limit of key {key} ({rule})\n",
+                    until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ),
+                &Connection::Sql(db.clone()),
+            )
+            .await;
+            Ok(PulledAdmission::Deferred)
         }
     }
 }
@@ -5082,11 +5139,39 @@ pub fn has_active_concurrency_limit(concurrent_limit: Option<i32>) -> bool {
     concurrent_limit.is_some_and(|n| n > 0)
 }
 
+/// The limit itself when it is active, per [`has_active_concurrency_limit`].
+fn active_limit(concurrent_limit: Option<i32>) -> Option<i32> {
+    concurrent_limit.filter(|&n| has_active_concurrency_limit(Some(n)))
+}
+
 /// Admit a job already owned by a worker without releasing its queue reservation.
 /// The caller must maintain its heartbeat while waiting and complete it on failure.
+///
+/// Jobs without an active limit are always admitted (`specs/concurrency-limits.md` §6).
 pub async fn try_admit_owned_job(db: &DB, job: &MiniPulledJob) -> error::Result<bool> {
-    let _ = (db, job);
-    Ok(true)
+    let settings = windmill_common::runnable_settings::prefetch_cached_from_handle(
+        job.runnable_settings_handle,
+        db,
+    )
+    .await?
+    .1
+    .maybe_fallback(None, job.concurrent_limit, job.concurrency_time_window_s);
+    let Some(limit) = active_limit(settings.concurrent_limit).filter(|_| !*DISABLE_CONCURRENCY_LIMIT)
+    else {
+        return Ok(true);
+    };
+    let key = concurrency_key(db, &job.id).await?.ok_or_else(|| {
+        Error::internal_err(format!(
+            "Job {} has a concurrency limit but no concurrency key",
+            job.id
+        ))
+    })?;
+
+    let mut tx = db.begin().await?;
+    let window_s = settings.concurrency_time_window_s.unwrap_or(0);
+    let admission = crate::jobs_oss::admit(&mut tx, job.id, &key, limit, window_s).await?;
+    tx.commit().await?;
+    Ok(admission == crate::jobs_oss::Admission::Admitted)
 }
 
 pub async fn custom_concurrency_key(
