@@ -5,14 +5,19 @@ built on the AGPLv3 parts of [Windmill](https://github.com/windmill-labs/windmil
 with a clean-room frontend and clean-room implementations of its
 enterprise features.
 
-Status: early. The backend is imported, stripped and passing its test suite;
-the frontend has not been started.
+Status: early. The backend is imported, stripped and passing its test suite.
+A first clean-room frontend (React, under `frontend/`) signs in, creates
+workspaces and lists their contents against a live backend; see
+`docs/issues/` for what is still broken and `specs/not-implemented.md` for
+what the backend lacks.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
 | `backend/` | Rust backend, imported from upstream with proprietary code removed (AGPLv3) |
+| `frontend/` | Clean-room web UI (React, Vite, Tailwind); `frontend/build/` is what the backend serves |
+| `specs/` | Specs the frontend is written from, and the backlog of unimplemented features |
 | `openflow.openapi.yaml` | OpenFlow spec (Apache 2.0) |
 | `tools/cfg-strip/` | Removes feature-gated code from Rust sources and manifests |
 | `scripts/sync-upstream.sh` | Merges a new upstream release (via the `upstream` branch) |
