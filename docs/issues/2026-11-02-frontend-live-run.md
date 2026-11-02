@@ -91,3 +91,10 @@ On a fresh workspace, Scripts Studio requests
 `/api/w/main/flows/get/f/etl/customer_sync`; both 404, and Scripts Studio
 shows a "Failed to load script" error first thing. They should open empty, or
 on the workspace's first item.
+
+# Resolved
+
+- 7 and 8, in 0af2a25: Instance Admin reads `GET /api/workers/list`; the studios
+  list the workspace's scripts and flows and open the first, or a new item.
+  Checked on the live instance: no requests to example paths, the worker card shows
+  its tags, and a deployed script is reopened from the list.

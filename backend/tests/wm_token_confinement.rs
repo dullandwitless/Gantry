@@ -406,7 +406,6 @@ async fn test_wm_token_is_confined_to_its_workspace(db: Pool<Postgres>) -> anyho
 /// one, which workspace confinement answers first, and a workspace-scoped one, which
 /// reaches the gate itself.
 #[sqlx::test(fixtures("preserve_on_behalf_of"))]
-#[ignore = "gantry: listing global settings is not implemented (the upstream implementation is proprietary)"]
 async fn test_wm_token_rejected_by_require_super_admin(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
     set_jwt_secret().await;

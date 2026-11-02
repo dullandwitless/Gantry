@@ -9,13 +9,11 @@ Compiled from the AGPL tree on 2026-11-02 (the stand-in modules, the refusal
 messages, and the tests ignored with a `gantry: ... is not implemented`
 reason). It names features, not how upstream builds them.
 
-## Blocking: an instance is barely usable without these
+## Implemented since this list was compiled
 
-- **Users and passwords.** Creating users, setting a password and hashing one
-  are stubs (`windmill-api/src/users_oss.rs`), so only the seeded admin exists.
-- **Email.** The server cannot send email (`windmill-common/src/email_oss.rs`):
-  invites, password resets and notifications.
-- **Global settings listing** (`windmill-api-settings`, `list_global_settings`).
+- **Users and passwords**, **email** and the **global settings listing**:
+  [users-and-email.md](users-and-email.md). Email needs the `smtp` cargo feature;
+  a build without it says so instead of sending.
 
 ## Identity and access
 

@@ -1476,10 +1476,35 @@ async fn github_app_stale_webhooks(
     Ok(Json(serde_json::json!([])))
 }
 
-async fn list_global_settings() -> JsonResult<String> {
-    return Err(error::Error::BadRequest(
-        "Listing global settings not available on community edition".to_string(),
-    ));
+#[derive(Serialize)]
+struct GlobalSetting {
+    name: String,
+    value: serde_json::Value,
+}
+
+/// Every global setting a superadmin may read, by name. Applies the same filter as the
+/// instance config API: never the hidden settings, and the server secrets only when this
+/// server exports them (specs/users-and-email.md, section 5).
+async fn list_global_settings(
+    Extension(db): Extension<DB>,
+    authed: ApiAuthed,
+) -> JsonResult<Vec<GlobalSetting>> {
+    require_super_admin(&db, &authed).await?;
+    let include_server_secrets = instance_config::server_secrets_exported();
+    let rows: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT name, value FROM global_settings ORDER BY name COLLATE \"C\"")
+            .fetch_all(&db)
+            .await?;
+    Ok(Json(
+        rows.into_iter()
+            .filter(|(name, _)| !instance_config::HIDDEN_SETTINGS.contains(&name.as_str()))
+            .filter(|(name, _)| {
+                include_server_secrets
+                    || !instance_config::SERVER_SECRET_SETTINGS.contains(&name.as_str())
+            })
+            .map(|(name, value)| GlobalSetting { name, value })
+            .collect(),
+    ))
 }
 
 pub async fn send_stats(Extension(db): Extension<DB>, authed: ApiAuthed) -> Result<String> {
