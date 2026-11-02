@@ -1,2 +1,6 @@
 target/
 .env
+/logs/
+/gantry.bundle
+/wsl-agent.sh
+/wsl-build.sh
