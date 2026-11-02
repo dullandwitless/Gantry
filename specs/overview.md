@@ -127,7 +127,7 @@ A visual workflow builder enabling orchestration of scripts, subflows, condition
 - **Flow Simulation & Debugger**: Test the flow step-by-step or run to completion with sample payloads.
 
 #### Primary API Endpoints
-- `GET /w/{workspace}/flows/get/p/{path}`: Fetch flow definition and metadata.
+- `GET /w/{workspace}/flows/get/{path}`: Fetch flow definition and metadata.
 - `POST /w/{workspace}/flows/create`: Create a new flow.
 - `POST /w/{workspace}/flows/update/{path}`: Update flow logic and increment revision.
 - `DELETE /w/{workspace}/flows/delete/{path}`: Delete a flow.
@@ -176,8 +176,8 @@ Provides real-time visibility and management of all background and on-demand scr
   - Live log viewer streaming standard output and standard error.
   - Step-by-step progress tracking for flow executions (`FlowStatus`, `FlowStatusModule`).
   - Inspection of input arguments, environment metadata, return values, and stack traces.
-- **Job Control**: Cancel running jobs (`POST /w/{workspace}/jobs/cancel/{id}`), restart failed executions, or force execution with altered parameters.
-- **Search & Filtering**: Filter job history by tag, path, status, triggering identity, date range, or duration (`POST /w/{workspace}/jobs/list_search`).
+- **Job Control**: Cancel running jobs (`POST /w/{workspace}/jobs_u/queue/cancel/{id}`), restart failed executions, or force execution with altered parameters.
+- **Search & Filtering**: Filter job history by tag, path, status, triggering identity, date range, or duration (`GET /w/{workspace}/jobs/list`).
 - **Audit & Diagnostics**: Inspect system service log files (`/service_logs/*`) and audit records (`/w/{workspace}/audit/*`).
 
 #### Backend Status Note
@@ -185,8 +185,8 @@ As documented in `specs/not-implemented.md`, upstream's full-text log indexer (`
 
 #### Primary API Endpoints
 - `GET /w/{workspace}/jobs/get/{id}`: Retrieve detailed job execution state and results.
-- `POST /w/{workspace}/jobs/list_search`: Search and filter workspace jobs.
-- `POST /w/{workspace}/jobs/cancel/{id}`: Cancel a running or queued job.
+- `GET /w/{workspace}/jobs/list`: List and filter workspace jobs.
+- `POST /w/{workspace}/jobs_u/queue/cancel/{id}`: Cancel a running or queued job.
 - `GET /w/{workspace}/jobs/get_logs/{id}`: Retrieve execution logs.
 - `GET /service_logs/list_files`, `GET /service_logs/get_log_file/{path}`: Access host service logs.
 - `GET /w/{workspace}/audit/list`: List workspace audit events.
@@ -383,7 +383,7 @@ Empowers instance administrators to configure global server parameters, monitor 
 #### Primary API Endpoints
 - `GET /health/status`, `GET /health/detailed`: Instance health checks.
 - `GET /workers/custom_tags`, `GET /configs/list_worker_groups`: List worker configurations.
-- `GET /w/{workspace}/concurrencyGroups/list`: List concurrency limits.
+- `GET /concurrency_groups/list`: List concurrency limits.
 - `POST /w/{workspace}/concurrencyGroups/create`: Create concurrency group.
 - `GET /w/{workspace}/volumes/list`: List worker volumes.
 - `GET /configs/list`: List server configuration parameters.

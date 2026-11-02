@@ -15,7 +15,9 @@ export const ResourcesVariablesView: React.FC = () => {
   const [variables, setVariables] = useState<Variable[]>([]);
 
   useEffect(() => {
-    loadData();
+    if (currentWorkspace) {
+      loadData();
+    }
   }, [currentWorkspace]);
 
   const loadData = async () => {

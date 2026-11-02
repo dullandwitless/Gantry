@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
-import { WorkspaceProvider } from './context/WorkspaceContext';
+import { WorkspaceProvider, useWorkspace } from './context/WorkspaceContext';
 import { ToastProvider } from './context/ToastContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { LoginView } from './components/auth/LoginView';
+import { CreateWorkspaceModal } from './components/workspace/CreateWorkspaceModal';
 
 import { Header } from './components/layout/Header';
 import { Sidebar } from './components/layout/Sidebar';
@@ -21,21 +22,26 @@ import { GitSyncView } from './components/gitsync/GitSyncView';
 import { AdminView } from './components/admin/AdminView';
 
 export const AppContent: React.FC = () => {
-  const { isAuthenticated, isLoading } = useAuth();
+  const { isAuthenticated, isLoading: authLoading } = useAuth();
+  const { needsWorkspaceCreation, isLoading: wsLoading } = useWorkspace();
   const [activeTab, setActiveTab] = useState<string>('scripts');
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
 
-  if (isLoading) {
+  if (authLoading) {
     return (
       <div className="h-screen w-screen bg-slate-950 flex flex-col items-center justify-center text-slate-400 gap-3">
         <div className="w-8 h-8 rounded-full border-2 border-brand-500 border-t-transparent animate-spin" />
-        <span className="text-xs font-mono">Initializing Gantry...</span>
+        <span className="text-xs font-mono">Connecting to Gantry...</span>
       </div>
     );
   }
 
   if (!isAuthenticated) {
     return <LoginView />;
+  }
+
+  if (needsWorkspaceCreation) {
+    return <CreateWorkspaceModal isOpen={true} />;
   }
 
   const renderActiveView = () => {

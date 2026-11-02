@@ -20,7 +20,9 @@ export const ScriptsStudio: React.FC = () => {
   const [activeRightTab, setActiveRightTab] = useState<'arguments' | 'output' | 'settings'>('arguments');
 
   useEffect(() => {
-    loadScript(scriptPath);
+    if (currentWorkspace) {
+      loadScript(scriptPath);
+    }
   }, [currentWorkspace, scriptPath]);
 
   const loadScript = async (path: string) => {

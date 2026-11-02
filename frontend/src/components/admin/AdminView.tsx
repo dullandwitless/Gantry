@@ -15,7 +15,9 @@ export const AdminView: React.FC = () => {
   const [concurrency, setConcurrency] = useState<ConcurrencyGroup[]>([]);
 
   useEffect(() => {
-    loadData();
+    if (currentWorkspace) {
+      loadData();
+    }
   }, [currentWorkspace]);
 
   const loadData = async () => {

@@ -30,6 +30,10 @@ class GantryApiClient {
     return this.token;
   }
 
+  isDemoMode(): boolean {
+    return localStorage.getItem('gantry_demo_mode') === 'true';
+  }
+
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -63,7 +67,7 @@ class GantryApiClient {
 
       const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('text/html')) {
-        throw new Error(`Endpoint ${path} returned HTML (SPA fallback), expected API payload`);
+        throw new Error(`Endpoint ${path} returned HTML instead of expected JSON.`);
       }
 
       if (contentType.includes('application/json')) {
@@ -96,6 +100,14 @@ class GantryApiClient {
   }
 
   async whoami(): Promise<UserProfile | null> {
+    if (this.isDemoMode()) {
+      return {
+        email: 'admin@windmill.dev',
+        username: 'admin',
+        name: 'Demo Admin',
+        super_admin: true,
+      };
+    }
     try {
       return await this.request<UserProfile>('/users/whoami');
     } catch {
@@ -113,38 +125,36 @@ class GantryApiClient {
 
   // Workspaces
   async listWorkspaces(): Promise<WorkspaceInfo[]> {
-    try {
-      const list = await this.request<WorkspaceInfo[]>('/workspaces/list');
-      if (Array.isArray(list) && list.length > 0) {
-        return list;
-      }
-    } catch (e) {
-      console.warn('[GantryAPI] listWorkspaces failed, using fallback:', e);
+    if (this.isDemoMode()) {
+      return [{ id: 'demo', name: 'Demo Workspace', owner: 'admin@windmill.dev' }];
     }
-    return [
-      { id: 'demo', name: 'Demo Workspace', owner: 'admin@windmill.dev' },
-      { id: 'prod', name: 'Production', owner: 'admin@windmill.dev' }
-    ];
+    const list = await this.request<WorkspaceInfo[]>('/workspaces/list');
+    return Array.isArray(list) ? list : [];
+  }
+
+  async createWorkspace(id: string, name: string): Promise<string> {
+    return await this.request<string>('/workspaces/create', {
+      method: 'POST',
+      body: JSON.stringify({ id, name }),
+    });
   }
 
   // Folders
   async listFolders(workspace: string): Promise<Folder[]> {
-    try {
-      const list = await this.request<Folder[]>(`/w/${workspace}/folders/list`);
-      if (Array.isArray(list) && list.length > 0) return list;
-    } catch {}
-    return [
-      { name: 'u', summary: 'Personal user scripts' },
-      { name: 'f', summary: 'Shared workflows' },
-      { name: 'integrations', summary: 'Connectors & tools' }
-    ];
+    if (this.isDemoMode()) {
+      return [
+        { name: 'u', summary: 'Personal user scripts' },
+        { name: 'f', summary: 'Shared workflows' },
+        { name: 'integrations', summary: 'Connectors & tools' }
+      ];
+    }
+    const list = await this.request<Folder[]>(`/w/${workspace}/folders/list`);
+    return Array.isArray(list) ? list : [];
   }
 
   // Scripts
   async getScript(workspace: string, path: string): Promise<Script> {
-    try {
-      return await this.request<Script>(`/w/${workspace}/scripts/get/p/${path}`);
-    } catch {
+    if (this.isDemoMode()) {
       return {
         path,
         summary: 'Demo Python Script',
@@ -158,9 +168,11 @@ class GantryApiClient {
         edited_at: new Date().toISOString()
       };
     }
+    return await this.request<Script>(`/w/${workspace}/scripts/get/p/${path}`);
   }
 
   async saveScript(workspace: string, script: Partial<Script>): Promise<void> {
+    if (this.isDemoMode()) return;
     await this.request(`/w/${workspace}/scripts/create`, {
       method: 'POST',
       body: JSON.stringify(script)
@@ -168,12 +180,7 @@ class GantryApiClient {
   }
 
   async runScriptTest(workspace: string, path: string, args: Record<string, any>): Promise<any> {
-    try {
-      return await this.request(`/w/${workspace}/jobs/run_wait_result/p/${path}`, {
-        method: 'POST',
-        body: JSON.stringify({ args })
-      });
-    } catch {
+    if (this.isDemoMode()) {
       return {
         status: 'completed',
         duration_ms: 245,
@@ -181,13 +188,15 @@ class GantryApiClient {
         logs: `[${new Date().toLocaleTimeString()}] Starting script execution...\n[${new Date().toLocaleTimeString()}] Evaluated arguments.\n[${new Date().toLocaleTimeString()}] Succeeded in 245ms.`
       };
     }
+    return await this.request(`/w/${workspace}/jobs/run_wait_result/p/${path}`, {
+      method: 'POST',
+      body: JSON.stringify({ args })
+    });
   }
 
-  // Flows
+  // Flows: path in OpenAPI is /w/{workspace}/flows/get/{path} (no p/)
   async getFlow(workspace: string, path: string): Promise<OpenFlow> {
-    try {
-      return await this.request<OpenFlow>(`/w/${workspace}/flows/get/p/${path}`);
-    } catch {
+    if (this.isDemoMode()) {
       return {
         path,
         summary: 'Demo Ingestion Pipeline',
@@ -210,124 +219,127 @@ class GantryApiClient {
         }
       };
     }
+    return await this.request<OpenFlow>(`/w/${workspace}/flows/get/${path}`);
   }
 
   async saveFlow(workspace: string, flow: Partial<OpenFlow>): Promise<void> {
+    if (this.isDemoMode()) return;
     await this.request(`/w/${workspace}/flows/create`, {
       method: 'POST',
       body: JSON.stringify(flow)
     });
   }
 
-  // Jobs & Runs
+  // Jobs & Runs: OpenAPI endpoint is GET /w/{workspace}/jobs/list
   async listJobs(workspace: string, status?: string): Promise<Job[]> {
-    try {
-      const list = await this.request<Job[]>(`/w/${workspace}/jobs/list_search`, {
-        method: 'POST',
-        body: JSON.stringify({ status })
-      });
-      if (Array.isArray(list) && list.length > 0) return list;
-    } catch {}
-    return [
-      {
-        id: 'job_01j7abc123',
-        workspace,
-        path: 'f/etl/sync_customers',
-        runnable_kind: 'flow',
-        status: 'completed',
-        started_at: new Date(Date.now() - 120000).toISOString(),
-        completed_at: new Date(Date.now() - 45000).toISOString(),
-        duration_ms: 75000,
-        created_by: 'admin@windmill.dev',
-        trigger_kind: 'schedule',
-        result: { imported: 1240, status: 'ok' },
-        raw_logs: 'Sync started at 00:00:00\nConnected to PostgreSQL\n1240 records processed.\nComplete.'
-      },
-      {
-        id: 'job_01j7abc456',
-        workspace,
-        path: 'u/alice/generate_pdf',
-        runnable_kind: 'script',
-        status: 'running',
-        started_at: new Date(Date.now() - 15000).toISOString(),
-        created_by: 'alice@windmill.dev',
-        trigger_kind: 'webhook',
-        raw_logs: 'Rendering HTML template...\nApplying CSS stylesheet...'
+    if (this.isDemoMode()) {
+      return [
+        {
+          id: 'job_01j7abc123',
+          workspace,
+          path: 'f/etl/sync_customers',
+          runnable_kind: 'flow',
+          status: 'completed',
+          started_at: new Date(Date.now() - 120000).toISOString(),
+          completed_at: new Date(Date.now() - 45000).toISOString(),
+          duration_ms: 75000,
+          created_by: 'admin@windmill.dev',
+          trigger_kind: 'schedule',
+          result: { imported: 1240, status: 'ok' },
+          raw_logs: 'Sync started at 00:00:00\nConnected to PostgreSQL\n1240 records processed.\nComplete.'
+        }
+      ];
+    }
+    const query = new URLSearchParams();
+    if (status && status !== 'all') {
+      if (status === 'running') {
+        query.set('running', 'true');
+      } else if (status === 'completed') {
+        query.set('status', 'success');
+      } else if (status === 'failed') {
+        query.set('status', 'failure');
       }
-    ];
+    }
+    const qStr = query.toString();
+    const list = await this.request<Job[]>(`/w/${workspace}/jobs/list${qStr ? `?${qStr}` : ''}`);
+    return Array.isArray(list) ? list : [];
   }
 
+  // Job Cancel: OpenAPI endpoint is POST /w/{workspace}/jobs_u/queue/cancel/{id}
   async cancelJob(workspace: string, id: string): Promise<void> {
-    await this.request(`/w/${workspace}/jobs/cancel/${id}`, { method: 'POST' });
+    if (this.isDemoMode()) return;
+    await this.request(`/w/${workspace}/jobs_u/queue/cancel/${id}`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'Cancelled from UI' })
+    });
   }
 
   // Apps
   async listApps(workspace: string): Promise<ListableApp[]> {
-    try {
-      const list = await this.request<ListableApp[]>(`/w/${workspace}/apps/list`);
-      if (Array.isArray(list) && list.length > 0) return list;
-    } catch {}
-    return [
-      { path: 'f/ops/system_monitor', summary: 'System resource monitor', custom_path: 'monitor', is_raw: true, admit_guests: false }
-    ];
+    if (this.isDemoMode()) {
+      return [
+        { path: 'f/ops/system_monitor', summary: 'System resource monitor', custom_path: 'monitor', is_raw: true, admit_guests: false }
+      ];
+    }
+    const list = await this.request<ListableApp[]>(`/w/${workspace}/apps/list`);
+    return Array.isArray(list) ? list : [];
   }
 
   // Resources & Variables
   async listResources(workspace: string): Promise<Resource[]> {
-    try {
-      const list = await this.request<Resource[]>(`/w/${workspace}/resources/list`);
-      if (Array.isArray(list) && list.length > 0) return list;
-    } catch {}
-    return [
-      { path: 'u/admin/main_pg', resource_type: 'postgresql', value: { host: 'localhost', port: 5432, dbname: 'windmill' } },
-      { path: 'f/shared/s3_storage', resource_type: 's3', value: { bucket: 'gantry-data', region: 'us-east-1' } }
-    ];
+    if (this.isDemoMode()) {
+      return [
+        { path: 'u/admin/main_pg', resource_type: 'postgresql', value: { host: 'localhost', port: 5432, dbname: 'windmill' } },
+        { path: 'f/shared/s3_storage', resource_type: 's3', value: { bucket: 'gantry-data', region: 'us-east-1' } }
+      ];
+    }
+    const list = await this.request<Resource[]>(`/w/${workspace}/resources/list`);
+    return Array.isArray(list) ? list : [];
   }
 
   async listVariables(workspace: string): Promise<Variable[]> {
-    try {
-      const list = await this.request<Variable[]>(`/w/${workspace}/variables/list`);
-      if (Array.isArray(list) && list.length > 0) return list;
-    } catch {}
-    return [
-      { path: 'ENVIRONMENT', value: 'production', is_secret: false, description: 'Deployment stage' },
-      { path: 'STRIPE_API_KEY', value: '••••••••••••••••', is_secret: true, description: 'Payment gateway API key' }
-    ];
+    if (this.isDemoMode()) {
+      return [
+        { path: 'ENVIRONMENT', value: 'production', is_secret: false, description: 'Deployment stage' },
+        { path: 'STRIPE_API_KEY', value: '••••••••••••••••', is_secret: true, description: 'Payment gateway API key' }
+      ];
+    }
+    const list = await this.request<Variable[]>(`/w/${workspace}/variables/list`);
+    return Array.isArray(list) ? list : [];
   }
 
   // Schedules
   async listSchedules(workspace: string): Promise<Schedule[]> {
-    try {
-      const list = await this.request<Schedule[]>(`/w/${workspace}/schedules/list`);
-      if (Array.isArray(list) && list.length > 0) return list;
-    } catch {}
-    return [
-      { path: 'nightly_backup', schedule: '0 2 * * *', timezone: 'UTC', script_path: 'f/ops/backup_db', enabled: true },
-      { path: 'hourly_healthcheck', schedule: '0 * * * *', timezone: 'UTC', script_path: 'f/ops/ping_services', enabled: true }
-    ];
+    if (this.isDemoMode()) {
+      return [
+        { path: 'nightly_backup', schedule: '0 2 * * *', timezone: 'UTC', script_path: 'f/ops/backup_db', enabled: true },
+        { path: 'hourly_healthcheck', schedule: '0 * * * *', timezone: 'UTC', script_path: 'f/ops/ping_services', enabled: true }
+      ];
+    }
+    const list = await this.request<Schedule[]>(`/w/${workspace}/schedules/list`);
+    return Array.isArray(list) ? list : [];
   }
 
-  // Workers & Admin
+  // Workers & Admin: OpenAPI endpoint is GET /concurrency_groups/list
   async listWorkers(): Promise<WorkerNode[]> {
-    try {
-      const list = await this.request<WorkerNode[]>('/workers/custom_tags');
-      if (Array.isArray(list) && list.length > 0) return list;
-    } catch {}
-    return [
-      { id: 'worker-01', name: 'gantry-worker-prod-1', ip: '10.0.1.24', status: 'active', tags: ['default', 'gpu'], active_jobs: 2, cpu_percent: 24, memory_gb: 16 },
-      { id: 'worker-02', name: 'gantry-worker-prod-2', ip: '10.0.1.25', status: 'idle', tags: ['default'], active_jobs: 0, cpu_percent: 4, memory_gb: 16 }
-    ];
+    if (this.isDemoMode()) {
+      return [
+        { id: 'worker-01', name: 'gantry-worker-prod-1', ip: '10.0.1.24', status: 'active', tags: ['default', 'gpu'], active_jobs: 2, cpu_percent: 24, memory_gb: 16 },
+        { id: 'worker-02', name: 'gantry-worker-prod-2', ip: '10.0.1.25', status: 'idle', tags: ['default'], active_jobs: 0, cpu_percent: 4, memory_gb: 16 }
+      ];
+    }
+    const list = await this.request<WorkerNode[]>('/workers/custom_tags');
+    return Array.isArray(list) ? list : [];
   }
 
   async listConcurrencyGroups(workspace: string): Promise<ConcurrencyGroup[]> {
-    try {
-      const list = await this.request<ConcurrencyGroup[]>(`/w/${workspace}/concurrencyGroups/list`);
-      if (Array.isArray(list) && list.length > 0) return list;
-    } catch {}
-    return [
-      { name: 'external_rate_limit', concurrency_limit: 5, current_running: 1 },
-      { name: 'heavy_batch_jobs', concurrency_limit: 2, current_running: 0 }
-    ];
+    if (this.isDemoMode()) {
+      return [
+        { name: 'external_rate_limit', concurrency_limit: 5, current_running: 1 }
+      ];
+    }
+    const list = await this.request<ConcurrencyGroup[]>('/concurrency_groups/list');
+    return Array.isArray(list) ? list : [];
   }
 }
 

@@ -89,7 +89,7 @@ Each step module declares required inputs based on its script/flow signature. Th
 
 | Action | HTTP Method | Endpoint Path | Notes |
 | :--- | :--- | :--- | :--- |
-| Get flow | `GET` | `/w/{workspace}/flows/get/p/{path}` | Retrieves `OpenFlow` JSON structure |
+| Get flow | `GET` | `/w/{workspace}/flows/get/{path}` | Retrieves `OpenFlow` JSON structure |
 | Create flow | `POST` | `/w/{workspace}/flows/create` | `{ path, value: FlowValue, summary }` |
 | Update flow | `POST` | `/w/{workspace}/flows/update/{path}` | Updates flow definition |
 | Delete flow | `DELETE` | `/w/{workspace}/flows/delete/{path}` | Soft-deletes flow to trash |

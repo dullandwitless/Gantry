@@ -19,7 +19,9 @@ export const FlowsStudio: React.FC = () => {
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
 
   useEffect(() => {
-    loadFlow(flowPath);
+    if (currentWorkspace) {
+      loadFlow(flowPath);
+    }
   }, [currentWorkspace, flowPath]);
 
   const loadFlow = async (path: string) => {

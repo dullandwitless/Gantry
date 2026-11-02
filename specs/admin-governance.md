@@ -85,5 +85,5 @@ Administration and Governance encompasses workspace-level membership and access 
 | Add granular ACL | `POST` | `/w/{workspace}/granular_acl/add` | Grants path-specific permission |
 | Token scopes | `GET` | `/tokens/list/scopes` | Returns available permission scopes |
 | List workers | `GET` | `/workers/custom_tags` | Returns active worker tags and nodes |
-| List concurrency groups | `GET` | `/w/{workspace}/concurrencyGroups/list` | Returns concurrency throttle limits |
+| List concurrency groups | `GET` | `/concurrency_groups/list` | Returns concurrency throttle limits |
 | Health check | `GET` | `/health/status` | Returns backend health status |

@@ -13,7 +13,9 @@ export const SchedulesTriggersView: React.FC = () => {
   const [schedules, setSchedules] = useState<Schedule[]>([]);
 
   useEffect(() => {
-    loadSchedules();
+    if (currentWorkspace) {
+      loadSchedules();
+    }
   }, [currentWorkspace]);
 
   const loadSchedules = async () => {

@@ -32,7 +32,9 @@ export default function App() {
 }`);
 
   useEffect(() => {
-    loadApps();
+    if (currentWorkspace) {
+      loadApps();
+    }
   }, [currentWorkspace]);
 
   const loadApps = async () => {

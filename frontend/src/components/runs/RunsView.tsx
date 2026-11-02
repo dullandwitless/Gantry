@@ -19,7 +19,9 @@ export const RunsView: React.FC = () => {
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
   useEffect(() => {
-    loadJobs();
+    if (currentWorkspace) {
+      loadJobs();
+    }
   }, [currentWorkspace, statusFilter]);
 
   const loadJobs = async () => {
@@ -41,7 +43,9 @@ export const RunsView: React.FC = () => {
     try {
       await api.cancelJob(currentWorkspace, id);
       addToast({ kind: 'info', title: 'Cancellation requested', message: `Job ${id}` });
+      if (currentWorkspace) {
       loadJobs();
+    }
     } catch (e: any) {
       addToast({ kind: 'error', title: 'Cancel failed', message: e.message });
     }

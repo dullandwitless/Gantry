@@ -39,7 +39,7 @@ The Runs Engine and Observability suite provides comprehensive operational visib
   - Job ID, status badge, execution time, memory usage, worker node name.
   - Trigger metadata and parent job link (for child steps).
 - **Control Bar**:
-  - `Cancel`: Terminate running job (`POST /w/{workspace}/jobs/cancel/{id}`).
+  - `Cancel`: Terminate running job (`POST /w/{workspace}/jobs_u/queue/cancel/{id}`).
   - `Rerun`: Rerun job with identical arguments.
   - `Edit & Rerun`: Open script or flow runner pre-populated with this run's arguments.
 - **Arguments & Return Value Inspector**:
@@ -70,10 +70,10 @@ The Runs Engine and Observability suite provides comprehensive operational visib
 
 | Action | HTTP Method | Endpoint Path | Notes |
 | :--- | :--- | :--- | :--- |
-| Search jobs | `POST` | `/w/{workspace}/jobs/list_search` | Filters by status, path, tags, date range |
+| Search jobs | `GET` | `/w/{workspace}/jobs/list` | Filters by status, path, tags, date range |
 | Get job details | `GET` | `/w/{workspace}/jobs/get/{id}` | Retrieves full `Job` object and execution state |
 | Get job logs | `GET` | `/w/{workspace}/jobs/get_logs/{id}` | Fetches raw execution logs |
-| Cancel job | `POST` | `/w/{workspace}/jobs/cancel/{id}` | Signals worker to abort job execution |
+| Cancel job | `POST` | `/w/{workspace}/jobs_u/queue/cancel/{id}` | Signals worker to abort job execution |
 | List service logs | `GET` | `/service_logs/list_files` | Enumerates available host service log files |
 | Read service log | `GET` | `/service_logs/get_log_file/{path}` | Reads raw host service log |
 | List audit logs | `GET` | `/w/{workspace}/audit/list` | Returns chronological workspace audit records |
