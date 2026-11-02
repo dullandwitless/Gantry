@@ -5,7 +5,6 @@ import { AuthProvider, useAuth } from './context/AuthContext';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { LoginView } from './components/auth/LoginView';
 import { RESET_PASSWORD_PATH, ResetPasswordView } from './components/auth/ResetPasswordView';
-import { OAuthCallbackView, oauthCallbackProvider } from './components/auth/OAuthCallbackView';
 import { CreateWorkspaceModal } from './components/workspace/CreateWorkspaceModal';
 
 import { Header } from './components/layout/Header';
@@ -34,22 +33,6 @@ export const AppContent: React.FC = () => {
       ? new URLSearchParams(window.location.search).get('token') ?? ''
       : null,
   );
-  const [oauthProvider, setOAuthProvider] = useState<string | null>(() =>
-    oauthCallbackProvider(window.location.pathname),
-  );
-
-  if (oauthProvider !== null) {
-    return (
-      <OAuthCallbackView
-        provider={oauthProvider}
-        onDone={() => {
-          // Drop the one-time code from the address bar and history.
-          window.history.replaceState(null, '', '/');
-          setOAuthProvider(null);
-        }}
-      />
-    );
-  }
 
   if (resetToken !== null) {
     return (

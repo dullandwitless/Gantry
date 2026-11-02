@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { api, LoginProvider } from '../../api/client';
+import { api } from '../../api/client';
 import { ForgotPasswordModal } from './ForgotPasswordModal';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
@@ -16,13 +16,11 @@ export const LoginView: React.FC = () => {
   const [isForgotOpen, setIsForgotOpen] = useState(false);
   // The seeded admin still has its default password: offer it until it is changed.
   const [isFirstTimeSetup, setIsFirstTimeSetup] = useState(false);
-  const [providers, setProviders] = useState<LoginProvider[]>([]);
 
   useEffect(() => {
     // Password reset needs email; offer it only when the server can send one.
     api.isSmtpConfigured().then(setCanResetPassword, () => setCanResetPassword(false));
     api.isFirstTimeSetup().then(setIsFirstTimeSetup);
-    api.listLoginProviders().then(setProviders);
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -102,25 +100,6 @@ export const LoginView: React.FC = () => {
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </form>
-
-          {providers.length > 0 && (
-            <div className="space-y-2">
-              <div className="flex items-center gap-3 text-[11px] text-slate-500">
-                <div className="flex-1 border-t border-slate-800" />
-                <span>or</span>
-                <div className="flex-1 border-t border-slate-800" />
-              </div>
-              {providers.map((p) => (
-                <a
-                  key={p.type}
-                  href={api.loginProviderUrl(p.type)}
-                  className="w-full flex justify-center py-2.5 rounded-xl text-xs font-semibold text-slate-200 bg-slate-950 border border-slate-700/80 hover:border-brand-500 transition-colors"
-                >
-                  Sign in with {p.display_name || p.type}
-                </a>
-              ))}
-            </div>
-          )}
 
           {isFirstTimeSetup && (
             <div className="pt-3 border-t border-slate-800/80">

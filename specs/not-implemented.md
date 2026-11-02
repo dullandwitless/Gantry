@@ -24,12 +24,10 @@ reason). It names features, not how upstream builds them.
 - **Critical alert channels**: email and Slack delivery
   ([critical-alert-channels.md](critical-alert-channels.md)); Teams waits on the Teams
   integration.
-- **Sign-in with OAuth providers** (SSO): [sso-oauth-login.md](sso-oauth-login.md), with
-  the `oauth2` cargo feature.
 
 ## Identity and access
 
-- SSO login with SAML; SCIM provisioning. Connecting resources through OAuth.
+- SSO login: SAML, SCIM provisioning, OAuth login providers.
 - Service accounts; custom workspace and instance roles; instance groups.
 - Workload identity through Gantry's OIDC provider (AWS roles, Azure, Anthropic).
 - Data table roles, ACLs, permissions and replay.

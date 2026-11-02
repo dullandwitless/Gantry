@@ -118,8 +118,6 @@ pub mod jobs;
 pub mod jobs_export;
 #[cfg(feature = "oauth2")]
 pub mod oauth2_oss;
-#[cfg(feature = "oauth2")]
-mod oauth_login;
 mod oidc_oss;
 mod path_autocomplete;
 mod raw_apps;

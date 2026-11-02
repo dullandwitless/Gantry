@@ -6,7 +6,6 @@ interface AuthContextType {
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (email: string, pass: string) => Promise<void>;
-  loginWithProvider: (provider: string, code: string, state: string) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -23,9 +22,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       .finally(() => setIsLoading(false));
   }, []);
 
-  /** Runs a sign-in that stores a session token, then loads the account it belongs to. */
-  const signIn = async (authenticate: () => Promise<unknown>) => {
-    await authenticate();
+  const login = async (email: string, pass: string) => {
+    await api.login(email, pass);
     const profile = await api.whoami();
     if (!profile) {
       await api.logout();
@@ -34,11 +32,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUser(profile);
   };
 
-  const login = (email: string, pass: string) => signIn(() => api.login(email, pass));
-
-  const loginWithProvider = (provider: string, code: string, state: string) =>
-    signIn(() => api.loginWithProvider(provider, code, state));
-
   const logout = async () => {
     await api.logout();
     setUser(null);
@@ -46,7 +39,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   return (
     <AuthContext.Provider
-      value={{ user, isAuthenticated: user !== null, isLoading, login, loginWithProvider, logout }}
+      value={{ user, isAuthenticated: user !== null, isLoading, login, logout }}
     >
       {children}
     </AuthContext.Provider>
