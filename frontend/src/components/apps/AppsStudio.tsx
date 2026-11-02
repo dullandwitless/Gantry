@@ -140,7 +140,7 @@ export const AppsStudio: React.FC = () => {
             <dl className="p-6 grid grid-cols-[10rem_1fr] gap-x-6 gap-y-3 text-xs content-start">
               <Field label="Summary">{app.summary || '—'}</Field>
               <Field label="Kind">{app.raw_app ? 'Full-code app' : 'Low-code app'}</Field>
-              <Field label="Execution">{EXECUTION_MODES[app.execution_mode] ?? app.execution_mode}</Field>
+              <Field label="Execution">{EXECUTION_MODES[app.policy.execution_mode] ?? app.policy.execution_mode}</Field>
               <Field label="Custom path">
                 {app.custom_path ? <span className="font-mono">{app.custom_path}</span> : '—'}
               </Field>

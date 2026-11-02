@@ -141,7 +141,7 @@ export interface AppWithLastVersion {
   created_by: string;
   created_at: string;
   value: unknown;
-  execution_mode: AppExecutionMode;
+  policy: { execution_mode: AppExecutionMode };
   custom_path?: string;
   raw_app?: boolean;
 }
