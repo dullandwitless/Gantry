@@ -6,7 +6,7 @@ import { useToast } from '../../context/ToastContext';
 import { ShieldCheck, ArrowRight } from 'lucide-react';
 
 export const LoginView: React.FC = () => {
-  const { login } = useAuth();
+  const { login, loginAsMockUser, signInOptions, iapError } = useAuth();
   const { addToast } = useToast();
 
   const [email, setEmail] = useState('');
@@ -36,6 +36,14 @@ export const LoginView: React.FC = () => {
     }
   };
 
+  const handleMockUser = async (mockEmail: string) => {
+    try {
+      await loginAsMockUser(mockEmail);
+    } catch (err: any) {
+      addToast({ kind: 'error', title: 'Login failed', message: err.message });
+    }
+  };
+
   const handleFillAdmin = () => {
     setEmail('admin@windmill.dev');
     setPassword('changeme');
@@ -53,74 +61,104 @@ export const LoginView: React.FC = () => {
           <p className="text-xs text-slate-400">Clean-Room Workflow & Developer Platform</p>
         </div>
 
-        {/* Login Card */}
-        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 shadow-2xl backdrop-blur space-y-5">
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-slate-300">Email Address</label>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="name@company.com"
-                className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-brand-500 transition-colors"
-              />
-            </div>
+        {/* Behind Identity-Aware Proxy there is nothing to sign in with: only a failure lands here. */}
+        {signInOptions.iap ? (
+          <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-4 text-xs">
+            <h2 className="text-sm font-semibold text-slate-100">Could not sign in through Identity-Aware Proxy</h2>
+            <p className="text-red-400 break-words">{iapError ?? 'The proxy did not identify you.'}</p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="w-full bg-brand-600 hover:bg-brand-500 text-slate-950 font-bold py-2.5 rounded-xl"
+            >
+              Try again
+            </button>
+          </div>
+        ) : (
+          <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 shadow-2xl backdrop-blur space-y-5">
+            {signInOptions.mock_users.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-[11px] text-slate-400">Local development: mock users</div>
+                {signInOptions.mock_users.map((mockEmail) => (
+                  <button
+                    key={mockEmail}
+                    type="button"
+                    onClick={() => handleMockUser(mockEmail)}
+                    className="w-full py-2 rounded-xl text-xs font-semibold text-slate-200 bg-slate-950 border border-slate-700/80 hover:border-brand-500 transition-colors"
+                  >
+                    Continue as {mockEmail}
+                  </button>
+                ))}
+                <div className="border-t border-slate-800 pt-1" />
+              </div>
+            )}
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-slate-300">Email Address</label>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="name@company.com"
+                  className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-brand-500 transition-colors"
+                />
+              </div>
 
-            <div className="space-y-1.5">
-              <div className="flex justify-between items-center text-xs">
-                <label className="font-medium text-slate-300">Password</label>
-                {canResetPassword && (
+              <div className="space-y-1.5">
+                <div className="flex justify-between items-center text-xs">
+                  <label className="font-medium text-slate-300">Password</label>
+                  {canResetPassword && (
+                    <button
+                      type="button"
+                      onClick={() => setIsForgotOpen(true)}
+                      className="text-brand-400 hover:text-brand-300"
+                    >
+                      Forgot password?
+                    </button>
+                  )}
+                </div>
+                <input
+                  type="password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••••••"
+                  className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-brand-500 transition-colors"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full bg-brand-600 hover:bg-brand-500 text-slate-950 font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-2 shadow-lg shadow-brand-600/20 transition-all disabled:opacity-50 mt-2"
+              >
+                <span>{isSubmitting ? 'Signing In...' : 'Sign In'}</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </form>
+
+            {isFirstTimeSetup && (
+              <div className="pt-3 border-t border-slate-800/80">
+                <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3 flex items-center justify-between text-xs">
+                  <div>
+                    <div className="text-[11px] text-slate-400">Default Seeded Admin:</div>
+                    <div className="font-mono text-[11px] text-brand-400 font-semibold mt-0.5">
+                      admin@windmill.dev / changeme
+                    </div>
+                  </div>
                   <button
                     type="button"
-                    onClick={() => setIsForgotOpen(true)}
-                    className="text-brand-400 hover:text-brand-300"
+                    onClick={handleFillAdmin}
+                    className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold border border-slate-700 transition-colors"
                   >
-                    Forgot password?
+                    Autofill
                   </button>
-                )}
-              </div>
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••••••"
-                className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-brand-500 transition-colors"
-              />
-            </div>
-
-            <button
-              type="submit"
-              disabled={isSubmitting}
-              className="w-full bg-brand-600 hover:bg-brand-500 text-slate-950 font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-2 shadow-lg shadow-brand-600/20 transition-all disabled:opacity-50 mt-2"
-            >
-              <span>{isSubmitting ? 'Signing In...' : 'Sign In'}</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </form>
-
-          {isFirstTimeSetup && (
-            <div className="pt-3 border-t border-slate-800/80">
-              <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3 flex items-center justify-between text-xs">
-                <div>
-                  <div className="text-[11px] text-slate-400">Default Seeded Admin:</div>
-                  <div className="font-mono text-[11px] text-brand-400 font-semibold mt-0.5">
-                    admin@windmill.dev / changeme
-                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleFillAdmin}
-                  className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold border border-slate-700 transition-colors"
-                >
-                  Autofill
-                </button>
               </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
         {isForgotOpen && (
           <ForgotPasswordModal initialEmail={email} onClose={() => setIsForgotOpen(false)} />

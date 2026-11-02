@@ -1,11 +1,16 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { api, UserProfile } from '../api/client';
+import { api, SignInOptions, UserProfile } from '../api/client';
 
 interface AuthContextType {
   user: UserProfile | null;
   isAuthenticated: boolean;
   isLoading: boolean;
+  /** How this instance signs users in (specs/identity-aware-proxy.md). */
+  signInOptions: SignInOptions;
+  /** Why signing in through Identity-Aware Proxy failed, when it did. */
+  iapError: string | null;
   login: (email: string, pass: string) => Promise<void>;
+  loginAsMockUser: (email: string) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -14,16 +19,31 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [signInOptions, setSignInOptions] = useState<SignInOptions>({ iap: false, mock_users: [] });
+  const [iapError, setIapError] = useState<string | null>(null);
 
   useEffect(() => {
-    api
-      .whoami()
-      .then(setUser)
-      .finally(() => setIsLoading(false));
+    (async () => {
+      const options = await api.getSignInOptions();
+      setSignInOptions(options);
+      // Behind IAP the session must belong to whoever the proxy admitted, so it is
+      // exchanged on every load, replacing any earlier one.
+      if (options.iap) {
+        try {
+          await api.iapLogin();
+        } catch (e: any) {
+          api.setToken(null);
+          setIapError(e.message);
+          return;
+        }
+      }
+      setUser(await api.whoami());
+    })().finally(() => setIsLoading(false));
   }, []);
 
-  const login = async (email: string, pass: string) => {
-    await api.login(email, pass);
+  /** Runs a sign-in that stores a session token, then loads the account it belongs to. */
+  const signIn = async (authenticate: () => Promise<unknown>) => {
+    await authenticate();
     const profile = await api.whoami();
     if (!profile) {
       await api.logout();
@@ -32,6 +52,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUser(profile);
   };
 
+  const login = (email: string, pass: string) => signIn(() => api.login(email, pass));
+
+  const loginAsMockUser = (email: string) => signIn(() => api.mockLogin(email));
+
   const logout = async () => {
     await api.logout();
     setUser(null);
@@ -39,7 +63,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   return (
     <AuthContext.Provider
-      value={{ user, isAuthenticated: user !== null, isLoading, login, logout }}
+      value={{
+        user,
+        isAuthenticated: user !== null,
+        isLoading,
+        signInOptions,
+        iapError,
+        login,
+        loginAsMockUser,
+        logout,
+      }}
     >
       {children}
     </AuthContext.Provider>

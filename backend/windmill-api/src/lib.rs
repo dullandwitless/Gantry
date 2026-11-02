@@ -118,6 +118,7 @@ pub mod jobs;
 pub mod jobs_export;
 #[cfg(feature = "oauth2")]
 pub mod oauth2_oss;
+mod external_auth;
 mod oidc_oss;
 mod path_autocomplete;
 mod raw_apps;
@@ -951,7 +952,9 @@ pub async fn run_server(
                 })
                 .nest(
                     "/auth",
-                    users::make_unauthed_service().layer(Extension(argon2)),
+                    users::make_unauthed_service()
+                        .merge(external_auth::routes())
+                        .layer(Extension(argon2)),
                 )
                 .nest("/oauth", {
                     #[cfg(feature = "oauth2")]

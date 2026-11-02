@@ -5,6 +5,11 @@ import {
   DataTable, TableColumn, Migration, S3FileItem, GlobalUser, NewUser, AuditLogEntry, AuditLogFilters
 } from '../types';
 
+export interface SignInOptions {
+  iap: boolean;
+  mock_users: string[];
+}
+
 export interface UserProfile {
   email: string;
   username: string;
@@ -84,6 +89,28 @@ class GantryApiClient {
     });
     this.setToken(token);
     return token;
+  }
+
+  // Sign-in through Identity-Aware Proxy, or as a mock user in local development
+  // (specs/identity-aware-proxy.md).
+  async getSignInOptions(): Promise<SignInOptions> {
+    try {
+      const options = await this.request<SignInOptions>('/auth/sign_in_options');
+      return { iap: options.iap === true, mock_users: Array.isArray(options.mock_users) ? options.mock_users : [] };
+    } catch {
+      return { iap: false, mock_users: [] };
+    }
+  }
+
+  /** Exchanges the IAP assertion the proxy adds to this request for a session. */
+  async iapLogin(): Promise<void> {
+    this.setToken(await this.request<string>('/auth/iap', { method: 'POST' }));
+  }
+
+  async mockLogin(email: string): Promise<void> {
+    this.setToken(
+      await this.request<string>('/auth/mock_login', { method: 'POST', body: JSON.stringify({ email }) }),
+    );
   }
 
   async logout(): Promise<void> {
