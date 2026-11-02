@@ -1,0 +1,35 @@
+name: frontend
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The server embeds frontend/build at compile time and the development machine
+  # builds the server without Node, so the bundle is committed. This typechecks the
+  # sources, rebuilds the bundle and fails if the committed one is stale.
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Committed bundle matches the sources
+        run: |
+          git add --intent-to-add --all build
+          git diff --exit-code --stat -- build || {
+            echo "::error::frontend/build is stale: run 'npm run build' in frontend/ and commit the result"
+            exit 1
+          }

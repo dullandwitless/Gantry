@@ -11,8 +11,13 @@ use axum::{
     routing::get,
     Extension, Json, Router,
 };
+use windmill_api_auth::require_super_admin;
 use windmill_audit::{AuditLog, ListAuditLogQuery};
-use windmill_common::{db::UserDB, error::JsonResult, utils::Pagination};
+use windmill_common::{
+    db::{UserDB, DB},
+    error::JsonResult,
+    utils::Pagination,
+};
 
 use crate::db::ApiAuthed;
 
@@ -36,8 +41,14 @@ async fn list_audit(
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(pagination): Query<Pagination>,
+    Extension(db): Extension<DB>,
     Query(lq): Query<ListAuditLogQuery>,
 ) -> JsonResult<Vec<AuditLog>> {
+    // Row-level security lets any workspace admin read every workspace's rows; only the
+    // workspace filter keeps them to their own (specs/audit-logs.md, section 3).
+    if lq.all_workspaces.unwrap_or(false) {
+        require_super_admin(&db, &authed).await?;
+    }
     let tx = user_db.begin(&authed).await?;
     let rows = windmill_audit::audit_oss::list_audit(tx, w_id, pagination, lq).await?;
     Ok(Json(rows))

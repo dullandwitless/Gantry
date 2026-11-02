@@ -2,7 +2,7 @@ import {
   Script, ScriptHistory, Draft, OpenFlow, Job, ListableApp, 
   Resource, ResourceType, Variable, Schedule, HttpTrigger, 
   WorkspaceInfo, WorkspaceUser, Folder, WorkerPing, ConcurrencyGroup, ListedRunnable,
-  DataTable, TableColumn, Migration, S3FileItem, GlobalUser, NewUser
+  DataTable, TableColumn, Migration, S3FileItem, GlobalUser, NewUser, AuditLogEntry, AuditLogFilters
 } from '../types';
 
 export interface UserProfile {
@@ -146,6 +146,22 @@ class GantryApiClient {
       method: 'POST',
       body: JSON.stringify({ token, new_password: newPassword }),
     });
+  }
+
+  // Audit log (specs/audit-logs.md)
+  async listAuditLogs(
+    workspace: string,
+    filters: AuditLogFilters,
+    perPage: number,
+    beforeId?: number,
+  ): Promise<AuditLogEntry[]> {
+    const query = new URLSearchParams({ per_page: String(perPage) });
+    for (const [key, value] of Object.entries(filters)) {
+      if (value) query.set(key, value);
+    }
+    if (beforeId !== undefined) query.set('before_id', String(beforeId));
+    const list = await this.request<AuditLogEntry[]>(`/w/${workspace}/audit/list?${query}`);
+    return Array.isArray(list) ? list : [];
   }
 
   // Instance users (superadmin)

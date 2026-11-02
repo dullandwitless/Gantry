@@ -21,6 +21,7 @@ import { DataTablesView } from './components/datatables/DataTablesView';
 import { AiToolsView } from './components/ai/AiToolsView';
 import { GitSyncView } from './components/gitsync/GitSyncView';
 import { AdminView } from './components/admin/AdminView';
+import { WorkspaceSettingsView } from './components/workspace/WorkspaceSettingsView';
 
 export const AppContent: React.FC = () => {
   const { isAuthenticated, isLoading: authLoading } = useAuth();
@@ -84,6 +85,7 @@ export const AppContent: React.FC = () => {
       case 'gitsync':
         return <GitSyncView />;
       case 'workspace-settings':
+        return <WorkspaceSettingsView />;
       case 'admin':
         return <AdminView />;
       default:

@@ -14,6 +14,8 @@ reason). It names features, not how upstream builds them.
 - **Users and passwords**, **email** and the **global settings listing**:
   [users-and-email.md](users-and-email.md). Email needs the `smtp` cargo feature;
   a build without it says so instead of sending.
+- **Audit logs**: writing and listing ([audit-logs.md](audit-logs.md)). Export to
+  object storage and OpenTelemetry is not implemented.
 
 ## Identity and access
 
@@ -24,7 +26,7 @@ reason). It names features, not how upstream builds them.
 
 ## Operations and observability
 
-- Audit logs.
+- Audit log export (object storage, OpenTelemetry).
 - Prometheus metrics (`METRICS_ADDR`); OpenTelemetry export and the tracing proxy.
 - Critical alerts and alert channels; usage stats.
 

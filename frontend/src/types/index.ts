@@ -288,3 +288,24 @@ export interface NewUser {
   name?: string;
   skip_email?: boolean;
 }
+
+/** An entry of `GET /w/{workspace}/audit/list` (OpenAPI schema `AuditLog`). */
+export interface AuditLogEntry {
+  workspace_id: string;
+  id: number;
+  timestamp: string;
+  username: string;
+  operation: string;
+  action_kind: 'Create' | 'Update' | 'Delete' | 'Execute';
+  resource?: string | null;
+  parameters?: Record<string, unknown> | null;
+}
+
+/** Filters of `GET /w/{workspace}/audit/list`; empty values are omitted. */
+export interface AuditLogFilters {
+  username?: string;
+  operation?: string;
+  action_kind?: string;
+  after?: string;
+  before?: string;
+}
