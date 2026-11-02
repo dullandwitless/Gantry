@@ -17,6 +17,8 @@ reason). It names features, not how upstream builds them.
 - **Audit logs**: writing and listing ([audit-logs.md](audit-logs.md)). Export to
   object storage and OpenTelemetry is not implemented.
 - **Concurrency limits**: [concurrency-limits.md](concurrency-limits.md).
+- **Settable poll delay** for job update streams:
+  [job-update-poll-delay.md](job-update-poll-delay.md).
 
 ## Identity and access
 
@@ -33,7 +35,6 @@ reason). It names features, not how upstream builds them.
 
 ## Execution
 
-- Settable poll delay.
 - Dedicated workers (flow loop squashing); agent workers (`MODE=agent`);
   worker autoscaling.
 - Private package registries (npm, PyPI, Maven and others); worker object-store

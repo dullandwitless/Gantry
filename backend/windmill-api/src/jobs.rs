@@ -10575,19 +10575,14 @@ pub fn start_job_update_sse_stream(
         loop {
             i += 1;
 
-            #[allow(unused_mut)]
-            let mut ms_duration = if i > 100 || !fast.unwrap_or(false) {
-                3000
-            } else if i > 10 {
-                500
-            } else {
-                100
+            // specs/job-update-poll-delay.md: a requested delay replaces the built-in schedule,
+            // bounded so it neither busy-polls the database nor delays the keep-alive ping.
+            let ms_duration = match poll_delay_ms {
+                Some(ms) => ms.clamp(100, 5000),
+                None if i > 100 || !fast.unwrap_or(false) => 3000,
+                None if i > 10 => 500,
+                None => 100,
             };
-
-            #[allow(unused_variables)]
-            if let Some(poll_delay_ms) = poll_delay_ms {
-                tracing::warn!("Settable poll delay is not supported in Gantry");
-            }
 
             if last_ping.elapsed().as_secs() > 5 {
                 if tx.send(JobUpdateSSEStream::Ping).await.is_err() {
