@@ -2,7 +2,7 @@ import {
   Script, ScriptHistory, Draft, OpenFlow, Job, ListableApp, 
   Resource, ResourceType, Variable, Schedule, HttpTrigger, 
   WorkspaceInfo, WorkspaceUser, Folder, WorkerPing, ConcurrencyGroup, ListedRunnable,
-  DataTable, TableColumn, Migration, S3FileItem
+  DataTable, TableColumn, Migration, S3FileItem, GlobalUser, NewUser
 } from '../types';
 
 export interface UserProfile {
@@ -121,6 +121,48 @@ class GantryApiClient {
     } catch {
       return false;
     }
+  }
+
+  // Passwords (specs/users-and-email.md, section 6)
+  async setOwnPassword(password: string): Promise<void> {
+    await this.request('/users/setpassword', { method: 'POST', body: JSON.stringify({ password }) });
+  }
+
+  async isSmtpConfigured(): Promise<boolean> {
+    return (await this.request<boolean>('/auth/is_smtp_configured')) === true;
+  }
+
+  /** Returns the server's message, which is the same whether or not the account exists. */
+  async requestPasswordReset(email: string): Promise<string> {
+    const res = await this.request<{ message: string }>('/auth/request_password_reset', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    return res.message;
+  }
+
+  async resetPassword(token: string, newPassword: string): Promise<void> {
+    await this.request('/auth/reset_password', {
+      method: 'POST',
+      body: JSON.stringify({ token, new_password: newPassword }),
+    });
+  }
+
+  // Instance users (superadmin)
+  async listGlobalUsers(): Promise<GlobalUser[]> {
+    const list = await this.request<GlobalUser[]>('/users/list_as_super_admin?per_page=1000');
+    return Array.isArray(list) ? list : [];
+  }
+
+  async createUser(user: NewUser): Promise<void> {
+    await this.request('/users/create', { method: 'POST', body: JSON.stringify(user) });
+  }
+
+  async setPasswordOf(email: string, password: string): Promise<void> {
+    await this.request(`/users/set_password_of/${encodeURIComponent(email)}`, {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    });
   }
 
   // Workspaces

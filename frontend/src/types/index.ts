@@ -265,3 +265,26 @@ export interface ConcurrencyGroup {
   concurrency_limit: number;
   current_running: number;
 }
+
+/** An entry of `GET /users/list_as_super_admin` (OpenAPI schema `GlobalUserInfo`). */
+export interface GlobalUser {
+  email: string;
+  login_type: string;
+  super_admin: boolean;
+  devops?: boolean;
+  verified: boolean;
+  name?: string | null;
+  company?: string | null;
+  username?: string | null;
+  disabled: boolean;
+  role_source: string;
+}
+
+/** Body of `POST /users/create`. */
+export interface NewUser {
+  email: string;
+  password?: string;
+  super_admin: boolean;
+  name?: string;
+  skip_email?: boolean;
+}

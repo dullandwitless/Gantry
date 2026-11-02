@@ -1,4 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { api } from '../../api/client';
+import { ForgotPasswordModal } from './ForgotPasswordModal';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { ShieldCheck, KeyRound, ArrowRight, Sparkles, Layers } from 'lucide-react';
@@ -10,6 +12,13 @@ export const LoginView: React.FC = () => {
   const [email, setEmail] = useState('admin@windmill.dev');
   const [password, setPassword] = useState('changeme');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [canResetPassword, setCanResetPassword] = useState(false);
+  const [isForgotOpen, setIsForgotOpen] = useState(false);
+
+  useEffect(() => {
+    // Password reset needs email; offer it only when the server can send one.
+    api.isSmtpConfigured().then(setCanResetPassword, () => setCanResetPassword(false));
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -59,6 +68,15 @@ export const LoginView: React.FC = () => {
             <div className="space-y-1.5">
               <div className="flex justify-between items-center text-xs">
                 <label className="font-medium text-slate-300">Password</label>
+                {canResetPassword && (
+                  <button
+                    type="button"
+                    onClick={() => setIsForgotOpen(true)}
+                    className="text-brand-400 hover:text-brand-300"
+                  >
+                    Forgot password?
+                  </button>
+                )}
               </div>
               <input
                 type="password"
@@ -111,6 +129,10 @@ export const LoginView: React.FC = () => {
             </button>
           </div>
         </div>
+
+        {isForgotOpen && (
+          <ForgotPasswordModal initialEmail={email} onClose={() => setIsForgotOpen(false)} />
+        )}
 
         {/* Provenance Footer */}
         <div className="flex items-center justify-center gap-1.5 text-xs text-slate-500">

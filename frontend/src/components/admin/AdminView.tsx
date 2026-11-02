@@ -5,12 +5,15 @@ import { api } from '../../api/client';
 import { WorkerPing, ConcurrencyGroup } from '../../types';
 import { Shield, Users, Cpu, Key, Activity, Plus, CheckCircle2, Server } from 'lucide-react';
 import { CleanRoomStubNotice } from '../common/CleanRoomStubNotice';
+import { UsersPanel } from './UsersPanel';
+import { useAuth } from '../../context/AuthContext';
 
 export const AdminView: React.FC = () => {
   const { currentWorkspace } = useWorkspace();
   const { addToast } = useToast();
+  const { user } = useAuth();
 
-  const [activeTab, setActiveTab] = useState<'workers' | 'members' | 'concurrency' | 'health'>('workers');
+  const [activeTab, setActiveTab] = useState<'workers' | 'users' | 'concurrency' | 'health'>('workers');
   const [workers, setWorkers] = useState<WorkerPing[] | null>(null);
   const [concurrency, setConcurrency] = useState<ConcurrencyGroup[]>([]);
 
@@ -53,14 +56,16 @@ export const AdminView: React.FC = () => {
           >
             Worker Pool
           </button>
-          <button
-            onClick={() => setActiveTab('members')}
-            className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-              activeTab === 'members' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Members & Roles
-          </button>
+          {user?.super_admin && (
+            <button
+              onClick={() => setActiveTab('users')}
+              className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                activeTab === 'users' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Users
+            </button>
+          )}
           <button
             onClick={() => setActiveTab('concurrency')}
             className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
@@ -81,8 +86,8 @@ export const AdminView: React.FC = () => {
       </div>
 
       <CleanRoomStubNotice
-        featureName="Enterprise SSO & Provisioning Stubs"
-        notes="Enterprise SAML, SCIM provisioning, and custom workspace role builder are proprietary upstream modules. User self-registration and invitation emails are stubs in the current backend. Gantry administers access using seeded admin roles and scoped API tokens."
+        featureName="Single sign-on and provisioning"
+        notes="SAML, SCIM provisioning and custom workspace roles are not implemented yet. Superadmins add users with a password under Users; email (invites, password reset) works when the server is built with the smtp feature and SMTP is configured."
       />
 
       {activeTab === 'workers' && (
@@ -102,35 +107,7 @@ export const AdminView: React.FC = () => {
         </div>
       )}
 
-      {activeTab === 'members' && (
-        <div className="space-y-4">
-          <div className="flex justify-between items-center">
-            <h2 className="text-sm font-semibold text-slate-200">Workspace Members</h2>
-          </div>
-          <div className="border border-slate-800 rounded-xl overflow-hidden bg-slate-900/40">
-            <table className="w-full text-left text-xs font-mono">
-              <thead className="bg-slate-900/80 border-b border-slate-800 text-slate-400">
-                <tr>
-                  <th className="p-3">User Email</th>
-                  <th className="p-3">Role</th>
-                  <th className="p-3">Permissions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60 text-slate-300">
-                <tr>
-                  <td className="p-3 font-bold text-slate-200">admin@gantry.dev</td>
-                  <td className="p-3">
-                    <span className="px-2 py-0.5 rounded bg-brand-950 text-brand-400 border border-brand-800 font-semibold">
-                      Admin
-                    </span>
-                  </td>
-                  <td className="p-3 text-slate-400 font-sans text-xs">Full instance & workspace control</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
+      {activeTab === 'users' && user?.super_admin && <UsersPanel />}
 
       {activeTab === 'concurrency' && (
         <div className="space-y-4">
