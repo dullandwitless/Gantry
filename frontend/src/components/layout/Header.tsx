@@ -1,6 +1,7 @@
 import React from 'react';
 import { useWorkspace } from '../../context/WorkspaceContext';
-import { Search, Bell, Settings, Layers, ShieldCheck } from 'lucide-react';
+import { useAuth } from '../../context/AuthContext';
+import { Search, Layers, ShieldCheck, LogOut } from 'lucide-react';
 
 interface HeaderProps {
   onOpenSearch: () => void;
@@ -9,6 +10,7 @@ interface HeaderProps {
 
 export const Header: React.FC<HeaderProps> = ({ onOpenSearch, activeTab }) => {
   const { currentWorkspace, setWorkspace, workspaces } = useWorkspace();
+  const { user, logout } = useAuth();
 
   return (
     <header className="h-14 border-b border-slate-800 bg-slate-900/60 backdrop-blur px-4 flex items-center justify-between sticky top-0 z-20">
@@ -21,7 +23,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenSearch, activeTab }) => {
             onChange={(e) => setWorkspace(e.target.value)}
             className="bg-transparent text-slate-200 font-medium focus:outline-none cursor-pointer"
           >
-            {workspaces.map((w) => (
+            {Array.isArray(workspaces) && workspaces.map((w) => (
               <option key={w.id} value={w.id} className="bg-slate-900 text-slate-100">
                 {w.name} ({w.id})
               </option>
@@ -32,7 +34,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenSearch, activeTab }) => {
         {/* Breadcrumb Area */}
         <div className="hidden sm:flex items-center gap-2 text-sm text-slate-400">
           <span>/</span>
-          <span className="capitalize text-slate-200 font-medium">{activeTab.replace('-', ' ')}</span>
+          <span className="capitalize text-slate-200 font-medium">{activeTab ? activeTab.replace('-', ' ') : 'Studio'}</span>
         </div>
       </div>
 
@@ -53,9 +55,22 @@ export const Header: React.FC<HeaderProps> = ({ onOpenSearch, activeTab }) => {
           <span>Clean-Room</span>
         </div>
 
-        {/* User Avatar */}
-        <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-brand-600 to-emerald-400 flex items-center justify-center font-bold text-xs text-slate-950 shadow">
-          A
+        {/* User Info & Logout */}
+        <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-brand-600 to-emerald-400 flex items-center justify-center font-bold text-xs text-slate-950 shadow">
+            {user?.email ? user.email[0].toUpperCase() : 'A'}
+          </div>
+          <div className="hidden xl:block text-left text-xs">
+            <div className="font-semibold text-slate-200 truncate max-w-[120px]">{user?.email || 'admin'}</div>
+            <div className="text-[10px] text-slate-400">{user?.super_admin ? 'Superadmin' : 'Member'}</div>
+          </div>
+          <button
+            onClick={() => logout()}
+            title="Sign out"
+            className="p-1.5 text-slate-400 hover:text-rose-400 rounded-lg hover:bg-slate-800 transition-colors ml-1"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </div>
     </header>

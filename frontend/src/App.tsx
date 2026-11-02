@@ -1,6 +1,10 @@
 import React, { useState } from 'react';
 import { WorkspaceProvider } from './context/WorkspaceContext';
 import { ToastProvider } from './context/ToastContext';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
+import { LoginView } from './components/auth/LoginView';
+
 import { Header } from './components/layout/Header';
 import { Sidebar } from './components/layout/Sidebar';
 import { CommandPalette } from './components/layout/CommandPalette';
@@ -17,8 +21,22 @@ import { GitSyncView } from './components/gitsync/GitSyncView';
 import { AdminView } from './components/admin/AdminView';
 
 export const AppContent: React.FC = () => {
+  const { isAuthenticated, isLoading } = useAuth();
   const [activeTab, setActiveTab] = useState<string>('scripts');
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
+
+  if (isLoading) {
+    return (
+      <div className="h-screen w-screen bg-slate-950 flex flex-col items-center justify-center text-slate-400 gap-3">
+        <div className="w-8 h-8 rounded-full border-2 border-brand-500 border-t-transparent animate-spin" />
+        <span className="text-xs font-mono">Initializing Gantry...</span>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return <LoginView />;
+  }
 
   const renderActiveView = () => {
     switch (activeTab) {
@@ -69,10 +87,14 @@ export const AppContent: React.FC = () => {
 
 export default function App() {
   return (
-    <ToastProvider>
-      <WorkspaceProvider>
-        <AppContent />
-      </WorkspaceProvider>
-    </ToastProvider>
+    <ErrorBoundary>
+      <ToastProvider>
+        <AuthProvider>
+          <WorkspaceProvider>
+            <AppContent />
+          </WorkspaceProvider>
+        </AuthProvider>
+      </ToastProvider>
+    </ErrorBoundary>
   );
 }

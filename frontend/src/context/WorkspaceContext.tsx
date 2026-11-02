@@ -15,19 +15,26 @@ const WorkspaceContext = createContext<WorkspaceContextType | undefined>(undefin
 
 export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentWorkspace, setCurrentWorkspace] = useState<string>('demo');
-  const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
+  const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([
+    { id: 'demo', name: 'Demo Workspace', owner: 'admin@windmill.dev' }
+  ]);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
   const refreshWorkspaces = async () => {
     try {
       const list = await api.listWorkspaces();
-      setWorkspaces(list);
-      if (list.length > 0 && !list.some(w => w.id === currentWorkspace)) {
-        setCurrentWorkspace(list[0].id);
+      if (Array.isArray(list) && list.length > 0) {
+        setWorkspaces(list);
+        if (!list.some(w => w.id === currentWorkspace)) {
+          setCurrentWorkspace(list[0].id);
+        }
+      } else {
+        setWorkspaces([{ id: 'demo', name: 'Demo Workspace', owner: 'admin@windmill.dev' }]);
       }
     } catch (e) {
-      console.error(e);
+      console.warn('[WorkspaceContext] Failed to load workspaces, falling back:', e);
+      setWorkspaces([{ id: 'demo', name: 'Demo Workspace', owner: 'admin@windmill.dev' }]);
     } finally {
       setIsLoading(false);
     }
@@ -39,7 +46,11 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   useEffect(() => {
     if (currentWorkspace) {
-      api.listFolders(currentWorkspace).then(setFolders).catch(console.error);
+      api.listFolders(currentWorkspace)
+        .then((f) => {
+          if (Array.isArray(f)) setFolders(f);
+        })
+        .catch(console.warn);
     }
   }, [currentWorkspace]);
 
