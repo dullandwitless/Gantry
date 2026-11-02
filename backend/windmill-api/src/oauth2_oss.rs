@@ -13,11 +13,6 @@ use hmac::Mac;
 
 #[cfg(feature = "oauth2")]
 use itertools::Itertools;
-use serde::{Deserialize, Serialize};
-#[cfg(feature = "oauth2")]
-use windmill_common::more_serde::maybe_number_opt;
-#[cfg(feature = "oauth2")]
-use windmill_oauth::{helpers, AccessToken, RefreshToken, Scope};
 
 #[cfg(feature = "oauth2")]
 use crate::OAUTH_CLIENTS;
@@ -28,9 +23,10 @@ use crate::db::DB;
 use std::str;
 
 pub fn global_service() -> Router {
-    Router::new()
-        .route("/list_logins", get(list_logins))
-        .route("/list_connects", get(list_connects))
+    let router = Router::new().route("/list_connects", get(list_connects));
+    #[cfg(feature = "oauth2")]
+    let router = router.merge(crate::oauth_login::routes());
+    router
 }
 
 pub fn workspaced_service() -> Router {
@@ -56,42 +52,20 @@ pub use windmill_oauth::{OAuthClient, OAuthConfig};
 
 #[cfg(feature = "oauth2")]
 pub async fn build_oauth_clients(
-    _base_url: &str,
-    _oauths_from_config: Option<HashMap<String, OAuthClient>>,
+    base_url: &str,
+    oauths_from_config: Option<HashMap<String, OAuthClient>>,
     _db: &DB,
 ) -> anyhow::Result<AllClients> {
-    // Stub: not implemented.
-    return Ok(AllClients {
-        logins: HashMap::default(),
+    // Sign-in providers: specs/sso-oauth-login.md. Resource connects are not implemented.
+    Ok(AllClients {
+        logins: crate::oauth_login::login_clients(
+            &oauths_from_config.unwrap_or_default(),
+            base_url,
+        ),
         connects: HashMap::default(),
         slack: None,
         slack_signing_secret: None,
-    });
-}
-
-#[cfg(feature = "oauth2")]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TokenResponse {
-    access_token: AccessToken,
-    #[serde(deserialize_with = "maybe_number_opt")]
-    #[serde(default)]
-    expires_in: Option<u64>,
-    refresh_token: Option<RefreshToken>,
-    #[serde(deserialize_with = "helpers::deserialize_space_delimited_vec")]
-    #[serde(serialize_with = "helpers::serialize_space_delimited_vec")]
-    #[serde(default)]
-    scope: Option<Vec<Scope>>,
-}
-
-#[derive(Serialize)]
-struct Logins {
-    oauth: Vec<String>,
-    saml: Option<String>,
-    auto_login: Option<String>,
-}
-async fn list_logins() -> error::JsonResult<Logins> {
-    // Stub: not implemented.
-    return Ok(Json(Logins { oauth: vec![], saml: None, auto_login: None }));
+    })
 }
 
 #[allow(unused)]
@@ -123,30 +97,6 @@ pub async fn _refresh_token(
     Err(error::Error::BadRequest(
         "Not implemented in Gantry".to_string(),
     ))
-}
-
-pub async fn check_nb_of_user(db: &DB) -> error::Result<()> {
-    let nb_users_sso =
-        sqlx::query_scalar!("SELECT COUNT(*) FROM password WHERE login_type != 'password'",)
-            .fetch_one(db)
-            .await?;
-    if nb_users_sso.unwrap_or(0) >= 10 {
-        return Err(error::Error::BadRequest(
-            "You have reached the maximum number of oauth users accounts (10) without an enterprise license"
-                .to_string(),
-        ));
-    }
-
-    let nb_users = sqlx::query_scalar!("SELECT COUNT(*) FROM password",)
-        .fetch_one(db)
-        .await?;
-    if nb_users.unwrap_or(0) >= 50 {
-        return Err(error::Error::BadRequest(
-            "You have reached the maximum number of accounts (50) without an enterprise license"
-                .to_string(),
-        ));
-    }
-    return Ok(());
 }
 
 #[derive(Clone, Debug)]

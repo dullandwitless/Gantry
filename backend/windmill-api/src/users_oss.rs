@@ -33,7 +33,7 @@ use windmill_common::users::{usr_accepts_email, PENDING_OAUTH_LOGIN_TYPE};
 const PASSWORD_LOGIN_TYPE: &str = "password";
 
 /// Width of `password.name` and `password.company`.
-const PROFILE_FIELD_MAX_LEN: usize = 255;
+pub(crate) const PROFILE_FIELD_MAX_LEN: usize = 255;
 
 /// Width of `password.login_type`.
 const LOGIN_TYPE_MAX_LEN: usize = 50;
@@ -96,21 +96,17 @@ pub async fn create_user(
         return Err(Error::BadRequest(format!("user {email} already exists")));
     }
 
-    let username = instance_username_for_new_account(&mut tx, &email).await?;
-
-    sqlx::query(
-        "INSERT INTO password
-            (email, password_hash, login_type, super_admin, verified, name, company, username)
-         VALUES ($1, $2, $3, $4, true, $5, $6, $7)",
+    insert_account(
+        &mut tx,
+        &NewAccount {
+            email: &email,
+            password_hash: password_hash.as_deref(),
+            login_type: &login_type,
+            super_admin: nu.super_admin,
+            name: nu.name.as_deref(),
+            company: nu.company.as_deref(),
+        },
     )
-    .bind(&email)
-    .bind(&password_hash)
-    .bind(&login_type)
-    .bind(nu.super_admin)
-    .bind(&nu.name)
-    .bind(&nu.company)
-    .bind(&username)
-    .execute(&mut *tx)
     .await?;
 
     audit_log(
@@ -133,6 +129,39 @@ pub async fn create_user(
     }
 
     Ok((StatusCode::CREATED, format!("user {email} created")))
+}
+
+pub(crate) struct NewAccount<'a> {
+    pub email: &'a str,
+    pub password_hash: Option<&'a str>,
+    pub login_type: &'a str,
+    pub super_admin: bool,
+    pub name: Option<&'a str>,
+    pub company: Option<&'a str>,
+}
+
+/// Inserts the `password` row of a new, verified account, with its instance username. The
+/// caller has checked that no account has this email.
+pub(crate) async fn insert_account(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &NewAccount<'_>,
+) -> Result<()> {
+    let username = instance_username_for_new_account(tx, account.email).await?;
+    sqlx::query(
+        "INSERT INTO password
+            (email, password_hash, login_type, super_admin, verified, name, company, username)
+         VALUES ($1, $2, $3, $4, true, $5, $6, $7)",
+    )
+    .bind(account.email)
+    .bind(account.password_hash)
+    .bind(account.login_type)
+    .bind(account.super_admin)
+    .bind(account.name)
+    .bind(account.company)
+    .bind(&username)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// The `password.username` a new account gets (spec section 1, step 5), or `None` when

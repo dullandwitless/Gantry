@@ -5,6 +5,11 @@ import {
   DataTable, TableColumn, Migration, S3FileItem, GlobalUser, NewUser, AuditLogEntry, AuditLogFilters
 } from '../types';
 
+export interface LoginProvider {
+  type: string;
+  display_name?: string | null;
+}
+
 export interface UserProfile {
   email: string;
   username: string;
@@ -84,6 +89,29 @@ class GantryApiClient {
     });
     this.setToken(token);
     return token;
+  }
+
+  // Sign-in providers (specs/sso-oauth-login.md). A server built without OAuth has none.
+  async listLoginProviders(): Promise<LoginProvider[]> {
+    try {
+      const res = await this.request<{ oauth: LoginProvider[] }>('/oauth/list_logins');
+      return Array.isArray(res?.oauth) ? res.oauth : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Where the browser goes to sign in with `provider`; it comes back to the callback page. */
+  loginProviderUrl(provider: string): string {
+    return `${this.baseUrl}/oauth/login/${encodeURIComponent(provider)}`;
+  }
+
+  async loginWithProvider(provider: string, code: string, state: string): Promise<void> {
+    const token = await this.request<string>(
+      `/oauth/login_callback/${encodeURIComponent(provider)}`,
+      { method: 'POST', body: JSON.stringify({ code, state }) },
+    );
+    this.setToken(token);
   }
 
   async logout(): Promise<void> {
