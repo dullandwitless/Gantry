@@ -21,6 +21,9 @@ reason). It names features, not how upstream builds them.
   [job-update-poll-delay.md](job-update-poll-delay.md).
 - **Prometheus metrics** (`METRICS_ADDR`, `expose_metrics`), with the `prometheus`
   cargo feature: [prometheus-metrics.md](prometheus-metrics.md).
+- **Critical alert channels**: email and Slack delivery
+  ([critical-alert-channels.md](critical-alert-channels.md)); Teams waits on the Teams
+  integration.
 
 ## Identity and access
 
@@ -33,7 +36,7 @@ reason). It names features, not how upstream builds them.
 
 - Audit log export (object storage, OpenTelemetry).
 - OpenTelemetry export and the tracing proxy.
-- Critical alerts and alert channels; usage stats.
+- Critical alerts to Microsoft Teams; usage stats.
 
 ## Execution
 

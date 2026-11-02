@@ -37,6 +37,7 @@ pub mod azure_workload_identity;
 pub mod bench;
 pub mod cache;
 pub mod client;
+pub mod critical_alert_channels;
 pub mod data_metrics;
 pub mod datatable_roles;
 pub mod datatable_roles_oss;

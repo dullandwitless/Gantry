@@ -7,6 +7,7 @@
  */
 
 use crate::auth::is_devops_email;
+use crate::critical_alert_channels::{notify_channels, AlertKind};
 use crate::ee_oss::LICENSE_KEY_ID;
 use crate::error::{to_anyhow, Error, Result};
 use crate::global_settings::UNIQUE_ID_SETTING;
@@ -714,15 +715,16 @@ pub fn generate_lock_id(database_name: &str) -> i64 {
 
 pub async fn report_critical_error(
     error_message: String,
-    _db: DB,
+    db: DB,
     workspace_id: Option<&str>,
     resource: Option<&str>,
 ) -> () {
     tracing::error!("CRITICAL ERROR: {error_message}");
+    notify_channels(&db, AlertKind::Critical, &error_message, workspace_id, resource);
 
     let mute_global = CRITICAL_ALERT_MUTE_UI_ENABLED.load(Ordering::Relaxed);
     let mute_workspace = if let Some(workspace_id) = workspace_id {
-        match fetch_mute_workspace(&_db, workspace_id).await {
+        match fetch_mute_workspace(&db, workspace_id).await {
             Ok(flag) => flag,
             Err(err) => {
                 tracing::error!("Error fetching mute_workspace: {}", err);
@@ -748,7 +750,7 @@ pub async fn report_critical_error(
         workspace_id,
         resource,
     )
-    .execute(&_db)
+    .execute(&db)
     .await
     {
         tracing::error!("Failed to save critical error to database: {}", err);
@@ -760,19 +762,21 @@ pub async fn report_critical_error(
 /// the instance-wide feed superadmins triage. The channels belong to the instance operator,
 /// who on cloud is not the workspace owner, hence the hard stop there. Callers own the
 /// per-workspace opt-in.
-pub async fn send_workspace_error_to_instance_channels(_error_message: String, _db: &DB) -> () {
+pub async fn send_workspace_error_to_instance_channels(error_message: String, db: &DB) -> () {
     if *CLOUD_HOSTED {
         return;
     }
+    notify_channels(db, AlertKind::WorkspaceError, &error_message, None, None);
 }
 
 pub async fn report_recovered_critical_error(
     message: String,
-    _db: DB,
+    db: DB,
     workspace_id: Option<&str>,
     resource: Option<&str>,
 ) -> () {
     tracing::info!("RECOVERED CRITICAL ERROR: {message}");
+    notify_channels(&db, AlertKind::Recovered, &message, workspace_id, resource);
 
     if let Err(err) = sqlx::query!(
         "INSERT INTO alerts (alert_type, message, acknowledged, acknowledged_workspace, workspace_id, resource)
@@ -783,7 +787,7 @@ pub async fn report_recovered_critical_error(
         workspace_id,
         resource,
     )
-    .execute(&_db)
+    .execute(&db)
     .await
     {
         tracing::error!("Failed to save recovered critical error to database: {}", err);
@@ -795,7 +799,7 @@ pub async fn report_recovered_critical_error(
             "UPDATE alerts SET acknowledged = true, acknowledged_workspace = true WHERE resource = $1 AND alert_type = 'critical_error'",
             resource,
         )
-        .execute(&_db)
+        .execute(&db)
         .await
         {
             tracing::error!("Failed to acknowledge critical error alerts for resource {}: {}", resource, err);
