@@ -19,23 +19,27 @@ async fn slack_stub() -> (String, Seen) {
     let app = Router::new()
         .route(
             "/chat.postMessage",
-            post(|State(seen): State<Seen>, headers: HeaderMap, Json(body): Json<Value>| async move {
-                let token = headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "))
-                    .map(str::to_string);
-                let answer = if body["channel"] == "#missing" {
-                    json!({ "ok": false, "error": "channel_not_found" })
-                } else {
-                    json!({ "ok": true })
-                };
-                seen.lock().unwrap().push((token, body));
-                Json(answer)
-            }),
+            post(
+                |State(seen): State<Seen>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                    let token = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .map(str::to_string);
+                    let answer = if body["channel"] == "#missing" {
+                        json!({ "ok": false, "error": "channel_not_found" })
+                    } else {
+                        json!({ "ok": true })
+                    };
+                    seen.lock().unwrap().push((token, body));
+                    Json(answer)
+                },
+            ),
         )
         .with_state(seen.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("addr"));
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
     (base, seen)
@@ -45,9 +49,14 @@ async fn slack_stub() -> (String, Seen) {
 async fn posts_the_text_to_the_channel_with_the_bot_token() {
     let (base, seen) = slack_stub().await;
 
-    post_slack_message(&base, "xoxb-test", "#alerts", "*[Gantry] Critical alert*\nDisk low")
-        .await
-        .expect("delivered");
+    post_slack_message(
+        &base,
+        "xoxb-test",
+        "#alerts",
+        "*[Gantry] Critical alert*\nDisk low",
+    )
+    .await
+    .expect("delivered");
 
     let seen = seen.lock().unwrap();
     assert_eq!(

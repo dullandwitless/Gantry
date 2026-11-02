@@ -151,10 +151,7 @@ pub async fn defer(
 
 /// Clears the deferral marker of a job that `admit` has just admitted, so it does not travel
 /// to the completed job.
-pub async fn clear_deferred_marker(
-    tx: &mut Transaction<'_, Postgres>,
-    job_id: Uuid,
-) -> Result<()> {
+pub async fn clear_deferred_marker(tx: &mut Transaction<'_, Postgres>, job_id: Uuid) -> Result<()> {
     sqlx::query(
         "UPDATE v2_job_queue SET extras = nullif(extras - $2, '{}'::jsonb)
          WHERE id = $1 AND extras ? $2",
@@ -163,9 +160,7 @@ pub async fn clear_deferred_marker(
     .bind(DEFERRED_MARKER)
     .execute(&mut **tx)
     .await
-    .map_err(|e| {
-        Error::internal_err(format!("Could not clear deferral of job {job_id}: {e:#}"))
-    })?;
+    .map_err(|e| Error::internal_err(format!("Could not clear deferral of job {job_id}: {e:#}")))?;
     Ok(())
 }
 
@@ -195,11 +190,7 @@ pub async fn wake_next_deferred(conn: &mut PgConnection, key: &str) -> Result<()
 
 /// Locks `key`'s counter row, creating it if the monitor removed it, and returns whether
 /// `job` already holds a slot.
-async fn lock_counter(
-    tx: &mut Transaction<'_, Postgres>,
-    key: &str,
-    job: &str,
-) -> Result<bool> {
+async fn lock_counter(tx: &mut Transaction<'_, Postgres>, key: &str, job: &str) -> Result<bool> {
     let held: Option<bool> = sqlx::query_scalar(
         "SELECT job_uuids ? $2 FROM concurrency_counter WHERE concurrency_id = $1 FOR UPDATE",
     )

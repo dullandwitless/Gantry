@@ -50,9 +50,16 @@ async fn serves_metrics_and_readiness_until_shutdown() {
     IS_READY.store(false, Ordering::Relaxed);
     assert_eq!(get(&format!("http://{addr}/ready")).await.0, 500);
     IS_READY.store(true, Ordering::Relaxed);
-    assert_eq!(get(&format!("http://{addr}/ready")).await, (200, "ready".to_string()));
+    assert_eq!(
+        get(&format!("http://{addr}/ready")).await,
+        (200, "ready".to_string())
+    );
 
-    assert_eq!(get(&format!("http://{addr}/reset")).await.0, 404, "there is no reset");
+    assert_eq!(
+        get(&format!("http://{addr}/reset")).await.0,
+        404,
+        "there is no reset"
+    );
 
     tx.send(()).expect("shutdown");
     tokio::time::timeout(Duration::from_secs(5), server)

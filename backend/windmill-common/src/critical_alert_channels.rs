@@ -107,7 +107,9 @@ async fn deliver(db: DB, channels: Arc<Vec<CriticalErrorChannel>>, notification:
                 )
                 .await
                 {
-                    tracing::warn!("Critical alert not sent to Slack channel {slack_channel}: {e:#}");
+                    tracing::warn!(
+                        "Critical alert not sent to Slack channel {slack_channel}: {e:#}"
+                    );
                 }
             }
             CriticalErrorChannel::Teams { teams_channel } => {

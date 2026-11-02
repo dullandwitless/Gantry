@@ -173,7 +173,10 @@ async fn a_window_counts_jobs_started_within_it(db: Pool<Postgres>) {
     );
 
     // Both runs fill limit 2; limit 3 leaves a slot.
-    assert!(matches!(try_admit(&db, job, 2, 60).await, Admission::Deferred { .. }));
+    assert!(matches!(
+        try_admit(&db, job, 2, 60).await,
+        Admission::Deferred { .. }
+    ));
     assert_eq!(try_admit(&db, job, 3, 60).await, Admission::Admitted);
 }
 
@@ -266,11 +269,10 @@ async fn a_release_wakes_only_the_longest_parked_deferred_job(db: Pool<Postgres>
     let mut conn = db.acquire().await.expect("acquire");
     wake_next_deferred(&mut conn, KEY).await.expect("wake");
 
-    let due: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM v2_job_queue WHERE scheduled_for <= now() ORDER BY id",
-    )
-    .fetch_all(&db)
-    .await
-    .expect("read due jobs");
+    let due: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM v2_job_queue WHERE scheduled_for <= now() ORDER BY id")
+            .fetch_all(&db)
+            .await
+            .expect("read due jobs");
     assert_eq!(due, vec![parked_first]);
 }
