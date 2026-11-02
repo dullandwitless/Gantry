@@ -3,21 +3,24 @@ import { api } from '../../api/client';
 import { ForgotPasswordModal } from './ForgotPasswordModal';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
-import { ShieldCheck, KeyRound, ArrowRight, Sparkles, Layers } from 'lucide-react';
+import { ShieldCheck, ArrowRight } from 'lucide-react';
 
 export const LoginView: React.FC = () => {
-  const { login, loginDemo } = useAuth();
+  const { login } = useAuth();
   const { addToast } = useToast();
 
-  const [email, setEmail] = useState('admin@windmill.dev');
-  const [password, setPassword] = useState('changeme');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [canResetPassword, setCanResetPassword] = useState(false);
   const [isForgotOpen, setIsForgotOpen] = useState(false);
+  // The seeded admin still has its default password: offer it until it is changed.
+  const [isFirstTimeSetup, setIsFirstTimeSetup] = useState(false);
 
   useEffect(() => {
     // Password reset needs email; offer it only when the server can send one.
     api.isSmtpConfigured().then(setCanResetPassword, () => setCanResetPassword(false));
+    api.isFirstTimeSetup().then(setIsFirstTimeSetup);
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -98,36 +101,25 @@ export const LoginView: React.FC = () => {
             </button>
           </form>
 
-          {/* Quick Seeded Admin Helper */}
-          <div className="pt-3 border-t border-slate-800/80">
-            <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3 flex items-center justify-between text-xs">
-              <div>
-                <div className="text-[11px] text-slate-400">Default Seeded Admin:</div>
-                <div className="font-mono text-[11px] text-brand-400 font-semibold mt-0.5">
-                  admin@windmill.dev / changeme
+          {isFirstTimeSetup && (
+            <div className="pt-3 border-t border-slate-800/80">
+              <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3 flex items-center justify-between text-xs">
+                <div>
+                  <div className="text-[11px] text-slate-400">Default Seeded Admin:</div>
+                  <div className="font-mono text-[11px] text-brand-400 font-semibold mt-0.5">
+                    admin@windmill.dev / changeme
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  onClick={handleFillAdmin}
+                  className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold border border-slate-700 transition-colors"
+                >
+                  Autofill
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={handleFillAdmin}
-                className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold border border-slate-700 transition-colors"
-              >
-                Autofill
-              </button>
             </div>
-          </div>
-
-          {/* Demo Mode Bypass */}
-          <div className="text-center pt-1">
-            <button
-              type="button"
-              onClick={loginDemo}
-              className="text-xs text-slate-400 hover:text-slate-200 inline-flex items-center gap-1.5 transition-colors"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-brand-400" />
-              <span>Explore Clean-Room UI in Demo Mode</span>
-            </button>
-          </div>
+          )}
         </div>
 
         {isForgotOpen && (

@@ -120,15 +120,30 @@ export interface Job {
 }
 
 // App Types
+// OpenAPI `ListableApp`
 export interface ListableApp {
   path: string;
-  summary?: string;
-  created_at?: string;
-  created_by?: string;
-  edited_at?: string;
-  is_raw?: boolean;
+  summary: string;
+  version: number;
+  edited_at: string;
+  execution_mode: AppExecutionMode;
+  raw_app?: boolean;
+}
+
+export type AppExecutionMode = 'viewer' | 'publisher' | 'anonymous';
+
+// OpenAPI `AppWithLastVersion`. `value` is the app definition: `files` and `runnables` for a
+// full-code app, a component grid for a low-code one.
+export interface AppWithLastVersion {
+  path: string;
+  summary: string;
+  versions: number[];
+  created_by: string;
+  created_at: string;
+  value: unknown;
+  execution_mode: AppExecutionMode;
   custom_path?: string;
-  admit_guests?: boolean;
+  raw_app?: boolean;
 }
 
 // Resource Types

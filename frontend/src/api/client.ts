@@ -1,5 +1,5 @@
 import { 
-  Script, ScriptHistory, Draft, OpenFlow, Job, ListableApp, 
+  Script, ScriptHistory, Draft, OpenFlow, Job, ListableApp, AppWithLastVersion, 
   Resource, ResourceType, Variable, Schedule, HttpTrigger, 
   WorkspaceInfo, WorkspaceUser, Folder, WorkerPing, ConcurrencyGroup, ListedRunnable,
   DataTable, TableColumn, Migration, S3FileItem, GlobalUser, NewUser, AuditLogEntry, AuditLogFilters
@@ -28,10 +28,6 @@ class GantryApiClient {
 
   getToken(): string | null {
     return this.token;
-  }
-
-  isDemoMode(): boolean {
-    return localStorage.getItem('gantry_demo_mode') === 'true';
   }
 
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -100,14 +96,6 @@ class GantryApiClient {
   }
 
   async whoami(): Promise<UserProfile | null> {
-    if (this.isDemoMode()) {
-      return {
-        email: 'admin@windmill.dev',
-        username: 'admin',
-        name: 'Demo Admin',
-        super_admin: true,
-      };
-    }
     try {
       return await this.request<UserProfile>('/users/whoami');
     } catch {
@@ -183,9 +171,6 @@ class GantryApiClient {
 
   // Workspaces
   async listWorkspaces(): Promise<WorkspaceInfo[]> {
-    if (this.isDemoMode()) {
-      return [{ id: 'demo', name: 'Demo Workspace', owner: 'admin@windmill.dev' }];
-    }
     const list = await this.request<WorkspaceInfo[]>('/workspaces/list');
     return Array.isArray(list) ? list : [];
   }
@@ -199,44 +184,21 @@ class GantryApiClient {
 
   // Folders
   async listFolders(workspace: string): Promise<Folder[]> {
-    if (this.isDemoMode()) {
-      return [
-        { name: 'u', summary: 'Personal user scripts' },
-        { name: 'f', summary: 'Shared workflows' },
-        { name: 'integrations', summary: 'Connectors & tools' }
-      ];
-    }
     const list = await this.request<Folder[]>(`/w/${workspace}/folders/list`);
     return Array.isArray(list) ? list : [];
   }
 
   // Scripts
   async listScripts(workspace: string): Promise<ListedRunnable[]> {
-    if (this.isDemoMode()) return [];
     const list = await this.request<ListedRunnable[]>(`/w/${workspace}/scripts/list`);
     return Array.isArray(list) ? list : [];
   }
 
   async getScript(workspace: string, path: string): Promise<Script> {
-    if (this.isDemoMode()) {
-      return {
-        path,
-        summary: 'Demo Python Script',
-        language: 'python3',
-        content: `def main(name: str = "World", count: int = 3):\n    """Sample greeting script for Gantry\n    :param name: Name to greet\n    :param count: Number of repetitions\n    """\n    return {"message": f"Hello {name}!", "count": count}`,
-        args: [
-          { name: 'name', type: 'string', default: 'World', description: 'Name to greet', required: true },
-          { name: 'count', type: 'integer', default: 3, description: 'Number of repetitions', required: false }
-        ],
-        created_by: 'admin@windmill.dev',
-        edited_at: new Date().toISOString()
-      };
-    }
     return await this.request<Script>(`/w/${workspace}/scripts/get/p/${path}`);
   }
 
   async saveScript(workspace: string, script: Partial<Script>): Promise<void> {
-    if (this.isDemoMode()) return;
     await this.request(`/w/${workspace}/scripts/create`, {
       method: 'POST',
       body: JSON.stringify(script)
@@ -244,14 +206,6 @@ class GantryApiClient {
   }
 
   async runScriptTest(workspace: string, path: string, args: Record<string, any>): Promise<any> {
-    if (this.isDemoMode()) {
-      return {
-        status: 'completed',
-        duration_ms: 245,
-        result: { message: `Hello ${args.name || 'World'}!`, count: args.count || 3 },
-        logs: `[${new Date().toLocaleTimeString()}] Starting script execution...\n[${new Date().toLocaleTimeString()}] Evaluated arguments.\n[${new Date().toLocaleTimeString()}] Succeeded in 245ms.`
-      };
-    }
     return await this.request(`/w/${workspace}/jobs/run_wait_result/p/${path}`, {
       method: 'POST',
       body: JSON.stringify({ args })
@@ -259,41 +213,16 @@ class GantryApiClient {
   }
 
   async listFlows(workspace: string): Promise<ListedRunnable[]> {
-    if (this.isDemoMode()) return [];
     const list = await this.request<ListedRunnable[]>(`/w/${workspace}/flows/list`);
     return Array.isArray(list) ? list : [];
   }
 
   // Flows: path in OpenAPI is /w/{workspace}/flows/get/{path} (no p/)
   async getFlow(workspace: string, path: string): Promise<OpenFlow> {
-    if (this.isDemoMode()) {
-      return {
-        path,
-        summary: 'Demo Ingestion Pipeline',
-        value: {
-          modules: [
-            {
-              id: 'fetch_data',
-              summary: 'Fetch records from source',
-              value: { type: 'rawscript', content: 'def main():\n    return [{"id": 1, "val": "A"}, {"id": 2, "val": "B"}]', language: 'python3' }
-            },
-            {
-              id: 'process_items',
-              summary: 'Process items in loop',
-              value: { type: 'forloopflow', iterator: 'results.fetch_data' },
-              input_transforms: {
-                iterator: { type: 'javascript', value: 'results.fetch_data' }
-              }
-            }
-          ]
-        }
-      };
-    }
     return await this.request<OpenFlow>(`/w/${workspace}/flows/get/${path}`);
   }
 
   async saveFlow(workspace: string, flow: Partial<OpenFlow>): Promise<void> {
-    if (this.isDemoMode()) return;
     await this.request(`/w/${workspace}/flows/create`, {
       method: 'POST',
       body: JSON.stringify(flow)
@@ -302,24 +231,6 @@ class GantryApiClient {
 
   // Jobs & Runs: OpenAPI endpoint is GET /w/{workspace}/jobs/list
   async listJobs(workspace: string, status?: string): Promise<Job[]> {
-    if (this.isDemoMode()) {
-      return [
-        {
-          id: 'job_01j7abc123',
-          workspace,
-          path: 'f/etl/sync_customers',
-          runnable_kind: 'flow',
-          status: 'completed',
-          started_at: new Date(Date.now() - 120000).toISOString(),
-          completed_at: new Date(Date.now() - 45000).toISOString(),
-          duration_ms: 75000,
-          created_by: 'admin@windmill.dev',
-          trigger_kind: 'schedule',
-          result: { imported: 1240, status: 'ok' },
-          raw_logs: 'Sync started at 00:00:00\nConnected to PostgreSQL\n1240 records processed.\nComplete.'
-        }
-      ];
-    }
     const query = new URLSearchParams();
     if (status && status !== 'all') {
       if (status === 'running') {
@@ -337,7 +248,6 @@ class GantryApiClient {
 
   // Job Cancel: OpenAPI endpoint is POST /w/{workspace}/jobs_u/queue/cancel/{id}
   async cancelJob(workspace: string, id: string): Promise<void> {
-    if (this.isDemoMode()) return;
     await this.request(`/w/${workspace}/jobs_u/queue/cancel/${id}`, {
       method: 'POST',
       body: JSON.stringify({ reason: 'Cancelled from UI' })
@@ -346,72 +256,39 @@ class GantryApiClient {
 
   // Apps
   async listApps(workspace: string): Promise<ListableApp[]> {
-    if (this.isDemoMode()) {
-      return [
-        { path: 'f/ops/system_monitor', summary: 'System resource monitor', custom_path: 'monitor', is_raw: true, admit_guests: false }
-      ];
-    }
     const list = await this.request<ListableApp[]>(`/w/${workspace}/apps/list`);
     return Array.isArray(list) ? list : [];
   }
 
+  async getApp(workspace: string, path: string): Promise<AppWithLastVersion> {
+    return await this.request<AppWithLastVersion>(`/w/${workspace}/apps/get/p/${path}`);
+  }
+
   // Resources & Variables
   async listResources(workspace: string): Promise<Resource[]> {
-    if (this.isDemoMode()) {
-      return [
-        { path: 'u/admin/main_pg', resource_type: 'postgresql', value: { host: 'localhost', port: 5432, dbname: 'windmill' } },
-        { path: 'f/shared/s3_storage', resource_type: 's3', value: { bucket: 'gantry-data', region: 'us-east-1' } }
-      ];
-    }
     const list = await this.request<Resource[]>(`/w/${workspace}/resources/list`);
     return Array.isArray(list) ? list : [];
   }
 
   async listVariables(workspace: string): Promise<Variable[]> {
-    if (this.isDemoMode()) {
-      return [
-        { path: 'ENVIRONMENT', value: 'production', is_secret: false, description: 'Deployment stage' },
-        { path: 'STRIPE_API_KEY', value: '••••••••••••••••', is_secret: true, description: 'Payment gateway API key' }
-      ];
-    }
     const list = await this.request<Variable[]>(`/w/${workspace}/variables/list`);
     return Array.isArray(list) ? list : [];
   }
 
   // Schedules
   async listSchedules(workspace: string): Promise<Schedule[]> {
-    if (this.isDemoMode()) {
-      return [
-        { path: 'nightly_backup', schedule: '0 2 * * *', timezone: 'UTC', script_path: 'f/ops/backup_db', enabled: true },
-        { path: 'hourly_healthcheck', schedule: '0 * * * *', timezone: 'UTC', script_path: 'f/ops/ping_services', enabled: true }
-      ];
-    }
     const list = await this.request<Schedule[]>(`/w/${workspace}/schedules/list`);
     return Array.isArray(list) ? list : [];
   }
 
   // Workers: GET /workers/list returns WorkerPing[]; /workers/custom_tags is tag names only.
   async listWorkers(): Promise<WorkerPing[]> {
-    if (this.isDemoMode()) {
-      return [
-        {
-          worker: 'wk-default-demo', worker_instance: 'demo-host', last_ping: 3,
-          started_at: new Date().toISOString(), ip: '10.0.1.24', jobs_executed: 0,
-          custom_tags: ['bash', 'python3'], worker_group: 'default', wm_version: 'demo',
-        },
-      ];
-    }
     const list = await this.request<WorkerPing[]>('/workers/list');
     return Array.isArray(list) ? list : [];
   }
 
   // Concurrency groups: OpenAPI endpoint is GET /concurrency_groups/list
   async listConcurrencyGroups(workspace: string): Promise<ConcurrencyGroup[]> {
-    if (this.isDemoMode()) {
-      return [
-        { name: 'external_rate_limit', concurrency_limit: 5, current_running: 1 }
-      ];
-    }
     const list = await this.request<ConcurrencyGroup[]>('/concurrency_groups/list');
     return Array.isArray(list) ? list : [];
   }
