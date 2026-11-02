@@ -62,3 +62,32 @@ same pattern.
 
 There is no login screen; a token has to be put into `localStorage` by hand.
 `POST /api/auth/login` exists for email and password.
+
+# Second run, after 0883657
+
+Sign-in (`POST /api/auth/login`), workspace onboarding
+(`POST /api/workspaces/create`) and the list views for apps, runs, schedules,
+resources, variables and concurrency groups all reach the API and get JSON.
+The error boundary works. Remaining findings:
+
+## 7. Instance Admin crashes (blocking for that view)
+
+Opening Instance Admin shows "Application Error: Cannot read properties of
+undefined (reading 'join')". The worker list is fetched from
+`GET /api/workers/custom_tags`, which returns a list of tag names
+(`["chromium"]`), and each entry is then read as a worker with a `tags` array.
+Workers come from `GET /api/workers/list`, whose entries carry their tags as
+`custom_tags`:
+
+```
+GET /api/workers/list -> [{"worker": "wk-default-...", "worker_instance": "...",
+  "last_ping": 2, "jobs_executed": 0, "custom_tags": ["ansible", "bash", ...], ...}]
+```
+
+## 8. Studios open example items that do not exist
+
+On a fresh workspace, Scripts Studio requests
+`/api/w/main/scripts/get/p/u/admin/demo_greeter` and Flows Canvas requests
+`/api/w/main/flows/get/f/etl/customer_sync`; both 404, and Scripts Studio
+shows a "Failed to load script" error first thing. They should open empty, or
+on the workspace's first item.
