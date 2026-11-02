@@ -1,5 +1,8 @@
 # Specs for the clean-room frontend
 
+What is still missing on the backend side is listed in
+[not-implemented.md](not-implemented.md).
+
 Gantry's frontend is written from scratch, from specs in this directory. The
 rules in [PROVENANCE.md](../PROVENANCE.md) apply; this file is how to work
 within them.
