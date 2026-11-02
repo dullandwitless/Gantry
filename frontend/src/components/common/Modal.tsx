@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 
 interface Props {
@@ -7,7 +8,11 @@ interface Props {
   children: React.ReactNode;
 }
 
-/** A centred dialog closed by Escape, the close button or a click on the backdrop. */
+/**
+ * A centred dialog closed by Escape, the close button or a click on the backdrop.
+ * Rendered into `document.body`: an ancestor with a filter or transform (such as the
+ * header's backdrop blur) would otherwise become the box `position: fixed` is relative to.
+ */
 export const Modal: React.FC<Props> = ({ title, onClose, children }) => {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -17,7 +22,7 @@ export const Modal: React.FC<Props> = ({ title, onClose, children }) => {
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4"
       onMouseDown={(e) => {
@@ -43,7 +48,8 @@ export const Modal: React.FC<Props> = ({ title, onClose, children }) => {
         </div>
         <div className="p-5">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };
 
