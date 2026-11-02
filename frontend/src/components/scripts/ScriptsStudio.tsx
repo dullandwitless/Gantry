@@ -4,48 +4,72 @@ import { useToast } from '../../context/ToastContext';
 import { api } from '../../api/client';
 import { Script, ScriptLang, ScriptArg } from '../../types';
 import { Play, Save, Clock, Lock, FileCode, CheckCircle2, AlertTriangle, Terminal } from 'lucide-react';
+import { useRunnablePicker } from '../common/useRunnablePicker';
+import { RunnablePathField } from '../common/RunnablePathField';
+
+const listScripts = (workspace: string) => api.listScripts(workspace);
 
 export const ScriptsStudio: React.FC = () => {
   const { currentWorkspace } = useWorkspace();
   const { addToast } = useToast();
 
-  const [scriptPath, setScriptPath] = useState<string>('u/admin/demo_greeter');
+  const picker = useRunnablePicker(currentWorkspace, listScripts, (e) =>
+    addToast({ kind: 'error', title: 'Failed to list scripts', message: e.message }),
+  );
+  const { selection } = picker;
+
+  const [newPath, setNewPath] = useState<string>('');
   const [script, setScript] = useState<Script | null>(null);
   const [code, setCode] = useState<string>('');
   const [language, setLanguage] = useState<ScriptLang>('python3');
   const [summary, setSummary] = useState<string>('');
-  const [testArgs, setTestArgs] = useState<Record<string, any>>({ name: 'Gantry User', count: 3 });
+  const [testArgs, setTestArgs] = useState<Record<string, any>>({});
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [runResult, setRunResult] = useState<any>(null);
   const [activeRightTab, setActiveRightTab] = useState<'arguments' | 'output' | 'settings'>('arguments');
 
-  useEffect(() => {
-    if (currentWorkspace) {
-      loadScript(scriptPath);
-    }
-  }, [currentWorkspace, scriptPath]);
+  const scriptPath = selection?.kind === 'existing' ? selection.path : newPath.trim();
 
-  const loadScript = async (path: string) => {
-    try {
-      const data = await api.getScript(currentWorkspace, path);
-      setScript(data);
-      setCode(data.content);
-      setLanguage(data.language);
-      setSummary(data.summary || '');
-      // Initialize test args defaults
-      if (data.args) {
+  useEffect(() => {
+    setRunResult(null);
+    if (selection?.kind !== 'existing') {
+      setScript(null);
+      setCode('');
+      setLanguage('python3');
+      setSummary('');
+      setTestArgs({});
+      setNewPath('');
+      return;
+    }
+    let cancelled = false;
+    api.getScript(currentWorkspace, selection.path).then(
+      (data) => {
+        if (cancelled) return;
+        setScript(data);
+        setCode(data.content);
+        setLanguage(data.language);
+        setSummary(data.summary || '');
         const initialArgs: Record<string, any> = {};
-        data.args.forEach(arg => {
+        data.args?.forEach((arg) => {
           initialArgs[arg.name] = arg.default !== undefined ? arg.default : '';
         });
         setTestArgs(initialArgs);
-      }
-    } catch (e: any) {
-      addToast({ kind: 'error', title: 'Failed to load script', message: e.message });
-    }
-  };
+      },
+      (e: Error) => {
+        if (!cancelled) addToast({ kind: 'error', title: 'Failed to load script', message: e.message });
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+    // addToast is recreated on every render; reloading must depend only on what is open.
+  }, [currentWorkspace, selection]);
 
   const handleSave = async () => {
+    if (!scriptPath) {
+      addToast({ kind: 'error', title: 'Path required', message: 'Name the script before deploying it.' });
+      return;
+    }
     try {
       await api.saveScript(currentWorkspace, {
         path: scriptPath,
@@ -54,16 +78,18 @@ export const ScriptsStudio: React.FC = () => {
         summary,
       });
       addToast({ kind: 'success', title: 'Script deployed', message: `Saved ${scriptPath}` });
+      await picker.refresh(scriptPath);
     } catch (e: any) {
       addToast({ kind: 'error', title: 'Deploy failed', message: e.message });
     }
   };
 
   const handleRunTest = async () => {
+    if (selection?.kind !== 'existing') return;
     setIsRunning(true);
     setActiveRightTab('output');
     try {
-      const res = await api.runScriptTest(currentWorkspace, scriptPath, testArgs);
+      const res = await api.runScriptTest(currentWorkspace, selection.path, testArgs);
       setRunResult(res);
       addToast({ kind: 'success', title: 'Execution completed', message: `Finished in ${res.duration_ms || 240}ms` });
     } catch (e: any) {
@@ -80,11 +106,13 @@ export const ScriptsStudio: React.FC = () => {
       <div className="h-12 border-b border-slate-800 bg-slate-900/40 px-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <FileCode className="w-4 h-4 text-brand-500" />
-          <input
-            type="text"
-            value={scriptPath}
-            onChange={(e) => setScriptPath(e.target.value)}
-            className="bg-slate-800/80 border border-slate-700/60 rounded px-2.5 py-1 text-xs font-mono text-slate-200 focus:outline-none focus:border-brand-500 w-64"
+          <RunnablePathField
+            noun="script"
+            items={picker.items}
+            selection={selection}
+            onSelect={picker.select}
+            newPath={newPath}
+            onNewPathChange={setNewPath}
           />
           <select
             value={language}
@@ -105,7 +133,8 @@ export const ScriptsStudio: React.FC = () => {
         <div className="flex items-center gap-2">
           <button
             onClick={handleRunTest}
-            disabled={isRunning}
+            disabled={isRunning || selection?.kind !== 'existing'}
+            title={selection?.kind === 'existing' ? undefined : 'Deploy the script before running it'}
             className="flex items-center gap-1.5 bg-brand-600 hover:bg-brand-500 disabled:opacity-50 text-slate-950 font-semibold px-3 py-1.5 rounded-lg text-xs shadow transition-all"
           >
             <Play className="w-3.5 h-3.5 fill-current" />

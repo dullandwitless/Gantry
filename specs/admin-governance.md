@@ -4,7 +4,8 @@ Author: cleanroom agent
 Date: 2026-11-02
 Sources:
 - `backend/windmill-api/openapi.yaml` (tags: `user`, `group`, `granular_acl`, `token`, `oauth`, `admin`, `setting`, `settings`, `config`, `worker`, `concurrencyGroups`, `volume`, `health`)
-- Schemas: `User`, `EditWorkspaceUser`, `GlobalUserInfo`, `Worker`, `ConcurrencyGroup`
+- Schemas: `User`, `EditWorkspaceUser`, `GlobalUserInfo`, `WorkerPing`, `ConcurrencyGroup`
+- `GET /api/workers/list` and `GET /api/workers/custom_tags` on a running Gantry instance (`docs/issues/2026-11-02-frontend-live-run.md`, finding 7)
 - `specs/not-implemented.md` (Notes on user creation stubs, email stubs, and SSO/SAML/SCIM enterprise stand-ins)
 - Windmill Public Documentation (`https://windmill.dev/docs/workspace_management`): Workspaces, members, groups, granular ACLs, API tokens, workers, concurrency limits, settings
 Attestation: I have not read Windmill's frontend source or proprietary code.
@@ -37,8 +38,21 @@ Administration and Governance encompasses workspace-level membership and access 
 
 ### 2.3 Worker Pool & Infrastructure Oversight
 - **Worker Node Monitoring**:
-  - Live table of connected workers: IP address, hostname, OS, memory, CPU load, active job count, and worker tags (`/workers/*`, `/w/{workspace}/workers/*`).
-  - Identify stale or disconnected worker daemons.
+  - Workers come from `GET /workers/list`, an array of `WorkerPing`. The default
+    returns workers that pinged in the last 5 minutes; `ping_since` (seconds)
+    widens or narrows that window. One card per entry, keyed by `worker`:
+    - `worker` (name) and `worker_group`; `ip`; `wm_version`.
+    - Tags from `custom_tags`, which may be absent or null (show "none").
+    - `jobs_executed`; `last_job_id` when the caller may see it.
+    - Last ping: `last_ping`, seconds since the worker's last ping (may be
+      null). A worker is shown as stale once that exceeds 60 seconds, and as
+      draining when `draining` is true.
+    - Memory: `memory_usage` of `memory`, both in bytes, when present.
+    - Occupancy: `occupancy_rate_15s`/`_5m`/`_30m`, fractions 0–1, when present.
+  - `GET /workers/custom_tags` returns tag names only (`string[]`), not workers;
+    it is for tag pickers, never for the worker list.
+  - An empty list is shown as "no worker has pinged in the last 5 minutes", and
+    a failed request as an error, never as sample workers.
 - **Concurrency Groups**:
   - Configure named concurrency queues with maximum parallel job limits (e.g. limiting third-party API calls or batch jobs to 5 concurrent executions) (`/w/{workspace}/concurrencyGroups/*`).
 - **Worker Volumes**:
@@ -84,6 +98,7 @@ Administration and Governance encompasses workspace-level membership and access 
 | List groups | `GET` | `/w/{workspace}/groups/list` | Returns workspace groups |
 | Add granular ACL | `POST` | `/w/{workspace}/granular_acl/add` | Grants path-specific permission |
 | Token scopes | `GET` | `/tokens/list/scopes` | Returns available permission scopes |
-| List workers | `GET` | `/workers/custom_tags` | Returns active worker tags and nodes |
+| List workers | `GET` | `/workers/list` | `WorkerPing[]`; tags in `custom_tags` |
+| List worker tags | `GET` | `/workers/custom_tags` | `string[]` of tag names |
 | List concurrency groups | `GET` | `/concurrency_groups/list` | Returns concurrency throttle limits |
 | Health check | `GET` | `/health/status` | Returns backend health status |

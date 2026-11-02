@@ -6,6 +6,7 @@ Sources:
 - `openflow.openapi.yaml` (Complete Flow Specification: `OpenFlow`, `FlowValue`, `FlowModule`, `FlowModuleValue`, `BranchOne`, `BranchAll`, `ForloopFlow`, `WhileloopFlow`, `AiAgent`, `AiDecision`, `Identity`, `InputTransform`, `Retry`, `StopAfterIf`)
 - `backend/windmill-api/openapi.yaml` (tags: `flow`, `flow_conversations`, `input`, `job`)
 - Windmill Public Documentation (`https://windmill.dev/docs/flows`): Visual flow builder, branching, loops, error handlers, subflows, approvals and resume tokens
+- `GET /api/w/{workspace}/flows/get/f/etl/customer_sync` returning 404 on a fresh Gantry workspace (`docs/issues/2026-11-02-frontend-live-run.md`, finding 8)
 Attestation: I have not read Windmill's frontend source or proprietary code.
 
 ---
@@ -17,6 +18,18 @@ Flows Studio is the visual workflow orchestration interface for composing multi-
 ---
 
 ## 2. Core User Capabilities
+
+### 2.0 Opening the studio
+- On entry the studio lists the workspace's deployed flows (`GET
+  /w/{workspace}/flows/list`, whose default order is starred first, then newest) and opens
+  the first one. With none, it opens a blank, unsaved flow whose path the
+  user types; nothing is fetched for it.
+- The studio never opens a hard-coded example path.
+- A picker switches between existing flows and "New flow". Typing in the
+  path field of a new flow fetches nothing; an existing flow is loaded
+  only when picked.
+- A failure to list or load is shown as an error, not replaced with sample
+  content.
 
 ### 2.1 Workflow Visual Canvas
 - Interactive canvas rendering steps in topological execution order:
@@ -89,6 +102,7 @@ Each step module declares required inputs based on its script/flow signature. Th
 
 | Action | HTTP Method | Endpoint Path | Notes |
 | :--- | :--- | :--- | :--- |
+| List flows | `GET` | `/w/{workspace}/flows/list` | Deployed flows, starred then newest; the studio opens the first |
 | Get flow | `GET` | `/w/{workspace}/flows/get/{path}` | Retrieves `OpenFlow` JSON structure |
 | Create flow | `POST` | `/w/{workspace}/flows/create` | `{ path, value: FlowValue, summary }` |
 | Update flow | `POST` | `/w/{workspace}/flows/update/{path}` | Updates flow definition |

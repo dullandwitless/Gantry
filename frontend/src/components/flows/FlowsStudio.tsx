@@ -2,40 +2,55 @@ import React, { useState, useEffect } from 'react';
 import { useWorkspace } from '../../context/WorkspaceContext';
 import { useToast } from '../../context/ToastContext';
 import { api } from '../../api/client';
-import { OpenFlow, FlowModule, FlowTransform } from '../../types';
+import { FlowModule } from '../../types';
 import { 
   GitFork, Play, Save, Plus, Trash2, ArrowDown, 
   Code, GitBranch, Repeat, Bot, CheckSquare, Layers 
 } from 'lucide-react';
+import { useRunnablePicker } from '../common/useRunnablePicker';
+import { RunnablePathField } from '../common/RunnablePathField';
+
+const listFlows = (workspace: string) => api.listFlows(workspace);
 
 export const FlowsStudio: React.FC = () => {
   const { currentWorkspace } = useWorkspace();
   const { addToast } = useToast();
 
-  const [flowPath, setFlowPath] = useState<string>('f/etl/customer_sync');
-  const [flow, setFlow] = useState<OpenFlow | null>(null);
+  const picker = useRunnablePicker(currentWorkspace, listFlows, (e) =>
+    addToast({ kind: 'error', title: 'Failed to list flows', message: e.message }),
+  );
+  const { selection } = picker;
+
+  const [newPath, setNewPath] = useState<string>('');
   const [modules, setModules] = useState<FlowModule[]>([]);
   const [selectedModuleId, setSelectedModuleId] = useState<string | null>(null);
-  const [isSimulating, setIsSimulating] = useState<boolean>(false);
+
+  const flowPath = selection?.kind === 'existing' ? selection.path : newPath.trim();
 
   useEffect(() => {
-    if (currentWorkspace) {
-      loadFlow(flowPath);
+    setSelectedModuleId(null);
+    if (selection?.kind !== 'existing') {
+      setModules([]);
+      setNewPath('');
+      return;
     }
-  }, [currentWorkspace, flowPath]);
-
-  const loadFlow = async (path: string) => {
-    try {
-      const data = await api.getFlow(currentWorkspace, path);
-      setFlow(data);
-      setModules(data.value?.modules || []);
-      if (data.value?.modules?.length > 0) {
-        setSelectedModuleId(data.value.modules[0].id);
-      }
-    } catch (e: any) {
-      addToast({ kind: 'error', title: 'Failed to load flow', message: e.message });
-    }
-  };
+    let cancelled = false;
+    api.getFlow(currentWorkspace, selection.path).then(
+      (data) => {
+        if (cancelled) return;
+        const loaded = data.value?.modules ?? [];
+        setModules(loaded);
+        setSelectedModuleId(loaded[0]?.id ?? null);
+      },
+      (e: Error) => {
+        if (!cancelled) addToast({ kind: 'error', title: 'Failed to load flow', message: e.message });
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+    // addToast is recreated on every render; reloading must depend only on what is open.
+  }, [currentWorkspace, selection]);
 
   const handleAddModule = (type: FlowModule['value']['type']) => {
     const newId = `step_${modules.length + 1}`;
@@ -44,7 +59,7 @@ export const FlowsStudio: React.FC = () => {
       summary: `New ${type} step`,
       value: {
         type,
-        path: type === 'script' ? 'u/admin/sample_script' : undefined,
+        path: type === 'script' ? '' : undefined,
         language: 'python3',
       },
     };
@@ -61,12 +76,17 @@ export const FlowsStudio: React.FC = () => {
   };
 
   const handleSave = async () => {
+    if (!flowPath) {
+      addToast({ kind: 'error', title: 'Path required', message: 'Name the flow before publishing it.' });
+      return;
+    }
     try {
       await api.saveFlow(currentWorkspace, {
         path: flowPath,
         value: { modules },
       });
       addToast({ kind: 'success', title: 'Flow saved', message: `Saved ${flowPath}` });
+      await picker.refresh(flowPath);
     } catch (e: any) {
       addToast({ kind: 'error', title: 'Save failed', message: e.message });
     }
@@ -100,11 +120,13 @@ export const FlowsStudio: React.FC = () => {
       <div className="h-12 border-b border-slate-800 bg-slate-900/40 px-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <GitFork className="w-4 h-4 text-brand-500" />
-          <input
-            type="text"
-            value={flowPath}
-            onChange={(e) => setFlowPath(e.target.value)}
-            className="bg-slate-800/80 border border-slate-700/60 rounded px-2.5 py-1 text-xs font-mono text-slate-200 focus:outline-none focus:border-brand-500 w-64"
+          <RunnablePathField
+            noun="flow"
+            items={picker.items}
+            selection={selection}
+            onSelect={picker.select}
+            newPath={newPath}
+            onNewPathChange={setNewPath}
           />
         </div>
 

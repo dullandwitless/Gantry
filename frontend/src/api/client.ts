@@ -1,7 +1,7 @@
 import { 
   Script, ScriptHistory, Draft, OpenFlow, Job, ListableApp, 
   Resource, ResourceType, Variable, Schedule, HttpTrigger, 
-  WorkspaceInfo, WorkspaceUser, Folder, WorkerNode, ConcurrencyGroup,
+  WorkspaceInfo, WorkspaceUser, Folder, WorkerPing, ConcurrencyGroup, ListedRunnable,
   DataTable, TableColumn, Migration, S3FileItem
 } from '../types';
 
@@ -153,6 +153,12 @@ class GantryApiClient {
   }
 
   // Scripts
+  async listScripts(workspace: string): Promise<ListedRunnable[]> {
+    if (this.isDemoMode()) return [];
+    const list = await this.request<ListedRunnable[]>(`/w/${workspace}/scripts/list`);
+    return Array.isArray(list) ? list : [];
+  }
+
   async getScript(workspace: string, path: string): Promise<Script> {
     if (this.isDemoMode()) {
       return {
@@ -192,6 +198,12 @@ class GantryApiClient {
       method: 'POST',
       body: JSON.stringify({ args })
     });
+  }
+
+  async listFlows(workspace: string): Promise<ListedRunnable[]> {
+    if (this.isDemoMode()) return [];
+    const list = await this.request<ListedRunnable[]>(`/w/${workspace}/flows/list`);
+    return Array.isArray(list) ? list : [];
   }
 
   // Flows: path in OpenAPI is /w/{workspace}/flows/get/{path} (no p/)
@@ -320,18 +332,22 @@ class GantryApiClient {
     return Array.isArray(list) ? list : [];
   }
 
-  // Workers & Admin: OpenAPI endpoint is GET /concurrency_groups/list
-  async listWorkers(): Promise<WorkerNode[]> {
+  // Workers: GET /workers/list returns WorkerPing[]; /workers/custom_tags is tag names only.
+  async listWorkers(): Promise<WorkerPing[]> {
     if (this.isDemoMode()) {
       return [
-        { id: 'worker-01', name: 'gantry-worker-prod-1', ip: '10.0.1.24', status: 'active', tags: ['default', 'gpu'], active_jobs: 2, cpu_percent: 24, memory_gb: 16 },
-        { id: 'worker-02', name: 'gantry-worker-prod-2', ip: '10.0.1.25', status: 'idle', tags: ['default'], active_jobs: 0, cpu_percent: 4, memory_gb: 16 }
+        {
+          worker: 'wk-default-demo', worker_instance: 'demo-host', last_ping: 3,
+          started_at: new Date().toISOString(), ip: '10.0.1.24', jobs_executed: 0,
+          custom_tags: ['bash', 'python3'], worker_group: 'default', wm_version: 'demo',
+        },
       ];
     }
-    const list = await this.request<WorkerNode[]>('/workers/custom_tags');
+    const list = await this.request<WorkerPing[]>('/workers/list');
     return Array.isArray(list) ? list : [];
   }
 
+  // Concurrency groups: OpenAPI endpoint is GET /concurrency_groups/list
   async listConcurrencyGroups(workspace: string): Promise<ConcurrencyGroup[]> {
     if (this.isDemoMode()) {
       return [

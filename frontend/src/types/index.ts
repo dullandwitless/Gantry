@@ -223,15 +223,41 @@ export interface Folder {
   owners?: string[];
 }
 
-export interface WorkerNode {
-  id: string;
-  name: string;
+/** An entry of `GET /workers/list` (OpenAPI schema `WorkerPing`). */
+export interface WorkerPing {
+  worker: string;
+  worker_instance: string;
+  /** Seconds since the worker last pinged. */
+  last_ping?: number | null;
+  started_at: string;
   ip: string;
-  status: 'active' | 'idle' | 'offline';
-  tags: string[];
-  active_jobs: number;
-  cpu_percent?: number;
-  memory_gb?: number;
+  jobs_executed: number;
+  last_job_id?: string | null;
+  last_job_workspace_id?: string | null;
+  custom_tags?: string[] | null;
+  worker_group: string;
+  wm_version: string;
+  /** Fractions from 0 to 1. */
+  occupancy_rate?: number;
+  occupancy_rate_15s?: number;
+  occupancy_rate_5m?: number;
+  occupancy_rate_30m?: number;
+  /** Bytes. */
+  memory?: number;
+  /** Bytes. */
+  memory_usage?: number;
+  /** Bytes. */
+  wm_memory_usage?: number;
+  vcpus?: number;
+  job_isolation?: string;
+  native_mode?: boolean;
+  draining?: boolean;
+}
+
+/** The fields the studios need from `GET /w/{workspace}/scripts/list` and `/flows/list`. */
+export interface ListedRunnable {
+  path: string;
+  summary?: string;
 }
 
 export interface ConcurrencyGroup {

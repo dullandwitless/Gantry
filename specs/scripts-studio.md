@@ -6,6 +6,7 @@ Sources:
 - `backend/windmill-api/openapi.yaml` (tags: `script`, `draft`, `helpers`, `npm_proxy`, `workspace_dependencies`, `dbt`, `job`)
 - Schemas: `Script`, `NewScript`, `ScriptHistory`, `ScriptArgs`, `ScriptLang`, `Draft`
 - Windmill Public Documentation (`https://windmill.dev/docs/scripts`): Languages (Python, TypeScript, Go, Bash, SQL, Rust, PHP), Parameter schema generation, Drafts, Script Locks, Test Runner, Hub
+- `GET /api/w/{workspace}/scripts/get/p/u/admin/demo_greeter` returning 404 on a fresh Gantry workspace (`docs/issues/2026-11-02-frontend-live-run.md`, finding 8)
 Attestation: I have not read Windmill's frontend source or proprietary code.
 
 ---
@@ -17,6 +18,18 @@ Scripts Studio is the core development environment within Gantry for creating, t
 ---
 
 ## 2. Core User Capabilities
+
+### 2.0 Opening the studio
+- On entry the studio lists the workspace's deployed scripts (`GET
+  /w/{workspace}/scripts/list`, whose default order is starred first, then newest) and opens
+  the first one. With none, it opens a blank, unsaved script whose path the
+  user types; nothing is fetched for it.
+- The studio never opens a hard-coded example path.
+- A picker switches between existing scripts and "New script". Typing in the
+  path field of a new script fetches nothing; an existing script is loaded
+  only when picked.
+- A failure to list or load is shown as an error, not replaced with sample
+  content.
 
 ### 2.1 Multi-Language Code Editing
 - Users write code in any supported runtime:
@@ -86,6 +99,7 @@ Scripts Studio is the core development environment within Gantry for creating, t
 
 | Action | HTTP Method | Endpoint Path | Payload / Notes |
 | :--- | :--- | :--- | :--- |
+| List scripts | `GET` | `/w/{workspace}/scripts/list` | Deployed scripts, starred then newest; the studio opens the first |
 | Get script | `GET` | `/w/{workspace}/scripts/get/p/{path}` | Returns script source, `args`, `language`, `summary` |
 | Create script | `POST` | `/w/{workspace}/scripts/create` | `{ path, content, language, summary, is_template }` |
 | Update/Deploy | `POST` | `/w/{workspace}/scripts/update/{path}` | `{ content, summary, lock }` |

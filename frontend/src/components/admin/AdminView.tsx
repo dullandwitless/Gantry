@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useWorkspace } from '../../context/WorkspaceContext';
 import { useToast } from '../../context/ToastContext';
 import { api } from '../../api/client';
-import { WorkerNode, ConcurrencyGroup } from '../../types';
+import { WorkerPing, ConcurrencyGroup } from '../../types';
 import { Shield, Users, Cpu, Key, Activity, Plus, CheckCircle2, Server } from 'lucide-react';
 import { CleanRoomStubNotice } from '../common/CleanRoomStubNotice';
 
@@ -11,7 +11,7 @@ export const AdminView: React.FC = () => {
   const { addToast } = useToast();
 
   const [activeTab, setActiveTab] = useState<'workers' | 'members' | 'concurrency' | 'health'>('workers');
-  const [workers, setWorkers] = useState<WorkerNode[]>([]);
+  const [workers, setWorkers] = useState<WorkerPing[] | null>(null);
   const [concurrency, setConcurrency] = useState<ConcurrencyGroup[]>([]);
 
   useEffect(() => {
@@ -20,17 +20,15 @@ export const AdminView: React.FC = () => {
     }
   }, [currentWorkspace]);
 
-  const loadData = async () => {
-    try {
-      const [workerList, concList] = await Promise.all([
-        api.listWorkers(),
-        api.listConcurrencyGroups(currentWorkspace)
-      ]);
-      setWorkers(workerList);
-      setConcurrency(concList);
-    } catch (e: any) {
-      addToast({ kind: 'error', title: 'Failed to load admin data', message: e.message });
-    }
+  const loadData = () => {
+    // Load independently so one failing endpoint does not hide the other's data.
+    api.listWorkers().then(setWorkers, (e: Error) => {
+      setWorkers([]);
+      addToast({ kind: 'error', title: 'Failed to load workers', message: e.message });
+    });
+    api.listConcurrencyGroups(currentWorkspace).then(setConcurrency, (e: Error) =>
+      addToast({ kind: 'error', title: 'Failed to load concurrency groups', message: e.message }),
+    );
   };
 
   return (
@@ -90,30 +88,17 @@ export const AdminView: React.FC = () => {
       {activeTab === 'workers' && (
         <div className="space-y-4">
           <h2 className="text-sm font-semibold text-slate-200">Registered Worker Nodes</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {workers.map((w) => (
-              <div key={w.id} className="p-4 rounded-xl border border-slate-800 bg-slate-900/40 space-y-3 font-mono text-xs">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Server className="w-4 h-4 text-brand-400" />
-                    <span className="font-bold text-slate-200">{w.name}</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-800 text-[10px] uppercase font-sans font-semibold">
-                    {w.status}
-                  </span>
-                </div>
-                <div className="text-slate-400 text-[11px] space-y-1">
-                  <div>IP Address: {w.ip}</div>
-                  <div>Tags: {w.tags.join(', ')}</div>
-                  <div>Active Executions: {w.active_jobs}</div>
-                </div>
-                <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400 font-sans">
-                  <span>CPU: {w.cpu_percent}%</span>
-                  <span>Memory: {w.memory_gb} GB</span>
-                </div>
-              </div>
-            ))}
-          </div>
+          {workers === null ? (
+            <div className="text-xs text-slate-500">Loading workers…</div>
+          ) : workers.length === 0 ? (
+            <div className="text-xs text-slate-500 italic">No worker has pinged in the last 5 minutes.</div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {workers.map((w) => (
+                <WorkerCard key={w.worker} worker={w} />
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -192,6 +177,83 @@ export const AdminView: React.FC = () => {
           </div>
         </div>
       )}
+    </div>
+  );
+};
+
+/** Seconds without a ping after which a worker is shown as stale. */
+const STALE_AFTER_SECONDS = 60;
+
+type WorkerState = 'alive' | 'stale' | 'draining';
+
+const workerState = (w: WorkerPing): WorkerState => {
+  if (w.draining) return 'draining';
+  if (w.last_ping == null || w.last_ping > STALE_AFTER_SECONDS) return 'stale';
+  return 'alive';
+};
+
+const stateBadgeClass: Record<WorkerState, string> = {
+  alive: 'bg-emerald-950 text-emerald-400 border-emerald-800',
+  stale: 'bg-rose-950 text-rose-400 border-rose-800',
+  draining: 'bg-amber-950 text-amber-400 border-amber-800',
+};
+
+const formatBytes = (bytes: number): string => {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+};
+
+const formatPercent = (fraction: number | undefined): string =>
+  fraction === undefined ? '–' : `${Math.round(fraction * 100)}%`;
+
+const WorkerCard: React.FC<{ worker: WorkerPing }> = ({ worker: w }) => {
+  const state = workerState(w);
+  const tags = w.custom_tags?.length ? w.custom_tags.join(', ') : 'none';
+  const memory =
+    w.memory_usage != null && w.memory != null
+      ? `${formatBytes(w.memory_usage)} / ${formatBytes(w.memory)}`
+      : w.memory != null
+        ? formatBytes(w.memory)
+        : null;
+  const hasOccupancy =
+    w.occupancy_rate_15s !== undefined || w.occupancy_rate_5m !== undefined || w.occupancy_rate_30m !== undefined;
+
+  return (
+    <div className="p-4 rounded-xl border border-slate-800 bg-slate-900/40 space-y-3 font-mono text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <Server className="w-4 h-4 shrink-0 text-brand-400" />
+          <span className="font-bold text-slate-200 truncate" title={w.worker}>{w.worker}</span>
+        </div>
+        <span className={`px-2 py-0.5 rounded-full border text-[10px] uppercase font-sans font-semibold ${stateBadgeClass[state]}`}>
+          {state}
+        </span>
+      </div>
+      <div className="text-slate-400 text-[11px] space-y-1">
+        <div>Group: {w.worker_group}</div>
+        <div>IP address: {w.ip}</div>
+        <div>Tags: {tags}</div>
+        <div>Jobs executed: {w.jobs_executed}</div>
+        <div>Last ping: {w.last_ping == null ? 'unknown' : `${w.last_ping}s ago`}</div>
+      </div>
+      {(memory !== null || hasOccupancy) && (
+        <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400 font-sans">
+          {memory !== null && <span>Memory: {memory}</span>}
+          {hasOccupancy && (
+            <span title="Occupancy over the last 15 seconds / 5 minutes / 30 minutes">
+              Occupancy: {formatPercent(w.occupancy_rate_15s)} / {formatPercent(w.occupancy_rate_5m)} /{' '}
+              {formatPercent(w.occupancy_rate_30m)}
+            </span>
+          )}
+        </div>
+      )}
+      <div className="text-[10px] text-slate-500">{w.wm_version}</div>
     </div>
   );
 };
