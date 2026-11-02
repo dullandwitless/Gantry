@@ -18,6 +18,8 @@ mcp = ["windmill-test-utils/mcp", "dep:rmcp"]
 run_inline = ["dep:windmill-worker", "windmill-test-utils/run_inline", "windmill-test-utils/duckdb"]
 postgres_trigger = ["windmill-test-utils/postgres_trigger"]
 http_trigger = ["windmill-test-utils/http_trigger"]
+# Every feature that gates a sqlx query, so scripts/prepare-sqlx.sh caches them all.
+all_sqlx_features = ["deno_core", "mcp", "postgres_trigger", "http_trigger"]
 
 [dependencies]
 windmill-test-utils.workspace = true
