@@ -28,12 +28,13 @@ reason). It names features, not how upstream builds them.
   development: [identity-aware-proxy.md](identity-aware-proxy.md).
 - **Service accounts**: creation and impersonation
   ([service-accounts.md](service-accounts.md)); no UI yet.
+- **Custom workspace and instance roles**: [custom-roles.md](custom-roles.md).
 
 ## Identity and access
 
 - SSO login with SAML or OAuth providers (Gantry signs in through Identity-Aware Proxy
   instead); SCIM provisioning.
-- Custom workspace and instance roles; a UI for service accounts.
+- A UI for service accounts and for roles.
 - Workload identity through Gantry's OIDC provider (AWS roles, Azure, Anthropic).
 - Data table roles, ACLs, permissions and replay.
 

@@ -1,9 +1,9 @@
 //! Workspace roles: what a non-admin member may author, manage and see.
 //!
 //! `developer` and `operator` are the default roles, and a workspace may override any role's
-//! capabilities in `workspace_settings.role_overrides`. Custom instance roles (the
-//! [`WORKSPACE_ROLES_SETTING`] global setting) and workspace-only roles are not enabled in this
-//! build: see [`custom_roles_built`] and [`custom_roles_enabled`].
+//! capabilities in `workspace_settings.role_overrides`. Superadmins may replace them with custom
+//! instance roles (the [`WORKSPACE_ROLES_SETTING`] global setting), and a workspace may add
+//! workspace-only roles by naming new roles in its overrides (specs/custom-roles.md).
 //! Workspace admin is not a role: it is the `is_admin` flag on top of whichever role a member has,
 //! and holds every capability. See `docs/workspace-roles.md`.
 //!
@@ -351,20 +351,6 @@ pub struct EffectiveRole {
     pub overridden: bool,
 }
 
-/// Whether stored instance roles and workspace-only roles apply: never in this build, which has
-/// `developer` and `operator`, which a workspace may still override.
-fn custom_roles_built() -> bool {
-    false
-}
-
-/// Whether instance roles and workspace-only roles may be changed: never in this build. It does
-/// not read `LICENSE_KEY_VALID`, which is always `true` here.
-pub fn custom_roles_enabled() -> bool {
-    {
-        false
-    }
-}
-
 pub fn default_instance_roles() -> Vec<RoleDefinition> {
     vec![
         RoleDefinition {
@@ -442,58 +428,32 @@ pub fn effective_roles(
             overridden: ovr.is_some(),
         });
     }
-    if custom_roles_built() {
-        let mut extra: Vec<_> = overrides
-            .iter()
-            .filter(|(n, _)| !instance.iter().any(|d| &d.name == *n))
-            .collect();
-        extra.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, o) in extra {
-            let caps = RoleCapabilities::resolve(name, &[&o.capabilities]);
-            out.push(EffectiveRole {
-                name: name.clone(),
-                label: o.label.clone().unwrap_or_else(|| name.clone()),
-                capabilities: caps,
-                source: RoleSource::Workspace,
-                overridden: true,
-            });
-        }
+    let mut extra: Vec<_> = overrides
+        .iter()
+        .filter(|(n, _)| !instance.iter().any(|d| &d.name == *n))
+        .collect();
+    extra.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, o) in extra {
+        let caps = RoleCapabilities::resolve(name, &[&o.capabilities]);
+        out.push(EffectiveRole {
+            name: name.clone(),
+            label: o.label.clone().unwrap_or_else(|| name.clone()),
+            capabilities: caps,
+            source: RoleSource::Workspace,
+            overridden: true,
+        });
     }
     Ok(out)
 }
 
-/// Validates a workspace's `role_overrides` against the instance roles.
+/// Validates a workspace's `role_overrides` against the instance roles. A name the instance does
+/// not define adds a workspace-only role (specs/custom-roles.md).
 pub fn validate_overrides(instance: &[RoleDefinition], overrides: &RoleOverrides) -> Result<()> {
     for name in overrides.keys() {
         validate_role_name(name)?;
-        if !custom_roles_built() && !instance.iter().any(|d| &d.name == name) {
-            return Err(Error::BadRequest(format!(
-                "role `{name}` is not defined: adding workspace roles is not supported in Gantry"
-            )));
-        }
     }
     for r in effective_roles(instance, overrides)? {
         r.capabilities.validate(&r.name)?;
-    }
-    Ok(())
-}
-
-/// Refuses, while [`custom_roles_enabled`] is false, a `role_overrides` write that adds, edits or
-/// relabels a workspace-only role. Removing one, and overriding instance roles, stay allowed.
-pub fn check_frozen_overrides(
-    instance: &[RoleDefinition],
-    previous: &RoleOverrides,
-    next: &RoleOverrides,
-) -> Result<()> {
-    if custom_roles_enabled() {
-        return Ok(());
-    }
-    for (name, o) in next {
-        if !instance.iter().any(|d| &d.name == name) && previous.get(name) != Some(o) {
-            return Err(Error::BadRequest(format!(
-                "changing workspace role `{name}` is not supported in Gantry"
-            )));
-        }
     }
     Ok(())
 }
@@ -536,8 +496,8 @@ lazy_static::lazy_static! {
 
 const ROLE_CACHE_TTL_SECS: i64 = 60;
 
-/// The instance's role list. This build, like an instance that never configured one, has the
-/// default roles. Cached 60s, dropped on every replica when the setting changes.
+/// The instance's role list: the stored `workspace_roles` setting, or the default roles when there
+/// is none. Cached 60s, dropped on every replica when the setting changes.
 pub async fn instance_roles(db: &DB) -> Result<Arc<Vec<RoleDefinition>>> {
     if let Some(roles) = cached_instance_roles() {
         return Ok(roles);
@@ -558,22 +518,18 @@ async fn instance_roles_on(conn: &mut sqlx::PgConnection) -> Result<Arc<Vec<Role
     if let Some(roles) = cached_instance_roles() {
         return Ok(roles);
     }
-    let roles = if custom_roles_built() {
-        let stored = sqlx::query_scalar!(
-            "SELECT value FROM global_settings WHERE name = $1",
-            WORKSPACE_ROLES_SETTING
-        )
-        .fetch_optional(&mut *conn)
-        .await?;
-        match stored {
-            Some(v) => parse_instance_roles(&v).unwrap_or_else(|e| {
-                tracing::error!("ignoring invalid {WORKSPACE_ROLES_SETTING} setting: {e:#}");
-                default_instance_roles()
-            }),
-            None => default_instance_roles(),
-        }
-    } else {
-        default_instance_roles()
+    let stored = sqlx::query_scalar!(
+        "SELECT value FROM global_settings WHERE name = $1",
+        WORKSPACE_ROLES_SETTING
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let roles = match stored {
+        Some(v) => parse_instance_roles(&v).unwrap_or_else(|e| {
+            tracing::error!("ignoring invalid {WORKSPACE_ROLES_SETTING} setting: {e:#}");
+            default_instance_roles()
+        }),
+        None => default_instance_roles(),
     };
     let roles = Arc::new(roles);
     INSTANCE_ROLES.insert(
@@ -884,13 +840,6 @@ pub async fn validate_instance_roles_write(
         None | Some(serde_json::Value::Null) => default_instance_roles(),
         Some(v) => parse_instance_roles(v)?,
     };
-    // Resetting stays open so a downgraded instance can always drop the setting.
-    if !custom_roles_enabled() && *current != next && next != default_instance_roles() {
-        return Err(Error::BadRequest(
-            "changing workspace roles is not supported in Gantry"
-                .to_string(),
-        ));
-    }
     for removed in current
         .iter()
         .filter(|r| !next.iter().any(|n| n.name == r.name))
@@ -1009,6 +958,47 @@ pub const AUTHOR_SEAT_SQL: &str = "t.is_admin OR COALESCE(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workspace_may_add_roles_of_its_own() {
+        let overrides: RoleOverrides = serde_json::from_value(serde_json::json!({
+            "reviewer": { "label": "Reviewer", "capabilities": { "manage_schedules": true } },
+            "operator": { "capabilities": { "apps": "compose" } }
+        }))
+        .unwrap();
+        let instance = default_instance_roles();
+        validate_overrides(&instance, &overrides).unwrap();
+
+        let roles = effective_roles(&instance, &overrides).unwrap();
+        let names: Vec<_> = roles.iter().map(|r| (r.name.as_str(), r.source)).collect();
+        assert_eq!(
+            names,
+            [
+                ("developer", RoleSource::Instance),
+                ("operator", RoleSource::Instance),
+                ("reviewer", RoleSource::Workspace),
+            ]
+        );
+        let reviewer = &roles[2];
+        assert_eq!(reviewer.label, "Reviewer");
+        // Unset capabilities come from the operator baseline.
+        let mut expected = RoleCapabilities::base_for("reviewer");
+        expected.manage_schedules = true;
+        expected.fork = !expected.is_restricted();
+        assert_eq!(reviewer.capabilities, expected);
+    }
+
+    #[test]
+    fn workspace_roles_follow_the_same_rules_as_instance_roles() {
+        let bad_name: RoleOverrides =
+            serde_json::from_value(serde_json::json!({ "Not A Slug": {} })).unwrap();
+        assert!(validate_overrides(&default_instance_roles(), &bad_name).is_err());
+        let incoherent: RoleOverrides = serde_json::from_value(serde_json::json!({
+            "builder": { "capabilities": { "code": false, "flows": "full" } }
+        }))
+        .unwrap();
+        assert!(validate_overrides(&default_instance_roles(), &incoherent).is_err());
+    }
 
     #[test]
     fn defaults_match_legacy_roles() {

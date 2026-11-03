@@ -61,7 +61,8 @@ async fn list_roles(
     Ok(Json(WorkspaceRoles {
         roles: roles.as_ref().clone(),
         overrides,
-        custom_roles_enabled: roles::custom_roles_enabled(),
+        // Gantry has no license tiers: workspaces may always add roles (specs/custom-roles.md).
+        custom_roles_enabled: true,
         my_role,
         my_capabilities,
     }))
@@ -91,11 +92,6 @@ pub(crate) async fn write_role_overrides(
 ) -> Result<()> {
     let instance = instance_roles(db).await?;
     roles::validate_overrides(&instance, &overrides)?;
-    roles::check_frozen_overrides(
-        &instance,
-        &roles::load_role_overrides(db, w_id).await?,
-        &overrides,
-    )?;
 
     let previous = roles::workspace_roles(db, w_id).await?;
     let removed: Vec<String> = previous
