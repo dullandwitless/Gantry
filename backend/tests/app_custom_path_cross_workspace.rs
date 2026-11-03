@@ -29,7 +29,7 @@ fn new_app(path: &str, custom_path: &str) -> serde_json::Value {
         "path": path,
         "summary": "Test app",
         "value": { "type": "rawapp", "inline_script": null },
-        "policy": { "execution_mode": "anonymous", "triggerables": {} },
+        "policy": { "execution_mode": "publisher", "triggerables": {} },
         "custom_path": custom_path
     })
 }
@@ -68,7 +68,7 @@ async fn test_custom_path_cross_workspace_deploy(db: Pool<Postgres>) -> anyhow::
     .json(&json!({
         "summary": "Test app (edited)",
         "value": { "type": "rawapp", "inline_script": null },
-        "policy": { "execution_mode": "anonymous", "triggerables": {} },
+        "policy": { "execution_mode": "publisher", "triggerables": {} },
         "custom_path": custom_path
     }))
     .send()

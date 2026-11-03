@@ -17,8 +17,8 @@ fn authed(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuil
     builder.header("Authorization", format!("Bearer {}", token))
 }
 
-/// Deploys a flow and an app that runs it.
-async fn setup(ws: &str, flow_path: &str, chat: bool) -> anyhow::Result<()> {
+/// Deploys a flow and an app that runs it, which test-user-2 may open.
+async fn setup(db: &Pool<Postgres>, ws: &str, flow_path: &str, chat: bool) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let resp = authed(client.post(format!("{ws}/flows/create")), TOKENS[0])
         .json(&json!({
@@ -36,7 +36,7 @@ async fn setup(ws: &str, flow_path: &str, chat: bool) -> anyhow::Result<()> {
             "summary": "",
             "value": {},
             "policy": {
-                "execution_mode": "anonymous",
+                "execution_mode": "publisher",
                 "triggerables_v2": {
                     format!("run:flow/{flow_path}"): { "static_inputs": {}, "one_of_inputs": {} }
                 }
@@ -45,6 +45,13 @@ async fn setup(ws: &str, flow_path: &str, chat: bool) -> anyhow::Result<()> {
         .send()
         .await?;
     assert!(resp.status().is_success(), "{}", resp.text().await?);
+    sqlx::query(
+        "UPDATE app SET extra_perms = '{\"u/test-user-2\": false}'
+         WHERE workspace_id = 'test-workspace' AND path = $1",
+    )
+    .bind(format!("{flow_path}_app"))
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -84,7 +91,7 @@ async fn a_viewer_cannot_reach_anothers_flow_memory(db: Pool<Postgres>) -> anyho
     );
 
     let plain = "u/test-user/plain";
-    setup(&ws, plain, false).await?;
+    setup(&db, &ws, plain, false).await?;
     let mut keys = vec![];
     for token in TOKENS {
         let resp = run(&ws, token, plain, false).await?;
@@ -107,7 +114,7 @@ async fn a_viewer_cannot_reach_anothers_flow_memory(db: Pool<Postgres>) -> anyho
     );
 
     let chat = "u/test-user/chat";
-    setup(&ws, chat, true).await?;
+    setup(&db, &ws, chat, true).await?;
     // From the app editor's preview: the app still runs the deployed flow, so the
     // conversation is the deployed flow's.
     let resp = run(&ws, TOKENS[0], chat, true).await?;

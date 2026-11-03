@@ -301,7 +301,7 @@ async fn test_operator_builder_apps_boundary(db: Pool<Postgres>) -> anyhow::Resu
     // The deploy panel saves access and frontend scopes through the settings-only endpoint.
     for (body, expected) in [
         (
-            json!({"policy": {"execution_mode": "anonymous", "triggerables_v2": {}}}),
+            json!({"policy": {"execution_mode": "publisher", "triggerables_v2": {}}}),
             200,
         ),
         (

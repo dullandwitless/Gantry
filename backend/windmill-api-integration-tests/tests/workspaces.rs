@@ -914,6 +914,9 @@ async fn test_the_one_workspace(db: Pool<Postgres>) -> anyhow::Result<()> {
     )
     .execute(&db)
     .await?;
+    sqlx::query("UPDATE password SET username = 'test-user-2' WHERE email = 'test2@windmill.dev'")
+        .execute(&db)
+        .await?;
 
     let resp = client()
         .post(&create)
@@ -944,13 +947,7 @@ async fn test_the_one_workspace(db: Pool<Postgres>) -> anyhow::Result<()> {
         sqlx::query_scalar("SELECT email FROM usr WHERE workspace_id = 'main' ORDER BY email")
             .fetch_all(&db)
             .await?;
-    assert_eq!(
-        members,
-        [
-            "test2@windmill.dev",
-            "test3@windmill.dev",
-            "test@windmill.dev"
-        ]
-    );
+    // test3 has no instance username, so an admin adds it with a chosen one.
+    assert_eq!(members, ["test2@windmill.dev", "test@windmill.dev"]);
     Ok(())
 }

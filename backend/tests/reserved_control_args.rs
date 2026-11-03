@@ -235,9 +235,9 @@ async fn an_authenticated_push_keeps_the_entrypoint_override(
     Ok(())
 }
 
-/// Create a public (anonymous) app whose single component is the deployed script, with the
-/// given policy inputs, and return its path.
-async fn create_public_app(
+/// Create an app that runs as its publisher, whose single component is the deployed script,
+/// with the given policy inputs.
+async fn create_publisher_app(
     ws: &str,
     path: &str,
     static_inputs: Value,
@@ -249,7 +249,7 @@ async fn create_public_app(
             "summary": "",
             "value": {},
             "policy": {
-                "execution_mode": "anonymous",
+                "execution_mode": "publisher",
                 "triggerables_v2": {
                     format!("comp:script/{SCRIPT_PATH}"): {
                         "static_inputs": static_inputs,
@@ -264,12 +264,10 @@ async fn create_public_app(
     Ok(())
 }
 
-/// A viewer of a public app runs the publisher's pinned script as the publisher: it may
+/// A viewer of a publisher app runs the publisher's pinned script as the publisher: it may
 /// fill in the inputs the policy leaves free and nothing else.
 #[sqlx::test(fixtures("base"))]
-async fn public_app_viewer_cannot_steer_the_pinned_runnable(
-    db: Pool<Postgres>,
-) -> anyhow::Result<()> {
+async fn app_viewer_cannot_steer_the_pinned_runnable(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
     let server = ApiServer::start(db.clone()).await?;
     let ws = format!(
@@ -279,7 +277,7 @@ async fn public_app_viewer_cannot_steer_the_pinned_runnable(
     deploy_script(&db).await?;
 
     let app_path = "u/test-user/reserved_args";
-    create_public_app(
+    create_publisher_app(
         &ws,
         app_path,
         json!({ "tenant": "acme" }),
@@ -287,15 +285,16 @@ async fn public_app_viewer_cannot_steer_the_pinned_runnable(
     )
     .await?;
 
-    // No `Authorization` header at all: the anonymous visitor of a public app.
     let run = |args: &'static str| {
-        client()
-            .post(format!("{ws}/apps_u/execute_component/{app_path}"))
-            .header("content-type", "application/json")
-            .body(format!(
-                r#"{{"component": "comp", "path": "script/{SCRIPT_PATH}", "args": {args}}}"#
-            ))
-            .send()
+        authed(
+            client().post(format!("{ws}/apps_u/execute_component/{app_path}")),
+            "SECRET_TOKEN",
+        )
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"component": "comp", "path": "script/{SCRIPT_PATH}", "args": {args}}}"#
+        ))
+        .send()
     };
 
     // A name spelled with a NUL is the same name once stored, so the policy's pinned value

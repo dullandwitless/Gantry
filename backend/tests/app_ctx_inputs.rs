@@ -48,7 +48,7 @@ async fn a_declared_ctx_input_ignores_the_value_the_viewer_sends(
             // The policy says nothing of context inputs: the server reads the
             // declaration from the deployed runnable.
             "policy": {
-                "execution_mode": "anonymous",
+                "execution_mode": "publisher",
                 "triggerables_v2": {
                     format!("whoami:rawscript/{CONTENT_SHA}"): {
                         "static_inputs": {},

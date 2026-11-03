@@ -68,7 +68,9 @@ does not demote anyone; a superadmin does that in the UI. This replaces the seed
 
 **Joining the workspace**: an account's first sign-in (a new account, or a `pending_oauth`
 one created by a superadmin) adds it to the workspace (§2) with the workspace's default role
-for new members, and to its `all` group. Later sign-ins change nothing, so a member an admin
+for new members, and to its `all` group, under its instance username (an account without
+one, as when automatic username creation is off, is left to an admin). Later sign-ins change
+nothing, so a member an admin
 removed stays removed. Before the workspace exists, nobody is added. Admins add instance users
 with the existing `POST /api/w/{w}/workspaces/add_user`.
 

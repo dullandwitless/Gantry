@@ -9,7 +9,6 @@ use sqlx::{PgConnection, Postgres, Transaction};
 use crate::{
     error::Result,
     roles::{default_role_name, workspace_roles_on},
-    usernames::get_instance_username_or_create_pending,
 };
 
 /// The workspace holding instance-level scripts and settings, beside the instance's one
@@ -48,8 +47,8 @@ pub struct Joined {
 }
 
 /// Adds the account `email` to the instance's workspace with the default role for new members
-/// and to its `all` group, unless the workspace does not exist yet or the account is already a
-/// member.
+/// and to its `all` group, under its instance username. Does nothing when the workspace does
+/// not exist yet, the account is already a member, or it has no instance username.
 pub async fn join_the_workspace(
     tx: &mut Transaction<'_, Postgres>,
     email: &str,
@@ -74,7 +73,18 @@ pub async fn join_the_workspace(
         .iter()
         .find(|r| r.name == role)
         .is_some_and(|r| !r.capabilities.code);
-    let username = get_instance_username_or_create_pending(tx, email).await?;
+    // Joining takes the account's instance username: without one (username creation off, or
+    // an account with different usernames per workspace) an admin adds it with a chosen one.
+    let username: Option<String> =
+        sqlx::query_scalar("SELECT username FROM password WHERE email = $1")
+            .bind(email)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+    let Some(username) = username else {
+        tracing::info!("{email} has no instance username, so it does not join {workspace_id}");
+        return Ok(None);
+    };
 
     sqlx::query(
         "INSERT INTO usr (workspace_id, email, username, is_admin, operator, workspace_role)

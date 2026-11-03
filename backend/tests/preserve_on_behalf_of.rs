@@ -89,7 +89,7 @@ fn new_app_with_on_behalf_of(
     preserve: bool,
 ) -> serde_json::Value {
     let mut policy = json!({
-        "execution_mode": "anonymous",
+        "execution_mode": "publisher",
         "triggerables": {}
     });
     if let Some(obo) = on_behalf_of {
@@ -1235,7 +1235,7 @@ async fn test_app_update_preserves_on_behalf_of(db: Pool<Postgres>) -> anyhow::R
     .json(&json!({
         "summary": "Updated app",
         "policy": {
-            "execution_mode": "anonymous",
+            "execution_mode": "publisher",
             "triggerables": {},
             "on_behalf_of": "u/original-user",
             "on_behalf_of_email": "original@windmill.dev"
@@ -1296,7 +1296,7 @@ async fn test_app_update_preserves_on_behalf_of(db: Pool<Postgres>) -> anyhow::R
     .json(&json!({
         "summary": "Deployer updated app",
         "policy": {
-            "execution_mode": "anonymous",
+            "execution_mode": "publisher",
             "triggerables": {},
             "on_behalf_of": "u/original-user",
             "on_behalf_of_email": "original@windmill.dev"
@@ -1357,7 +1357,7 @@ async fn test_app_update_preserves_on_behalf_of(db: Pool<Postgres>) -> anyhow::R
     .json(&json!({
         "summary": "Non-admin updated app",
         "policy": {
-            "execution_mode": "anonymous",
+            "execution_mode": "publisher",
             "triggerables": {},
             "on_behalf_of": "u/original-user",
             "on_behalf_of_email": "original@windmill.dev"

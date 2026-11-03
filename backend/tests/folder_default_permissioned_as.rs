@@ -69,7 +69,7 @@ fn new_app(path: &str) -> serde_json::Value {
             "inline_script": null
         },
         "policy": {
-            "execution_mode": "anonymous",
+            "execution_mode": "publisher",
             "triggerables": {}
         }
     })

@@ -31,7 +31,7 @@ fn new_app(path: &str, summary: &str) -> serde_json::Value {
             "inline_script": null
         },
         "policy": {
-            "execution_mode": "anonymous",
+            "execution_mode": "publisher",
             "triggerables": {},
             "on_behalf_of": null,
             "on_behalf_of_email": null
@@ -183,7 +183,7 @@ async fn test_app_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .json(&json!({
             "summary": "Updated app",
             "policy": {
-                "execution_mode": "anonymous",
+                "execution_mode": "publisher",
                 "triggerables": {},
                 "on_behalf_of": null,
                 "on_behalf_of_email": null

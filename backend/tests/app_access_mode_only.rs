@@ -48,13 +48,13 @@ async fn create(ws: &str, token: &str, path: &str, policy: Value) -> anyhow::Res
     Ok(())
 }
 
-/// An anonymous, sandboxed raw app with no runnables, as a builder may deploy one.
+/// A sandboxed raw app with no runnables, as a builder may deploy one.
 async fn create_raw(ws: &str, token: &str, path: &str) -> anyhow::Result<()> {
     let app = json!({
         "path": path,
         "summary": "",
         "value": { "files": {}, "runnables": {} },
-        "policy": { "execution_mode": "anonymous", "sandbox": true, "triggerables_v2": {} },
+        "policy": { "execution_mode": "publisher", "sandbox": true, "triggerables_v2": {} },
     });
     let form = multipart::Form::new()
         .part(
@@ -119,11 +119,10 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
     let before = policy(&db, SHARED).await?;
     assert_eq!(before["on_behalf_of"], "u/test-user");
 
-    let (status, body) =
-        update(&ws, SHARED, ADMIN, json!({ "execution_mode": "anonymous" })).await?;
+    let (status, body) = update(&ws, SHARED, ADMIN, json!({ "execution_mode": "viewer" })).await?;
     assert_eq!(status, 200, "{body}");
     let mut after = policy(&db, SHARED).await?;
-    assert_eq!(after["execution_mode"], "anonymous");
+    assert_eq!(after["execution_mode"], "viewer");
     after["execution_mode"] = before["execution_mode"].clone();
     assert_eq!(
         after, before,
@@ -135,7 +134,7 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
         &ws,
         SHARED,
         ADMIN,
-        json!({ "execution_mode": "publisher", "policy": { "execution_mode": "anonymous" } }),
+        json!({ "execution_mode": "publisher", "policy": { "execution_mode": "viewer" } }),
     )
     .await?;
     assert_eq!(status, 400);
@@ -148,7 +147,7 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
         update(&ws, SHARED, USER, json!({ "execution_mode": "publisher" })).await?;
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("wm_deployers"), "{body}");
-    assert_eq!(policy(&db, SHARED).await?["execution_mode"], "anonymous");
+    assert_eq!(policy(&db, SHARED).await?["execution_mode"], "viewer");
 
     // ========================================
     // 3. A policy without a mode keeps the deployed one.
@@ -162,7 +161,7 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
     .bind(OWN)
     .execute(&db)
     .await?;
-    let (status, body) = update(&ws, OWN, USER, json!({ "execution_mode": "anonymous" })).await?;
+    let (status, body) = update(&ws, OWN, USER, json!({ "execution_mode": "viewer" })).await?;
     assert_eq!(status, 200, "{body}");
     let drafts: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM draft WHERE workspace_id = 'test-workspace' AND path = $1",
@@ -180,7 +179,7 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
     .await?;
     assert_eq!(status, 200, "{body}");
     let p = policy(&db, OWN).await?;
-    assert_eq!(p["execution_mode"], "anonymous");
+    assert_eq!(p["execution_mode"], "viewer");
     assert!(
         p["triggerables_v2"].get("c:script/f/x/new").is_some(),
         "{p}"
@@ -221,7 +220,7 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         policy(&db, BUILT).await?["execution_mode"],
-        "anonymous",
+        "publisher",
         "a builder's policy without a mode must keep a non-Viewer deployed mode"
     );
 
@@ -236,19 +235,6 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
     let (status, body) = update(&ws, BUILT, BUILDER, settings_only).await?;
     assert_eq!(status, 200, "{body}");
     assert_eq!(policy(&db, BUILT).await?["execution_mode"], "publisher");
-
-    let (status, body) = update(
-        &ws,
-        BUILT,
-        BUILDER,
-        json!({ "execution_mode": "anonymous" }),
-    )
-    .await?;
-    assert_eq!(
-        status, 200,
-        "a builder may change the mode of its own app: {body}"
-    );
-    assert_eq!(policy(&db, BUILT).await?["execution_mode"], "anonymous");
 
     // A builder's deploy would sandbox an app whose policy leaves it unset, which a mode-only
     // change must not do.
@@ -268,7 +254,6 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
     assert_eq!(status, 403, "{body}");
     let p = policy(&db, BUILT).await?;
     assert!(p.get("sandbox").is_none(), "{p}");
-    assert_eq!(p["execution_mode"], "anonymous");
 
     // Changing the mode alone skips the check of the triggerables against the builder's RLS, so
     // it stays refused on an app that runs as someone else; deploying it is the way.
@@ -283,29 +268,6 @@ async fn test_access_mode_only_update(db: Pool<Postgres>) -> anyhow::Result<()> 
     .await?;
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("by deploying it"), "{body}");
-
-    // ========================================
-    // 5. Widening is gated by the protection rule; narrowing is not.
-    // ========================================
-    let resp = client()
-        .post(format!("{ws}/workspaces/protection_rules"))
-        .bearer_auth(ADMIN)
-        .json(&json!({
-            "name": "no-public-apps",
-            "rules": ["RestrictAnonymousAppDeployment"],
-            "bypass_users": [],
-            "bypass_groups": []
-        }))
-        .send()
-        .await?;
-    assert_eq!(resp.status(), 200, "{}", resp.text().await?);
-
-    let (status, body) = update(&ws, OWN, USER, json!({ "execution_mode": "publisher" })).await?;
-    assert_eq!(status, 200, "narrowing stays open: {body}");
-    let (status, body) = update(&ws, OWN, USER, json!({ "execution_mode": "anonymous" })).await?;
-    assert_eq!(status, 403, "{body}");
-    assert!(body.contains("no-public-apps"), "{body}");
-    assert_eq!(policy(&db, OWN).await?["execution_mode"], "publisher");
 
     Ok(())
 }

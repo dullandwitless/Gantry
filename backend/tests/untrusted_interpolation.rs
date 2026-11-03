@@ -209,7 +209,7 @@ async fn success_handler_resolves_nothing_the_job_returned(
 
 #[sqlx::test(fixtures("base"))]
 #[serial_test::serial]
-async fn public_app_resolves_nothing_the_viewer_sent(db: Pool<Postgres>) -> anyhow::Result<()> {
+async fn app_viewer_input_resolves_nothing_it_sent(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
     let server = ApiServer::start(db.clone()).await?;
     let port = server.addr.port();
@@ -225,7 +225,7 @@ async fn public_app_resolves_nothing_the_viewer_sent(db: Pool<Postgres>) -> anyh
             "summary": "",
             "value": {"runnables": {"c": {"type": "inline",
                 "inlineScript": {"language": "bun", "content": content}}}},
-            "policy": {"execution_mode": "anonymous", "triggerables_v2": {
+            "policy": {"execution_mode": "publisher", "triggerables_v2": {
                 format!("c:rawscript/{}", windmill_common::utils::calculate_hash(content)):
                     {"static_inputs": {}, "one_of_inputs": {}}
             }},
@@ -233,6 +233,12 @@ async fn public_app_resolves_nothing_the_viewer_sent(db: Pool<Postgres>) -> anyh
         .send()
         .await?;
     assert!(resp.status().is_success(), "{}", resp.text().await?);
+    sqlx::query(
+        "UPDATE app SET extra_perms = '{\"u/test-user-2\": false}'
+         WHERE workspace_id = 'test-workspace' AND path = 'u/test-user/app'",
+    )
+    .execute(&db)
+    .await?;
     // `\u0024` passes a text match on `$var:` until jsonb decodes it.
     let body = r#"{"component": "c",
         "raw_code": {"language": "bun", "content": "CONTENT"},

@@ -2,7 +2,7 @@
 //!
 //! These tests verify that WM_END_USER_EMAIL is populated with the authenticated
 //! user's email when executing app components and when running scripts and flows directly.
-//! Only apps support non-workspace-member execution via OptAuthed + token lookup.
+//! Apps are for workspace members only (specs/single-organisation.md §3).
 
 use serde_json::json;
 use sqlx::{Pool, Postgres};
@@ -11,17 +11,9 @@ use windmill_common::worker::Connection;
 use windmill_test_utils::*;
 
 const SAME_WS_TOKEN: &str = "SECRET_TOKEN";
-#[cfg(feature = "deno_core")]
-const OTHER_WS_TOKEN: &str = "OTHER_WS_TOKEN";
-#[cfg(feature = "deno_core")]
-const NO_WS_TOKEN: &str = "NO_WS_TOKEN";
 
 #[cfg(feature = "deno_core")]
 const SAME_WS_EMAIL: &str = "test@windmill.dev";
-#[cfg(feature = "deno_core")]
-const OTHER_WS_EMAIL: &str = "other-ws@windmill.dev";
-#[cfg(feature = "deno_core")]
-const NO_WS_EMAIL: &str = "no-ws@windmill.dev";
 
 #[cfg(feature = "deno_core")]
 const GET_EMAIL_CONTENT: &str =
@@ -57,7 +49,7 @@ async fn create_app_with_inline_script(port: u16, path: &str) -> anyhow::Result<
                 }]
             },
             "policy": {
-                "execution_mode": "anonymous",
+                "execution_mode": "publisher",
                 "on_behalf_of": null,
                 "on_behalf_of_email": null,
                 "triggerables_v2": {
@@ -65,7 +57,7 @@ async fn create_app_with_inline_script(port: u16, path: &str) -> anyhow::Result<
                         "static_inputs": {},
                         "one_of_inputs": {}
                     },
-                    // SHA256 hash of raw_code content for anonymous execution
+                    // SHA256 hash of raw_code content
                     "rawscript/894d2f85ea2411e777e7d5787366c9fec4c1a7a5f83482748f1d129196c9f54f": {
                         "static_inputs": {},
                         "one_of_inputs": {}
@@ -105,7 +97,7 @@ async fn create_raw_app_with_inline_script(port: u16, path: &str) -> anyhow::Res
                 }
             },
             "policy": {
-                "execution_mode": "anonymous",
+                "execution_mode": "publisher",
                 "on_behalf_of": null,
                 "on_behalf_of_email": null,
                 "triggerables_v2": {
@@ -113,7 +105,7 @@ async fn create_raw_app_with_inline_script(port: u16, path: &str) -> anyhow::Res
                         "static_inputs": {},
                         "one_of_inputs": {}
                     },
-                    // SHA256 hash of raw_code content for anonymous execution
+                    // SHA256 hash of raw_code content
                     "rawscript/894d2f85ea2411e777e7d5787366c9fec4c1a7a5f83482748f1d129196c9f54f": {
                         "static_inputs": {},
                         "one_of_inputs": {}
@@ -148,7 +140,7 @@ async fn create_app_triggering_flow(port: u16, path: &str, flow_path: &str) -> a
                 "hiddenInlineScripts": []
             },
             "policy": {
-                "execution_mode": "anonymous",
+                "execution_mode": "publisher",
                 "on_behalf_of": null,
                 "on_behalf_of_email": null,
                 "triggerables_v2": {
@@ -426,20 +418,6 @@ async fn test_app_wm_end_user_email(db: Pool<Postgres>) -> anyhow::Result<()> {
                 "same workspace user should get their email"
             );
 
-            // Other workspace user (uses app's anonymous policy + token lookup)
-            let result = run_inline_script(port, OTHER_WS_TOKEN, app_path, false).await?;
-            assert_eq!(
-                result, OTHER_WS_EMAIL,
-                "other workspace user should get their email"
-            );
-
-            // No workspace user (uses app's anonymous policy + token lookup)
-            let result = run_inline_script(port, NO_WS_TOKEN, app_path, false).await?;
-            assert_eq!(
-                result, NO_WS_EMAIL,
-                "no workspace user should get their email"
-            );
-
             Ok::<(), anyhow::Error>(())
         },
         port,
@@ -468,11 +446,19 @@ async fn test_app_flow_step_wm_end_user_email(db: Pool<Postgres>) -> anyhow::Res
         Connection::Sql(db.clone()),
         async move {
             create_app_triggering_flow(port, app_path, flow_path).await?;
+            // A member other than the publisher may open it.
+            sqlx::query(
+                "UPDATE app SET extra_perms = '{\"g/all\": false}'
+                 WHERE workspace_id = 'test-workspace' AND path = $1",
+            )
+            .bind(app_path)
+            .execute(&db)
+            .await?;
 
             // The flow result is its last step's result.
-            let result = run_app_flow(port, OTHER_WS_TOKEN, app_path, flow_path).await?;
+            let result = run_app_flow(port, "SECRET_TOKEN_2", app_path, flow_path).await?;
             assert_eq!(
-                result, OTHER_WS_EMAIL,
+                result, "test2@windmill.dev",
                 "every flow step should see the end user email, not the app publisher's"
             );
 
@@ -506,20 +492,6 @@ async fn test_raw_app_wm_end_user_email(db: Pool<Postgres>) -> anyhow::Result<()
             assert_eq!(
                 result, SAME_WS_EMAIL,
                 "same workspace user should get their email"
-            );
-
-            // Other workspace user (uses app's anonymous policy + token lookup)
-            let result = run_inline_script(port, OTHER_WS_TOKEN, app_path, false).await?;
-            assert_eq!(
-                result, OTHER_WS_EMAIL,
-                "other workspace user should get their email"
-            );
-
-            // No workspace user (uses app's anonymous policy + token lookup)
-            let result = run_inline_script(port, NO_WS_TOKEN, app_path, false).await?;
-            assert_eq!(
-                result, NO_WS_EMAIL,
-                "no workspace user should get their email"
             );
 
             Ok::<(), anyhow::Error>(())
@@ -556,7 +528,7 @@ async fn test_app_viewer_data_access_is_stamped_on_inline_runnables_only(
         "summary": "",
         "value": { "type": "app", "grid": [], "subgrids": {}, "hiddenInlineScripts": [] },
         "policy": {
-            "execution_mode": "anonymous",
+            "execution_mode": "publisher",
             "on_behalf_of": null,
             "on_behalf_of_email": null,
             "triggerables_v2": {
