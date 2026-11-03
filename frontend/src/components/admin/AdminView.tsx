@@ -4,7 +4,6 @@ import { useToast } from '../../context/ToastContext';
 import { api } from '../../api/client';
 import { WorkerPing, ConcurrencyGroup } from '../../types';
 import { Shield, Users, Cpu, Key, Activity, Plus, CheckCircle2, Server } from 'lucide-react';
-import { CleanRoomStubNotice } from '../common/CleanRoomStubNotice';
 import { UsersPanel } from './UsersPanel';
 import { useAuth } from '../../context/AuthContext';
 
@@ -84,11 +83,6 @@ export const AdminView: React.FC = () => {
           </button>
         </div>
       </div>
-
-      <CleanRoomStubNotice
-        featureName="Single sign-on and provisioning"
-        notes="SAML, SCIM provisioning and custom workspace roles are not implemented yet. Superadmins add users with a password under Users; email (invites, password reset) works when the server is built with the smtp feature and SMTP is configured."
-      />
 
       {activeTab === 'workers' && (
         <div className="space-y-4">

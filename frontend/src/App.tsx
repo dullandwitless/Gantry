@@ -4,7 +4,6 @@ import { ToastProvider } from './context/ToastContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { LoginView } from './components/auth/LoginView';
-import { RESET_PASSWORD_PATH, ResetPasswordView } from './components/auth/ResetPasswordView';
 import { CreateWorkspaceModal } from './components/workspace/CreateWorkspaceModal';
 
 import { Header } from './components/layout/Header';
@@ -28,25 +27,6 @@ export const AppContent: React.FC = () => {
   const { needsWorkspaceCreation, isLoading: wsLoading } = useWorkspace();
   const [activeTab, setActiveTab] = useState<string>('scripts');
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
-  const [resetToken, setResetToken] = useState<string | null>(() =>
-    window.location.pathname === RESET_PASSWORD_PATH
-      ? new URLSearchParams(window.location.search).get('token') ?? ''
-      : null,
-  );
-
-  if (resetToken !== null) {
-    return (
-      <ResetPasswordView
-        token={resetToken}
-        onDone={() => {
-          // Drop the token from the address bar and history before leaving.
-          window.history.replaceState(null, '', '/');
-          setResetToken(null);
-        }}
-      />
-    );
-  }
-
   if (authLoading) {
     return (
       <div className="h-screen w-screen bg-slate-950 flex flex-col items-center justify-center text-slate-400 gap-3">

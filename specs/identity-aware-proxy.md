@@ -59,8 +59,8 @@ request to use it is a 404, so a stray variable in a deployed environment opens 
 **Signing in**: `POST /api/auth/mock_login` with `{"email": ...}` signs in that user (§3) if
 the address is in the list (400 otherwise), without a password.
 
-**UI**: the sign-in page offers "Continue as <email>" for each mock user, above password
-sign-in.
+**UI**: the sign-in page offers "Continue as <email>" for each mock user. There is no password
+sign-in (specs/single-organisation.md §1).
 
 ## 3. Signing a user in
 
@@ -71,7 +71,8 @@ Shared by IAP (login type `iap`) and mock users (login type `mock`):
   `pending_oauth` account (created by an admin for external sign-in) takes the new login type;
 - no account, with `require_preexisting_user_for_oauth` on: refused (403, "ask an
   administrator to create your account");
-- no account otherwise: created, verified, not a superadmin, without password, with an
+- no account otherwise: created, verified, without password, a superadmin only if
+  `GANTRY_SUPERADMINS` lists it (specs/single-organisation.md §1), with an
   instance username assigned as for admin-created accounts. Audited as `users.create`.
 
 The session is a normal session token (`create_session_token`), returned as text and set as

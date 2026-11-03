@@ -131,14 +131,6 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .unwrap();
     assert_eq!(resp.status(), 200, "delete token: {}", resp.text().await?);
 
-    // --- list_invites ---
-    let resp = authed(client().get(format!("{global_base}/list_invites")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    resp.json::<Vec<serde_json::Value>>().await?;
-
     // --- username_info ---
     let resp = authed(client().get(format!("{global_base}/username_info/test@windmill.dev")))
         .send()
@@ -195,18 +187,6 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.text().await?
     );
 
-    // --- setpassword ---
-    let resp = authed(client().post(format!("{global_base}/setpassword")))
-        .json(&json!({"password": "new-test-password-123"}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status() == 200 || resp.status() == 500,
-        "setpassword: unexpected status {}",
-        resp.status()
-    );
-
     // --- all_runnables ---
     let resp = authed(client().get(format!("{global_base}/all_runnables")))
         .send()
@@ -227,30 +207,6 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.status()
     );
 
-    // --- decline_invite (no pending invite, but endpoint should handle gracefully) ---
-    let resp = authed(client().post(format!("{global_base}/decline_invite")))
-        .json(&json!({"workspace_id": "nonexistent-ws"}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status() == 200 || resp.status() == 404,
-        "decline_invite: unexpected status {}",
-        resp.status()
-    );
-
-    // --- auth: is_first_time_setup (unauthed) ---
-    let resp = client()
-        .get(format!(
-            "http://localhost:{port}/api/auth/is_first_time_setup"
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let is_first = resp.json::<bool>().await?;
-    assert_eq!(is_first, false);
-
     // --- auth: is_smtp_configured (unauthed) ---
     let resp = client()
         .get(format!(
@@ -266,7 +222,6 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     let resp = authed(client().post(format!("{global_base}/create")))
         .json(&json!({
             "email": "newglobaluser@windmill.dev",
-            "password": "test-password-123",
             "super_admin": false,
             "name": "New Global User"
         }))
@@ -307,22 +262,6 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     // ===== Auth (unauthed) endpoints =====
     let auth_base = format!("http://localhost:{port}/api/auth");
 
-    // --- login (will fail: password hash in fixture is fake) ---
-    // An unparseable stored hash must read as a failed login, not as a server error
-    // relaying the hash parser's message to an unauthenticated caller.
-    let resp = client()
-        .post(format!("{auth_base}/login"))
-        .json(&json!({"email": "test@windmill.dev", "password": "wrong-password"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "login: unexpected status {}",
-        resp.status()
-    );
-
     // --- logout (POST, with auth token) ---
     let resp = authed(client().post(format!("{auth_base}/logout")))
         .send()
@@ -342,32 +281,6 @@ async fn test_user_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
     assert!(
         resp.status() == 200 || resp.status() == 303,
         "logout GET: unexpected status {}",
-        resp.status()
-    );
-
-    // --- request_password_reset (returns 400 if SMTP not configured) ---
-    let resp = client()
-        .post(format!("{auth_base}/request_password_reset"))
-        .json(&json!({"email": "test@windmill.dev"}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status() == 200 || resp.status() == 400,
-        "request_password_reset: unexpected status {}",
-        resp.status()
-    );
-
-    // --- reset_password (invalid token) ---
-    let resp = client()
-        .post(format!("{auth_base}/reset_password"))
-        .json(&json!({"token": "invalid-token", "new_password": "new-pass"}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status() == 400 || resp.status() == 500,
-        "reset_password: unexpected status {}",
         resp.status()
     );
 

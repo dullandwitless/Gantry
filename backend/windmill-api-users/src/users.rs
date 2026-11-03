@@ -10,7 +10,6 @@
 
 use sqlx::{Postgres, Transaction};
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -19,7 +18,6 @@ use windmill_api_auth::ApiAuthed;
 
 pub use windmill_api_auth::Tokened;
 
-use argon2::{Argon2, PasswordVerifier};
 use axum::{
     extract::{Extension, Path, Query},
     response::{IntoResponse, Response},
@@ -31,11 +29,8 @@ use windmill_api_auth::{
     forbid_elevated_job_token, forbid_job_token_account_destruction, forbid_superadmin_job_token,
     require_super_admin, OptJobAuthed,
 };
-use windmill_common::usernames::{
-    generate_instance_wide_unique_username, get_instance_username_or_create_pending,
-};
+use windmill_common::usernames::generate_instance_wide_unique_username;
 use windmill_common::utils::{COOKIE_DOMAIN, IS_SECURE};
-use windmill_common::webhook::WebhookShared;
 use windmill_common::DB;
 
 use serde::{Deserialize, Serialize};
@@ -46,12 +41,11 @@ use tracing::Instrument;
 use windmill_audit::audit_oss::audit_log;
 use windmill_audit::ActionKind;
 use windmill_common::audit::AuditAuthor;
-use windmill_common::auth::{hash_token, safe_token_prefix, TOKEN_PREFIX_LEN};
+use windmill_common::auth::{hash_token, TOKEN_PREFIX_LEN};
 use windmill_common::global_settings::{
     load_value_from_global_settings, parse_max_token_expiration_days,
-    AUTOMATE_USERNAME_CREATION_SETTING, MAX_TOKEN_EXPIRATION_DAYS_SETTING,
+    MAX_TOKEN_EXPIRATION_DAYS_SETTING,
 };
-use windmill_common::oauth2::InstanceEvent;
 use windmill_common::per_minute_counter::PerMinuteCounter;
 use windmill_common::users::truncate_token;
 use windmill_common::users::COOKIE_NAME;
@@ -61,15 +55,15 @@ use windmill_common::users::{
 };
 use windmill_common::utils::paginate;
 use windmill_common::worker::CLOUD_HOSTED;
+use windmill_common::HUB_BASE_URL;
 use windmill_common::{
     auth::{get_folders_for_user, get_groups_for_user},
     db::UserDB,
-    error::{self, Error, JsonResult, Result},
+    error::{Error, JsonResult, Result},
     utils::{
         escape_ilike_pattern, not_found_if_none, rd_string, require_admin, Pagination, StripPath,
     },
 };
-use windmill_common::{BASE_URL, HUB_BASE_URL};
 use windmill_git_sync::handle_deployment_metadata;
 
 pub const COOKIE_PATH: &str = "/";
@@ -122,11 +116,7 @@ pub fn global_service() -> Router {
         .route("/exists/{email}", get(exists_email))
         .route("/email", get(get_email))
         .route("/whoami", get(global_whoami))
-        .route("/list_invites", get(list_invites))
-        .route("/decline_invite", post(decline_invite))
-        .route("/accept_invite", post(accept_invite))
         .route("/list_as_super_admin", get(list_users_as_super_admin))
-        .route("/set_login_type/{user}", post(set_login_type))
         .route("/update/{user}", post(update_user))
         .route("/delete/{user}", delete(delete_user))
         .route("/username_info/{user}", get(get_instance_username_info))
@@ -143,7 +133,6 @@ pub fn global_service() -> Router {
         )
         .route("/tokens/list", get(list_tokens))
         .route("/tokens/impersonate", post(impersonate))
-        .route("/login_links", post(create_login_link))
         .route(
             "/cloud_trial_offer",
             post(set_cloud_trial_offer).get(get_cloud_trial_offer),
@@ -167,16 +156,8 @@ pub fn global_service() -> Router {
 
 pub fn make_unauthed_service() -> Router {
     Router::new()
-        .route("/login", post(login))
         .route("/logout", post(logout).get(logout))
-        .route("/is_first_time_setup", get(is_first_time_setup))
-        .route("/request_password_reset", post(request_password_reset))
-        .route("/login_link/{token}", get(consume_login_link))
         .route("/is_smtp_configured", get(is_smtp_configured))
-        .route(
-            "/is_password_login_disabled",
-            get(is_password_login_disabled),
-        )
 }
 
 pub use windmill_api_auth::{
@@ -256,39 +237,15 @@ pub struct UserInfo {
     pub non_member: bool,
 }
 
-#[derive(FromRow, Serialize)]
-pub struct WorkspaceInvite {
-    pub workspace_id: String,
-    pub email: String,
-    pub is_admin: bool,
-    pub operator: bool,
-    pub role: String,
-    pub parent_workspace_id: Option<String>,
-}
-
-#[allow(dead_code)]
+/// An account a superadmin creates ahead of its first sign-in. Passwords and login types are
+/// refused rather than ignored (specs/single-organisation.md §1).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewUser {
     pub email: String,
-    /// Required when `login_type` is `password` (the default), ignored otherwise.
-    pub password: Option<String>,
     pub super_admin: bool,
     pub name: Option<String>,
     pub company: Option<String>,
-    pub skip_email: Option<bool>,
-    /// `password`, `pending_oauth`, or a configured OAuth login client key.
-    pub login_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct AcceptInvite {
-    pub workspace_id: String,
-    pub username: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct DeclineInvite {
-    pub workspace_id: String,
 }
 
 #[derive(Deserialize)]
@@ -309,17 +266,6 @@ pub struct EditWorkspaceUser {
     pub disabled: Option<bool>,
 }
 
-#[allow(dead_code)]
-#[derive(Deserialize)]
-pub struct EditPassword {
-    pub password: String,
-}
-
-#[derive(Deserialize)]
-pub struct EditLoginType {
-    pub login_type: String,
-}
-
 #[derive(FromRow, Serialize)]
 pub struct TruncatedToken {
     pub label: Option<String>,
@@ -333,54 +279,6 @@ pub struct TruncatedToken {
 }
 
 // NewToken is re-exported from windmill-api-auth above
-
-#[derive(Deserialize)]
-pub struct Login {
-    pub email: String,
-    pub password: String,
-}
-
-lazy_static::lazy_static! {
-    static ref FIRST_TIME_SETUP: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
-}
-
-pub async fn is_first_time_setup(Extension(db): Extension<DB>) -> JsonResult<bool> {
-    if !FIRST_TIME_SETUP.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(Json(false));
-    }
-    let single_user = sqlx::query_scalar!("SELECT 1 FROM password LIMIT 2")
-        .fetch_all(&db)
-        .await
-        .ok()
-        .unwrap_or_default()
-        .len()
-        == 1;
-    if single_user {
-        let user_is_admin_and_password_changeme = sqlx::query_scalar!(
-            "SELECT 1 FROM password WHERE email = 'admin@windmill.dev' AND password_hash = '$argon2id$v=19$m=4096,t=3,p=1$oLJo/lPn/gezXCuFOEyaNw$i0T2tCkw3xUFsrBIKZwr8jVNHlIfoxQe+HfDnLtd12I'"
-        ).fetch_all(&db)
-        .await
-        .ok()
-        .unwrap_or_default()
-        .len() == 1;
-        if user_is_admin_and_password_changeme {
-            let base_url_is_not_set =
-                sqlx::query_scalar!("SELECT COUNT(*) FROM global_settings WHERE name = 'base_url'")
-                    .fetch_optional(&db)
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten()
-                    .unwrap_or(0)
-                    == 0;
-            if base_url_is_not_set {
-                return Ok(Json(true));
-            }
-        }
-    }
-    FIRST_TIME_SETUP.store(false, std::sync::atomic::Ordering::Relaxed);
-    Ok(Json(false))
-}
 
 #[derive(Deserialize)]
 struct WorkspaceUsername {
@@ -626,29 +524,6 @@ async fn list_usernames(
     let rows = sqlx::query_scalar!("SELECT username from usr WHERE workspace_id = $1", &w_id)
         .fetch_all(&mut *tx)
         .await?;
-    tx.commit().await?;
-    Ok(Json(rows))
-}
-
-async fn list_invites(
-    authed: ApiAuthed,
-    Extension(db): Extension<DB>,
-) -> JsonResult<Vec<WorkspaceInvite>> {
-    let mut tx = db.begin().await?;
-    let rows = sqlx::query_as!(
-        WorkspaceInvite,
-        "SELECT
-            workspace_invite.workspace_id,
-            workspace_invite.email,
-            workspace_invite.is_admin,
-            workspace_invite.operator,
-            COALESCE(workspace_invite.workspace_role, CASE WHEN workspace_invite.operator THEN 'operator' ELSE 'developer' END) AS \"role!\",
-            workspace.parent_workspace_id
-        FROM workspace_invite JOIN workspace ON workspace_invite.workspace_id = workspace.id WHERE email = $1",
-        authed.email
-    )
-    .fetch_all(&mut *tx)
-    .await?;
     tx.commit().await?;
     Ok(Json(rows))
 }
@@ -1069,246 +944,6 @@ async fn whois(
 //         format!("new invite code {}", nu.code),
 //     ))
 // }
-
-async fn decline_invite(
-    authed: ApiAuthed,
-    Extension(db): Extension<DB>,
-    Json(nu): Json<DeclineInvite>,
-) -> Result<(StatusCode, String)> {
-    let mut tx = db.begin().await?;
-
-    let is_admin = sqlx::query_scalar!(
-        "DELETE FROM workspace_invite WHERE workspace_id = $1 AND email = $2 RETURNING is_admin",
-        nu.workspace_id,
-        authed.email,
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    audit_log(
-        &mut *tx,
-        &authed,
-        "users.decline_invite",
-        ActionKind::Delete,
-        &nu.workspace_id,
-        Some(&authed.email),
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-
-    if is_admin.is_some() {
-        Ok((
-            StatusCode::OK,
-            format!(
-                "user {} declined invite to workspace {}",
-                &authed.email, nu.workspace_id
-            ),
-        ))
-    } else {
-        Err(Error::NotFound(format!(
-            "invite for {} not found",
-            authed.email
-        )))
-    }
-}
-
-async fn accept_invite(
-    authed: ApiAuthed,
-    Extension(webhook): Extension<WebhookShared>,
-    Extension(db): Extension<DB>,
-    Json(nu): Json<AcceptInvite>,
-) -> Result<(StatusCode, String)> {
-    let mut tx = db.begin().await?;
-
-    let r = sqlx::query!(
-        "DELETE FROM workspace_invite WHERE workspace_id = $1 AND email = $2 RETURNING is_admin, operator, workspace_role",
-        nu.workspace_id,
-        authed.email,
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some(r) = r {
-        let already_in_workspace = sqlx::query_scalar!(
-            "SELECT EXISTS(SELECT 1 FROM usr WHERE workspace_id = $1 AND email = $2)",
-            &nu.workspace_id,
-            &authed.email,
-        )
-        .fetch_one(&mut *tx)
-        .await?
-        .unwrap_or(false);
-
-        if already_in_workspace {
-            tx.commit().await?;
-            return Ok((
-                StatusCode::CREATED,
-                format!(
-                    "user {} accepted invite to workspace {}",
-                    &authed.email, nu.workspace_id
-                ),
-            ));
-        }
-        let username;
-        (tx, username) = join_workspace(
-            &nu.workspace_id,
-            &authed,
-            nu.username,
-            r.is_admin,
-            r.operator,
-            tx,
-        )
-        .await?;
-        if let Some(role) = &r.workspace_role {
-            sqlx::query!(
-                "UPDATE usr SET workspace_role = $1 WHERE workspace_id = $2 AND username = $3",
-                role,
-                &nu.workspace_id,
-                &username
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        audit_log(
-            &mut *tx,
-            &ApiAuthed { username: username.clone(), ..authed.clone() },
-            "users.accept_invite",
-            ActionKind::Create,
-            &nu.workspace_id,
-            Some(&authed.email),
-            None,
-        )
-        .await?;
-        tx.commit().await?;
-
-        handle_deployment_metadata(
-            &authed.email,
-            &username,
-            &db,
-            &nu.workspace_id,
-            windmill_git_sync::DeployedObject::User { email: authed.email.clone() },
-            Some(format!("User '{}' accepted invite", &authed.email)),
-            true,
-            None,
-        )
-        .await?;
-        webhook.send_instance_event(InstanceEvent::UserJoinedWorkspace {
-            email: authed.email.clone(),
-            workspace: nu.workspace_id.clone(),
-            username: username,
-        });
-        Ok((
-            StatusCode::CREATED,
-            format!(
-                "user {} accepted invite to workspace {}",
-                &authed.email, nu.workspace_id
-            ),
-        ))
-    } else {
-        Err(Error::NotFound(format!(
-            "invite for {} not found",
-            authed.email
-        )))
-    }
-}
-
-async fn join_workspace<'c>(
-    w_id: &str,
-    authed: &ApiAuthed,
-    username: Option<String>,
-    is_admin: bool,
-    operator: bool,
-    mut tx: sqlx::Transaction<'c, sqlx::Postgres>,
-) -> error::Result<(sqlx::Transaction<'c, sqlx::Postgres>, String)> {
-    let automate_username_creation = sqlx::query_scalar!(
-        "SELECT value FROM global_settings WHERE name = $1",
-        AUTOMATE_USERNAME_CREATION_SETTING,
-    )
-    .fetch_optional(&mut *tx)
-    .await?
-    .map(|v| v.as_bool())
-    .flatten()
-    .unwrap_or(true);
-
-    let username = if automate_username_creation {
-        if username.is_some() && username.unwrap().len() > 0 {
-            return Err(Error::BadRequest(
-                "username is not allowed when username creation is automated".to_string(),
-            ));
-        }
-        get_instance_username_or_create_pending(&mut tx, &authed.email).await?
-    } else {
-        let username = username.ok_or(Error::BadRequest("username is required".to_string()))?;
-        let already_exists_username = sqlx::query_scalar!(
-            "SELECT EXISTS(SELECT 1 FROM usr WHERE workspace_id = $1 AND username = $2)",
-            &w_id,
-            username,
-        )
-        .fetch_one(&mut *tx)
-        .await?
-        .unwrap_or(false);
-
-        if already_exists_username {
-            return Err(Error::BadRequest(format!(
-                "user with username {} already exists in workspace {}",
-                username, w_id
-            )));
-        }
-
-        windmill_common::usernames::validate_username(&username)?;
-        username.to_string()
-    };
-
-    let already_exists_email = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM usr WHERE workspace_id = $1 AND email = $2)",
-        &w_id,
-        authed.email,
-    )
-    .fetch_one(&mut *tx)
-    .await?
-    .unwrap_or(false);
-
-    if already_exists_email {
-        return Err(Error::BadRequest(format!(
-            "user with email {} already exists in workspace {}",
-            authed.email, w_id
-        )));
-    }
-
-    sqlx::query!(
-        "INSERT INTO usr
-            (workspace_id, email, username, is_admin, operator)
-            VALUES ($1, $2, $3, $4, $5)",
-        &w_id,
-        authed.email,
-        username,
-        is_admin,
-        operator
-    )
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query_as!(
-        Group,
-        "INSERT INTO usr_to_group (workspace_id, usr, group_) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        &w_id,
-        username,
-        "all",
-    )
-    .execute(&mut *tx)
-    .await?;
-    audit_log(
-        &mut *tx,
-        &AuditAuthor { username: username.clone(), ..authed.into() },
-        "users.add_to_workspace",
-        ActionKind::Create,
-        &w_id,
-        Some(&authed.email),
-        None,
-    )
-    .await?;
-    Ok((tx, username))
-}
 
 async fn leave_instance(Extension(db): Extension<DB>, authed: ApiAuthed) -> Result<String> {
     forbid_job_token_account_destruction(&authed)?;
@@ -2764,143 +2399,6 @@ async fn delete_workspace_user(
     Ok(format!("username {} deleted", username_to_delete))
 }
 
-async fn set_login_type(
-    Extension(db): Extension<DB>,
-    Path(email): Path<String>,
-    authed: ApiAuthed,
-    OptJobAuthed { job_id, .. }: OptJobAuthed,
-    Json(et): Json<EditLoginType>,
-) -> Result<String> {
-    require_super_admin(&db, &authed).await?;
-    forbid_superadmin_job_token(&db, &authed.email, job_id).await?;
-    let mut tx = db.begin().await?;
-
-    sqlx::query!(
-        "UPDATE password SET login_type = $1 WHERE email = $2",
-        et.login_type,
-        email
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    audit_log(
-        &mut *tx,
-        &authed,
-        "users.set_login_type",
-        ActionKind::Update,
-        "global",
-        Some(&email),
-        None,
-    )
-    .await?;
-
-    tx.commit().await?;
-    Ok(format!(
-        "login type of {} updated to {}",
-        email, et.login_type
-    ))
-}
-
-#[allow(unreachable_code, unused_variables)]
-async fn login(
-    headers: axum::http::HeaderMap,
-    cookies: Cookies,
-    Extension(db): Extension<DB>,
-    Extension(argon2): Extension<Arc<Argon2<'_>>>,
-    Json(Login { email, password }): Json<Login>,
-) -> Result<String> {
-    // In `--no-auth` mode there is no real login; the frontend never needs a
-    // session cookie because every request already resolves as the admin
-    // superadmin (see resolve_opt_job_authed).
-    if windmill_api_auth::is_no_auth() {
-        return Ok("no_auth".to_string());
-    }
-
-    let email = email.to_lowercase();
-
-    if windmill_common::global_settings::DISABLE_PASSWORD_LOGIN
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err(Error::BadRequest(
-            "Password login is disabled on this instance".to_string(),
-        ));
-    }
-
-    windmill_common::login_rate_limit::check_and_increment_login_attempt(&headers, &email)?;
-
-    let mut tx = db.begin().await?;
-    let audit_author = AuditAuthor {
-        email: email.clone(),
-        username: email.clone(),
-        username_override: None,
-        token_prefix: None,
-    };
-    let email_w_h: Option<(String, String, bool)> = sqlx::query_as(
-        "SELECT email, password_hash, super_admin FROM password WHERE email = $1 AND login_type = \
-         'password' AND disabled = false",
-    )
-    .bind(&email)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some((email, hash, super_admin)) = email_w_h {
-        if argon2
-            .verify_password(password.as_bytes(), hash.as_str())
-            .is_err()
-        {
-            audit_log(
-                &mut *tx,
-                &audit_author,
-                "users.login_failure",
-                ActionKind::Create,
-                "global",
-                None,
-                None,
-            )
-            .await?;
-            windmill_common::login_rate_limit::record_login_failure(&email);
-            Err(Error::BadRequest("Invalid login".to_string()))
-        } else {
-            let token =
-                create_session_token(&email, super_admin, None, false, &mut tx, cookies).await?;
-
-            let audit_author = AuditAuthor {
-                email: email.clone(),
-                username: email.clone(),
-                username_override: None,
-                token_prefix: Some(safe_token_prefix(&token)),
-            };
-
-            audit_log(
-                &mut *tx,
-                &audit_author,
-                "users.login",
-                ActionKind::Create,
-                "global",
-                Some(&truncate_token(&token)),
-                None,
-            )
-            .await?;
-
-            tx.commit().await?;
-            Ok(token)
-        }
-    } else {
-        audit_log(
-            &mut *tx,
-            &audit_author,
-            "users.login_failure",
-            ActionKind::Create,
-            "global",
-            None,
-            None,
-        )
-        .await?;
-        windmill_common::login_rate_limit::record_login_failure(&email);
-        Err(Error::BadRequest("Invalid login".to_string()))
-    }
-}
-
 #[derive(Deserialize)]
 struct RefreshTokenQuery {
     if_expiring_in_less_than_s: Option<i32>,
@@ -3379,62 +2877,6 @@ async fn impersonate(
     Ok((StatusCode::CREATED, token))
 }
 
-const LOGIN_LINK_DEFAULT_TTL_S: u32 = 600;
-const LOGIN_LINK_MAX_TTL_S: u32 = 900;
-const LOGIN_LINK_DEFAULT_RD: &str = "/user/workspaces";
-const LOGIN_LINK_EXPIRED_PAGE: &str = "/user/login_link_expired";
-
-#[derive(Deserialize)]
-pub struct NewLoginLink {
-    pub email: String,
-    pub expires_in_s: Option<u32>,
-    pub rd: Option<String>,
-    /// Refuse to mint unless the account still has this login type: a caller re-entering an
-    /// account it created can require `pending_oauth`, so the link stops working once the
-    /// owner has set a password or signed in with a provider.
-    pub require_login_type: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct LoginLink {
-    pub url: String,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// A post-login destination is only ever a same-origin path: anything else would hand the
-/// fresh session's first navigation to another host. Control characters are refused because
-/// browsers strip tab/newline from a `Location` before parsing it, so `/\t/host` reads as
-/// the protocol-relative `//host`.
-fn same_origin_rd(rd: Option<String>) -> Option<String> {
-    rd.filter(|r| {
-        r.starts_with('/')
-            && !r.starts_with("//")
-            && !r.contains('\\')
-            && !r.chars().any(|c| c.is_ascii_control())
-    })
-}
-
-#[cfg(test)]
-mod same_origin_rd_tests {
-    use super::same_origin_rd;
-
-    fn accepts(rd: &str) -> bool {
-        same_origin_rd(Some(rd.to_string())).is_some()
-    }
-
-    #[test]
-    fn only_plain_same_origin_paths_pass() {
-        assert!(accepts("/"));
-        assert!(accepts("/user/workspaces?rd=%2Fx"));
-        assert!(!accepts("https://evil.example/"));
-        assert!(!accepts("//evil.example/"));
-        assert!(!accepts("/\\evil.example/"));
-        assert!(!accepts("/\t/evil.example/"));
-        assert!(!accepts("/x\r\nSet-Cookie: a=b"));
-        assert!(!accepts("user/workspaces"));
-    }
-}
-
 /// Both provisioning writes reference `password(email)`; a typo'd address from the
 /// provisioning script should read as "no such account", not as a foreign-key error.
 async fn require_account(
@@ -3452,103 +2894,6 @@ async fn require_account(
         return Err(Error::NotFound(format!("no account for {email}")));
     }
     Ok(())
-}
-
-fn login_link_redirect(location: String) -> Response {
-    (
-        StatusCode::FOUND,
-        [
-            ("location", location),
-            ("referrer-policy", "no-referrer".to_string()),
-        ],
-    )
-        .into_response()
-}
-
-/// Mint a single-use link that signs `email` in when opened. The row is not a `token`:
-/// it can only ever become a session, and burning it needs no cache invalidation.
-async fn create_login_link(
-    Extension(db): Extension<DB>,
-    authed: ApiAuthed,
-    OptJobAuthed { job_id, .. }: OptJobAuthed,
-    Json(nl): Json<NewLoginLink>,
-) -> Result<(StatusCode, Json<LoginLink>)> {
-    require_super_admin(&db, &authed).await?;
-    forbid_superadmin_job_token(&db, &authed.email, job_id).await?;
-
-    let email = nl.email.to_lowercase();
-    let rd = match nl.rd {
-        Some(rd) => Some(same_origin_rd(Some(rd)).ok_or_else(|| {
-            Error::BadRequest("rd must be a same-origin path starting with /".to_string())
-        })?),
-        None => None,
-    };
-    let ttl = nl
-        .expires_in_s
-        .unwrap_or(LOGIN_LINK_DEFAULT_TTL_S)
-        .clamp(1, LOGIN_LINK_MAX_TTL_S);
-
-    let mut tx = db.begin().await?;
-    let target = sqlx::query!(
-        "SELECT super_admin, devops, login_type FROM password WHERE email = $1 AND disabled = false",
-        &email
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(target) = target else {
-        return Err(Error::NotFound(format!("no active account for {email}")));
-    };
-    // A link is a full session for its account; whoever holds the minting credential
-    // must not be able to turn it into an instance-wide role.
-    if target.super_admin || target.devops {
-        return Err(Error::BadRequest(
-            "login links cannot target superadmin or devops accounts".to_string(),
-        ));
-    }
-    if let Some(required) = nl.require_login_type.as_deref() {
-        if target.login_type != required {
-            return Err(Error::Generic(
-                StatusCode::CONFLICT,
-                format!(
-                    "login_type_mismatch: {email} signs in with {}, not {required}",
-                    target.login_type
-                ),
-            ));
-        }
-    }
-
-    let token = rd_string(32);
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl as i64);
-    sqlx::query!(
-        "INSERT INTO login_link (token_hash, email, rd, expiration, created_by)
-         VALUES ($1, $2, $3, $4, $5)",
-        hash_token(&token),
-        &email,
-        rd,
-        expires_at,
-        &authed.email,
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    audit_log(
-        &mut *tx,
-        &authed,
-        "users.login_link.create",
-        ActionKind::Create,
-        "global",
-        Some(&email),
-        Some([("expires_in_s", &ttl.to_string()[..])].into()),
-    )
-    .await?;
-    tx.commit().await?;
-
-    let url = format!(
-        "{}/api/auth/login_link/{}",
-        (**BASE_URL.load()).clone(),
-        token
-    );
-    Ok((StatusCode::CREATED, Json(LoginLink { url, expires_at })))
 }
 
 #[derive(Deserialize)]
@@ -3779,104 +3124,6 @@ async fn go_cloud_trial_offer(
     .await?;
     tx.commit().await?;
     Ok(Json(CloudTrialOfferGo { location, reason }))
-}
-
-#[derive(Deserialize)]
-struct LoginLinkQuery {
-    rd: Option<String>,
-}
-
-async fn consume_login_link(
-    headers: axum::http::HeaderMap,
-    cookies: Cookies,
-    Extension(db): Extension<DB>,
-    Path(token): Path<String>,
-    Query(query): Query<LoginLinkQuery>,
-) -> Result<Response> {
-    let bounce = |reason: &str| {
-        Ok(login_link_redirect(format!(
-            "{LOGIN_LINK_EXPIRED_PAGE}?reason={reason}"
-        )))
-    };
-    if token.len() != 32 {
-        return bounce("invalid");
-    }
-    let t_hash = hash_token(&token);
-    // The account is unknown until the row is read, so only the global and per-IP tiers
-    // apply here; a 32-char random token leaves nothing for the per-account tier to guard.
-    windmill_common::login_rate_limit::check_and_increment_login_attempt(
-        &headers,
-        &t_hash[..TOKEN_PREFIX_LEN],
-    )?;
-
-    let mut tx = db.begin().await?;
-    let link = sqlx::query!(
-        "UPDATE login_link SET consumed_at = now()
-         WHERE token_hash = $1 AND consumed_at IS NULL AND expiration > now()
-         RETURNING email, rd, created_by",
-        &t_hash
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(link) = link else {
-        let used = sqlx::query_scalar!(
-            "SELECT consumed_at IS NOT NULL AS \"used!\" FROM login_link WHERE token_hash = $1",
-            &t_hash
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
-        return bounce(match used {
-            Some(true) => "used",
-            Some(false) => "expired",
-            None => "invalid",
-        });
-    };
-
-    // Re-checked at open time and locked through session creation: a promotion inside
-    // the link's window must not turn a link minted for an ordinary account into a
-    // privileged session. The bounce drops the transaction, so the link is not spent.
-    let target = sqlx::query!(
-        "SELECT super_admin, devops FROM password WHERE email = $1 AND disabled = false FOR UPDATE",
-        &link.email
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(target) = target else {
-        return bounce("invalid");
-    };
-    if target.super_admin || target.devops {
-        return bounce("invalid");
-    }
-
-    let session = create_session_token(&link.email, false, None, false, &mut tx, cookies).await?;
-    audit_log(
-        &mut *tx,
-        &AuditAuthor {
-            email: link.email.clone(),
-            username: link.email.clone(),
-            username_override: None,
-            token_prefix: Some(safe_token_prefix(&session)),
-        },
-        "users.login",
-        ActionKind::Create,
-        "global",
-        Some(&truncate_token(&session)),
-        Some(
-            [
-                ("method", "login_link"),
-                ("minted_by", link.created_by.as_str()),
-            ]
-            .into(),
-        ),
-    )
-    .await?;
-    tx.commit().await?;
-
-    let rd = link
-        .rd
-        .or_else(|| same_origin_rd(query.rd))
-        .unwrap_or_else(|| LOGIN_LINK_DEFAULT_RD.to_string());
-    Ok(login_link_redirect(rd))
 }
 
 #[derive(Deserialize)]
@@ -4430,148 +3677,8 @@ async fn overwrite_global_users() -> JsonResult<String> {
 // NOTE: rename_user, update_username_in_workpsace, and RenameUser
 // are in windmill-api (they depend on its secret_backend_ext)
 
-#[derive(Deserialize)]
-pub struct RequestPasswordReset {
-    pub email: String,
-}
-
-#[derive(Deserialize)]
-pub struct ResetPassword {
-    pub token: String,
-    pub new_password: String,
-}
-
-#[derive(Serialize)]
-pub struct PasswordResetResponse {
-    pub message: String,
-}
-
-// Password Reset Functions
-
 /// Check if SMTP is configured
 async fn is_smtp_configured(Extension(db): Extension<DB>) -> JsonResult<bool> {
     let smtp = windmill_common::server::load_smtp_config(&db).await?;
     Ok(Json(smtp.is_some()))
-}
-
-/// Check if password login is disabled (instance-wide)
-async fn is_password_login_disabled() -> JsonResult<bool> {
-    Ok(Json(
-        windmill_common::global_settings::DISABLE_PASSWORD_LOGIN
-            .load(std::sync::atomic::Ordering::Relaxed),
-    ))
-}
-
-/// Request a password reset email
-async fn request_password_reset(
-    Extension(db): Extension<DB>,
-    Json(req): Json<RequestPasswordReset>,
-) -> Result<Json<PasswordResetResponse>> {
-    if windmill_common::global_settings::DISABLE_PASSWORD_LOGIN
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err(Error::BadRequest(
-            "Password login is disabled on this instance".to_string(),
-        ));
-    }
-
-    let email = req.email.to_lowercase();
-
-    // Check if SMTP is configured
-    let smtp = windmill_common::server::load_smtp_config(&db).await?;
-    let smtp = smtp.ok_or_else(|| {
-        Error::BadRequest("SMTP is not configured. Password reset is not available.".to_string())
-    })?;
-
-    // Check if user exists with password login type
-    let user_exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM password WHERE email = $1 AND login_type = 'password')",
-        &email
-    )
-    .fetch_one(&db)
-    .await?
-    .unwrap_or(false);
-
-    // Always return success to prevent email enumeration
-    // But only send email if user exists
-    if user_exists {
-        // Generate a secure token
-        let token = rd_string(32);
-
-        // Delete any existing tokens for this email
-        sqlx::query!("DELETE FROM magic_link WHERE email = $1", &email)
-            .execute(&db)
-            .await?;
-
-        // Insert new token with 1 hour expiration
-        sqlx::query!(
-            "INSERT INTO magic_link (email, token, expiration) VALUES ($1, $2, NOW() + INTERVAL '1 hour')",
-            &email,
-            &token
-        )
-        .execute(&db)
-        .await?;
-
-        // Get the base URL for the reset link
-        let base_url = (**BASE_URL.load()).clone();
-        let base_url = if base_url.is_empty() {
-            std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost".to_string())
-        } else {
-            base_url
-        };
-
-        let reset_link = format!("{}/user/reset-password?token={}", base_url, token);
-
-        // Send the email
-        let subject = "Gantry Password Reset";
-        let content = format!(
-            "You have requested a password reset for your Gantry account.\n\n\
-            Click the link below to reset your password:\n\
-            {}\n\n\
-            This link will expire in 1 hour.\n\n\
-            If you did not request this password reset, you can safely ignore this email.",
-            reset_link
-        );
-
-        // Send the email - don't fail the request if email fails
-        if let Err(e) = windmill_common::email_oss::send_email_plain_text(
-            subject,
-            &content,
-            vec![email.clone()],
-            smtp,
-            Some(Duration::from_secs(10)),
-        )
-        .await
-        {
-            tracing::error!("Failed to send password reset email to {}: {:?}", email, e);
-        }
-    }
-
-    // Always return success to prevent email enumeration
-    Ok(Json(PasswordResetResponse {
-        message: "If an account with that email exists, a password reset link has been sent."
-            .to_string(),
-    }))
-}
-
-// NOTE: reset_password is in windmill-api (depends on users_oss::hash_password)
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Stored hashes outlive the hashing crate: every instance still holds hashes minted by
-    /// older argon2 releases, and an upgrade that stopped reading them locks their users out.
-    #[test]
-    fn verifies_a_hash_minted_by_an_older_argon2() {
-        // The seeded admin hash from migration 20220508150023, m=4096,t=3,p=1.
-        let seeded = "$argon2id$v=19$m=4096,t=3,p=1$oLJo/lPn/gezXCuFOEyaNw$i0T2tCkw3xUFsrBIKZwr8jVNHlIfoxQe+HfDnLtd12I";
-
-        assert!(Argon2::default()
-            .verify_password(b"changeme", seeded)
-            .is_ok());
-        assert!(Argon2::default()
-            .verify_password(b"not-the-password", seeded)
-            .is_err());
-    }
 }

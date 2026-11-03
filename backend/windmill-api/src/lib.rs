@@ -32,7 +32,6 @@ use crate::{
 use windmill_api_agent_workers::AgentCache;
 
 use anyhow::Context;
-use argon2::Argon2;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
@@ -111,6 +110,7 @@ mod workspace_dependencies;
 mod agent_runs;
 mod ai_evals;
 mod approvals;
+mod external_auth;
 #[cfg(feature = "parquet")]
 mod job_helpers_oss;
 pub mod job_metrics;
@@ -118,7 +118,6 @@ pub mod jobs;
 pub mod jobs_export;
 #[cfg(feature = "oauth2")]
 pub mod oauth2_oss;
-mod external_auth;
 mod oidc_oss;
 mod path_autocomplete;
 mod raw_apps;
@@ -157,9 +156,9 @@ mod utils;
 mod variables;
 mod volumes_oss;
 pub mod webhook_util;
+mod workspace_settings_document;
 mod workspaces;
 mod workspaces_export;
-mod workspace_settings_document;
 
 #[cfg(feature = "mcp")]
 mod mcp_tools;
@@ -263,7 +262,6 @@ async fn set_request_client(
     windmill_common::trigger_history::scope_client(client, next.run(req)).await
 }
 
-
 /// Worker name derived from the agent JWT token, used to authenticate volume operations.
 /// Defined unconditionally so volume endpoint handlers can reference it regardless of
 /// whether agent_worker_server is enabled (the extension is only populated on the agent path).
@@ -361,7 +359,6 @@ pub async fn run_server(
         db.clone(),
         std::env::var("SUPERADMIN_SECRET").ok(),
     ));
-    let argon2 = Arc::new(Argon2::default());
 
     // Initialize debug signing key for debugger authentication
     windmill_api_debug::init_debug_signing_key().await;
@@ -738,9 +735,7 @@ pub async fn run_server(
                             "/users",
                             // CORS so the opaque-origin app iframe can read
                             // users/whoami with a scoped embed token.
-                            users::workspaced_service()
-                                .layer(Extension(argon2.clone()))
-                                .layer(cors.clone()),
+                            users::workspaced_service().layer(cors.clone()),
                         )
                         // CORS so a sandboxed raw app's opaque-origin bundle can
                         // read variables with its frontend SDK token. Bearer-only:
@@ -777,10 +772,7 @@ pub async fn run_server(
                         .merge(triggers_service),
                 )
                 .nest("/workspaces", workspaces::global_service())
-                .nest(
-                    "/users",
-                    users::global_service().layer(Extension(argon2.clone())),
-                )
+                .nest("/users", users::global_service())
                 .nest("/settings", windmill_api_settings::global_service())
                 .nest("/workers", windmill_api_workers::global_service())
                 .nest("/service_logs", service_logs::global_service())
@@ -930,15 +922,9 @@ pub async fn run_server(
                     "/w/{workspace_id}/jobs/teams_approval/{job_id}",
                     get(teams_approvals_oss::request_teams_approval),
                 )
-                .nest("/w/{workspace_id}/github_app", {
-                    Router::new()
-                })
-                .nest("/github_app", {
-                    Router::new()
-                })
-                .nest("/w/{workspace_id}/git_sync", {
-                    Router::new()
-                })
+                .nest("/w/{workspace_id}/github_app", { Router::new() })
+                .nest("/github_app", { Router::new() })
+                .nest("/w/{workspace_id}/git_sync", { Router::new() })
                 .nest(
                     "/w/{workspace_id}/resources_u",
                     public_service().layer(cors.clone()),
@@ -952,9 +938,7 @@ pub async fn run_server(
                 })
                 .nest(
                     "/auth",
-                    users::make_unauthed_service()
-                        .merge(external_auth::routes())
-                        .layer(Extension(argon2)),
+                    users::make_unauthed_service().merge(external_auth::routes()),
                 )
                 .nest("/oauth", {
                     #[cfg(feature = "oauth2")]

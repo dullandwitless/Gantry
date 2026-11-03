@@ -9,14 +9,11 @@
 // Re-export everything from windmill-api-users
 pub use windmill_api_users::users::*;
 
-use std::sync::Arc;
-
 use crate::db::{ApiAuthed, OptJobAuthed};
 use crate::secret_backend_ext::{
     reject_http_store_refs_under_prefix, rename_vault_secrets_with_prefix,
     MOVABLE_EXTERNAL_VALUE_SQL,
 };
-use argon2::Argon2;
 use axum::{
     extract::{Extension, Path, Query},
     routing::{get, post},
@@ -24,12 +21,9 @@ use axum::{
 };
 use hyper::StatusCode;
 use serde::Deserialize;
-use windmill_api_auth::{
-    forbid_elevated_job_token, forbid_superadmin_job_token, require_super_admin,
-};
+use windmill_api_auth::{forbid_superadmin_job_token, require_super_admin};
 use windmill_audit::audit_oss::audit_log;
 use windmill_audit::ActionKind;
-use windmill_common::audit::AuditAuthor;
 use windmill_common::usernames::validate_username;
 use windmill_common::{
     error::{self, Error, Result},
@@ -52,8 +46,6 @@ pub fn workspaced_service() -> Router {
 /// Wraps the subcrate's global_service with routes that depend on windmill-api internals.
 pub fn global_service() -> Router {
     windmill_api_users::users::global_service()
-        .route("/setpassword", post(set_password))
-        .route("/set_password_of/{user}", post(set_password_of_user))
         .route("/create", post(create_user))
         .route("/rename/{user}", post(rename_user))
         .route("/onboarding", post(submit_onboarding_data))
@@ -69,10 +61,8 @@ pub fn global_service() -> Router {
         )
 }
 
-/// Wraps the subcrate's make_unauthed_service with routes that depend on windmill-api internals.
 pub fn make_unauthed_service() -> Router {
     windmill_api_users::users::make_unauthed_service()
-        .route("/reset_password", post(reset_password))
 }
 
 async fn create_user(
@@ -80,11 +70,10 @@ async fn create_user(
     OptJobAuthed { job_id, .. }: OptJobAuthed,
     Extension(db): Extension<DB>,
     Extension(webhook): Extension<windmill_common::webhook::WebhookShared>,
-    Extension(argon2): Extension<Arc<Argon2<'_>>>,
     Json(nu): Json<NewUser>,
 ) -> Result<(StatusCode, String)> {
     forbid_superadmin_job_token(&db, &authed.email, job_id).await?;
-    crate::users_oss::create_user(authed, db, webhook, argon2, nu).await
+    crate::users_oss::create_user(authed, db, webhook, nu).await
 }
 
 async fn submit_onboarding_data(
@@ -210,76 +199,6 @@ pub(crate) async fn lock_mcp_oauth_grants(
     };
     sqlx::query(q).bind(email).execute(conn).await?;
     Ok(())
-}
-
-async fn revoke_mcp_oauth_grants(tx: &mut sqlx::PgConnection, email: &str) -> Result<()> {
-    lock_mcp_oauth_grants(&mut *tx, email, true).await?;
-    // The token trigger only notifies for sessions, so evict deleted MCP access tokens explicitly.
-    sqlx::query!(
-        "WITH revoked AS (
-             DELETE FROM token WHERE email = $1 AND label LIKE 'mcp-oauth-%' RETURNING token_prefix
-         ), refresh AS (
-             DELETE FROM mcp_oauth_refresh_token WHERE user_email = $1
-         ), code AS (
-             DELETE FROM mcp_oauth_server_code WHERE user_email = $1
-         )
-         INSERT INTO notify_event (channel, payload)
-         SELECT 'notify_token_invalidation', token_prefix FROM revoked",
-        email
-    )
-    .execute(&mut *tx)
-    .await?;
-    Ok(())
-}
-
-async fn set_password(
-    Extension(db): Extension<DB>,
-    Extension(argon2): Extension<Arc<Argon2<'_>>>,
-    authed: ApiAuthed,
-    Tokened { token }: Tokened,
-    OptJobAuthed { job_id, .. }: OptJobAuthed,
-    Json(ep): Json<EditPassword>,
-) -> Result<String> {
-    // Choosing the password of the elevated account this job runs as is a credential
-    // mint by another name: logging in with it yields a session with no `job_id`
-    // (GHSA-hfh4-cx4h-3fcr).
-    forbid_elevated_job_token(&db, &authed.email, job_id).await?;
-    let email = authed.email.clone();
-    let res = crate::users_oss::set_password(db.clone(), argon2, authed, &email, ep).await?;
-    sqlx::query!(
-        "DELETE FROM token WHERE email = $1 AND label = 'session' AND token_hash != $2",
-        &email,
-        windmill_common::auth::hash_token(&token)
-    )
-    .execute(&db)
-    .await?;
-    let mut tx = db.begin().await?;
-    revoke_mcp_oauth_grants(&mut *tx, &email).await?;
-    tx.commit().await?;
-    Ok(res)
-}
-
-async fn set_password_of_user(
-    Extension(db): Extension<DB>,
-    Extension(argon2): Extension<Arc<Argon2<'_>>>,
-    Path(email): Path<String>,
-    authed: ApiAuthed,
-    OptJobAuthed { job_id, .. }: OptJobAuthed,
-    Json(ep): Json<EditPassword>,
-) -> Result<String> {
-    require_super_admin(&db, &authed).await?;
-    forbid_superadmin_job_token(&db, &authed.email, job_id).await?;
-    let res = crate::users_oss::set_password(db.clone(), argon2, authed, &email, ep).await?;
-    sqlx::query!(
-        "DELETE FROM token WHERE email = $1 AND label = 'session'",
-        &email
-    )
-    .execute(&db)
-    .await?;
-    let mut tx = db.begin().await?;
-    revoke_mcp_oauth_grants(&mut *tx, &email).await?;
-    tx.commit().await?;
-    Ok(res)
 }
 
 #[derive(Deserialize)]
@@ -1066,98 +985,4 @@ async fn update_username_in_workpsace<'c>(
     .await?;
 
     Ok(())
-}
-
-/// Reset password using a token
-async fn reset_password(
-    Extension(db): Extension<DB>,
-    Extension(argon2): Extension<Arc<Argon2<'_>>>,
-    Json(req): Json<ResetPassword>,
-) -> Result<Json<PasswordResetResponse>> {
-    if windmill_common::global_settings::DISABLE_PASSWORD_LOGIN
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err(Error::BadRequest(
-            "Password login is disabled on this instance".to_string(),
-        ));
-    }
-
-    let mut tx = db.begin().await?;
-
-    // Find the token and verify it's not expired
-    let magic_link = sqlx::query!(
-        "SELECT email FROM magic_link WHERE token = $1 AND expiration > NOW()",
-        &req.token
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let email = match magic_link {
-        Some(link) => link.email,
-        None => {
-            return Err(Error::BadRequest(
-                "Invalid or expired password reset token".to_string(),
-            ))
-        }
-    };
-
-    // Hash the new password
-    let password_hash = crate::users_oss::hash_password(argon2, req.new_password)?;
-
-    // Update the password
-    let rows_updated = sqlx::query!(
-        "UPDATE password SET password_hash = $1 WHERE email = $2 AND login_type = 'password'",
-        &password_hash,
-        &email
-    )
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-
-    if rows_updated == 0 {
-        return Err(Error::BadRequest(
-            "Unable to update password. User may not exist or may use a different login method."
-                .to_string(),
-        ));
-    }
-
-    // Delete the used token and any other tokens for this email
-    sqlx::query!("DELETE FROM magic_link WHERE email = $1", &email)
-        .execute(&mut *tx)
-        .await?;
-
-    // Invalidate all existing sessions for this user
-    sqlx::query!(
-        "DELETE FROM token WHERE email = $1 AND label = 'session'",
-        &email
-    )
-    .execute(&mut *tx)
-    .await?;
-    revoke_mcp_oauth_grants(&mut *tx, &email).await?;
-
-    // Audit log
-    let audit_author = AuditAuthor {
-        email: email.clone(),
-        username: email.clone(),
-        username_override: None,
-        token_prefix: None,
-    };
-
-    audit_log(
-        &mut *tx,
-        &audit_author,
-        "users.password_reset",
-        ActionKind::Update,
-        "global",
-        Some(&email),
-        None,
-    )
-    .await?;
-
-    tx.commit().await?;
-
-    Ok(Json(PasswordResetResponse {
-        message: "Password has been reset successfully. You can now log in with your new password."
-            .to_string(),
-    }))
 }

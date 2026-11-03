@@ -10,7 +10,6 @@ use windmill_api_auth::{
     build_scope_path_predicate, check_scopes, require_devops_role, require_instance_admin,
     require_is_writer, require_super_admin, ApiAuthed,
 };
-use windmill_api_users::users::WorkspaceInvite;
 use windmill_common::email_oss::send_email_if_possible;
 use windmill_common::ssrf::{validate_webhook_url, webhook_ssrf_error_message};
 use windmill_common::usernames::{get_instance_username_or_create_pending, validate_username};
@@ -87,13 +86,10 @@ lazy_static::lazy_static! {
 pub fn workspaced_service() -> Router {
     Router::new()
         .route("/get_as_superadmin", get(get_workspace_as_superadmin))
-        .route("/list_pending_invites", get(list_pending_invites))
         .route("/update", post(edit_workspace))
         .route("/archive", post(archive_workspace))
-        .route("/invite_user", post(invite_user))
         .route("/add_user", post(add_user))
         .route("/create_service_account", post(create_service_account))
-        .route("/delete_invite", post(delete_invite))
         .route("/rebuild_dependency_map", post(rebuild_dependency_map))
         .route("/get_dependency_map", get(get_dependency_map))
         .route("/get_dependents/{*imported_path}", get(get_dependents))
@@ -116,7 +112,6 @@ pub fn workspaced_service() -> Router {
         .route("/slack_oauth_config", delete(delete_slack_oauth_config))
         .route("/slack_signing_secret", post(set_slack_signing_secret))
         .route("/edit_webhook", post(edit_webhook))
-        .route("/edit_auto_invite", post(edit_auto_invite))
         .route("/edit_instance_groups", post(edit_instance_groups))
         .route(
             "/get_secondary_storage_names",
@@ -257,7 +252,6 @@ pub fn global_service() -> Router {
         .route("/create_fork", post(deprecated_create_workspace_fork))
         .route("/exists", post(exists_workspace))
         .route("/exists_username", post(exists_username))
-        .route("/allowed_domain_auto_invite", get(is_allowed_auto_domain))
         .route("/unarchive/{workspace}", post(unarchive_workspace))
         .route(
             "/delete/{workspace}",
@@ -603,17 +597,6 @@ struct ValidateUsername {
 }
 
 #[derive(Deserialize)]
-pub struct NewWorkspaceInvite {
-    pub email: String,
-    pub is_admin: bool,
-    /// Legacy role selector, `true` for the `operator` role; `role` wins.
-    #[serde(default)]
-    pub operator: bool,
-    #[serde(default)]
-    pub role: Option<String>,
-}
-
-#[derive(Deserialize)]
 pub struct NewWorkspaceUser {
     pub email: String,
     pub username: Option<String>,
@@ -743,33 +726,6 @@ impl EditSuccessHandler {
 
 lazy_static::lazy_static! {
     pub static ref EMAIL_REGEXP: Regex = Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$").unwrap();
-}
-
-async fn list_pending_invites(
-    authed: ApiAuthed,
-    Extension(user_db): Extension<UserDB>,
-    Path(w_id): Path<String>,
-) -> JsonResult<Vec<WorkspaceInvite>> {
-    require_admin(authed.is_admin, &authed.username)?;
-    let mut tx = user_db.begin(&authed).await?;
-    let rows = sqlx::query_as!(
-        WorkspaceInvite,
-        "SELECT
-            workspace_invite.workspace_id,
-            workspace_invite.email,
-            workspace_invite.is_admin,
-            workspace_invite.operator,
-            COALESCE(workspace_invite.workspace_role, CASE WHEN workspace_invite.operator THEN 'operator' ELSE 'developer' END) AS \"role!\",
-            workspace.parent_workspace_id
-        FROM workspace_invite JOIN workspace ON workspace_invite.workspace_id = workspace.id
-        WHERE workspace_id = $1
-        ORDER BY workspace_invite.email",
-        w_id
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(Json(rows))
 }
 
 async fn is_premium(
@@ -2032,22 +1988,7 @@ async fn get_secondary_storage_names(
     Ok(Json(result))
 }
 
-pub const BANNED_DOMAINS: &str = include_str!("../../windmill-api/banned_domains.txt");
 pub const MAX_CUSTOM_PROMPT_LENGTH: usize = 5000;
-
-async fn is_allowed_auto_domain(ApiAuthed { email, .. }: ApiAuthed) -> JsonResult<bool> {
-    let domain = email.split('@').last().unwrap();
-    return Ok(Json(!BANNED_DOMAINS.contains(domain)));
-}
-
-async fn edit_auto_invite(
-    authed: ApiAuthed,
-    Extension(db): Extension<DB>,
-    Path(w_id): Path<String>,
-    Json(ea): Json<EditAutoInvite>,
-) -> Result<String> {
-    crate::workspaces_oss::edit_auto_invite(authed, db, w_id, ea).await
-}
 
 async fn edit_instance_groups(
     _authed: ApiAuthed,
@@ -5493,8 +5434,7 @@ async fn edit_deploy_ui_config(
 }
 
 #[derive(Deserialize)]
-pub struct EditDefaultApp {
-}
+pub struct EditDefaultApp {}
 
 async fn edit_default_app(
     _authed: ApiAuthed,
@@ -5503,8 +5443,7 @@ async fn edit_default_app(
     Json(_new_config): Json<EditDefaultApp>,
 ) -> Result<String> {
     return Err(Error::BadRequest(
-        "Setting a workspace default app is not supported in Gantry"
-            .to_string(),
+        "Setting a workspace default app is not supported in Gantry".to_string(),
     ));
 }
 
@@ -7741,10 +7680,7 @@ async fn clone_variables(
         .await?;
 
         for path in secret_paths {
-            match backend
-                .get_secret(source_workspace_id, &path)
-                .await
-            {
+            match backend.get_secret(source_workspace_id, &path).await {
                 Ok(plain_value) => {
                     backend
                         .set_secret(target_workspace_id, &path, &plain_value)
@@ -11244,87 +11180,6 @@ async fn workspace_invite_emails_disabled(db: &DB) -> Result<bool> {
     )
 }
 
-async fn invite_user(
-    ApiAuthed { username, is_admin, .. }: ApiAuthed,
-    Extension(db): Extension<DB>,
-    Extension(webhook): Extension<WebhookShared>,
-    Path(w_id): Path<String>,
-    Json(mut nu): Json<NewWorkspaceInvite>,
-) -> Result<(StatusCode, String)> {
-    require_admin(is_admin, &username)?;
-    if nu.role.is_none() {
-        reject_admin_and_operator(nu.is_admin, nu.operator)?;
-    }
-    let (role, role_operator) =
-        resolve_new_member_role(&db, &w_id, nu.operator, nu.role.as_deref()).await?;
-
-    if w_id == "admins" {
-        return Err(Error::BadRequest(
-            "The admins workspace is reserved for superadmins. Members cannot be added to it without an enterprise license.".to_string(),
-        ));
-    }
-
-    nu.email = nu.email.to_lowercase();
-
-    let mut tx = db.begin().await?;
-
-    let already_in_workspace = sqlx::query_scalar!(
-        "SELECT EXISTS (SELECT 1 FROM usr WHERE workspace_id = $1 AND email = $2)",
-        &w_id,
-        nu.email
-    )
-    .fetch_one(&mut *tx)
-    .await?
-    .unwrap_or(false);
-
-    if already_in_workspace {
-        return Err(Error::BadRequest(format!(
-            "user with email {} already exists in workspace {}",
-            nu.email, w_id
-        )));
-    }
-
-    sqlx::query!(
-        "INSERT INTO workspace_invite
-            (workspace_id, email, is_admin, operator, workspace_role)
-            VALUES ($1, $2, $3, $4, $5) ON CONFLICT (workspace_id, email)
-            DO UPDATE SET is_admin = EXCLUDED.is_admin, operator = EXCLUDED.operator,
-                workspace_role = EXCLUDED.workspace_role",
-        &w_id,
-        nu.email,
-        nu.is_admin,
-        role_operator,
-        &role
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    if !workspace_invite_emails_disabled(&db).await? {
-        send_email_if_possible(
-            &format!("Invited to Gantry's workspace: {w_id}"),
-            &format!(
-                "You have been granted access to Gantry's workspace {w_id}
-
-If you do not have an account on {}, login with SSO or ask an admin to create an account for you.",
-                (**BASE_URL.load()).clone()
-            ),
-            &nu.email,
-        );
-    }
-
-    webhook.send_instance_event(InstanceEvent::UserInvitedWorkspace {
-        email: nu.email.clone(),
-        workspace: w_id,
-    });
-
-    Ok((
-        StatusCode::CREATED,
-        format!("user with email {} invited", nu.email),
-    ))
-}
-
 /// Non-admin path for `add_user`: the creator of a fork may bring collaborators into the fork they
 /// created, so a team can work on it without an admin of the fork having to step in. The grant is
 /// deliberately narrow, because a fork holds a full clone of its parent (secrets included) and the
@@ -11587,38 +11442,6 @@ async fn create_service_account(
     Json(nu): Json<NewServiceAccount>,
 ) -> Result<(StatusCode, String)> {
     crate::workspaces_oss::create_service_account(authed, db, w_id, nu).await
-}
-
-async fn delete_invite(
-    ApiAuthed { username, is_admin, .. }: ApiAuthed,
-    Extension(db): Extension<DB>,
-    Path(w_id): Path<String>,
-    Json(nu): Json<NewWorkspaceInvite>,
-) -> Result<(StatusCode, String)> {
-    require_admin(is_admin, &username)?;
-
-    let mut tx = db.begin().await?;
-
-    sqlx::query!(
-        "DELETE FROM workspace_invite WHERE
-        workspace_id = $1 AND email = $2 AND is_admin = $3
-        AND ($5::text IS NOT NULL OR operator = $4)
-        AND ($5::text IS NULL OR $5 = COALESCE(workspace_role, CASE WHEN operator THEN 'operator' ELSE 'developer' END))",
-        &w_id,
-        nu.email,
-        nu.is_admin,
-        nu.operator,
-        nu.role
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    Ok((
-        StatusCode::CREATED,
-        format!("invite to email {} deleted", nu.email),
-    ))
 }
 
 async fn exists_username(
@@ -15158,7 +14981,10 @@ pub async fn apply_settings_edit(
     let (d, p) = (Extension(db), Path(w_id));
     match edit {
         Webhook => edit_webhook(a, d, p, settings_edit_body(edit, body)?).await?,
-        AutoInvite => edit_auto_invite(a, d, p, settings_edit_body(edit, body)?).await?,
+        AutoInvite => {
+            let body = settings_edit_body(edit, body)?.0;
+            crate::workspaces_oss::edit_auto_invite(a, d.0, p.0, body).await?
+        }
         InstanceGroups => edit_instance_groups(a, d, p, settings_edit_body(edit, body)?).await?,
         ErrorHandler => edit_error_handler(a, d, p, settings_edit_body(edit, body)?).await?,
         SuccessHandler => edit_success_handler(a, d, p, settings_edit_body(edit, body)?).await?,

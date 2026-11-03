@@ -1,5 +1,5 @@
-//! Global user creation, password setting and the global settings listing
-//! (specs/users-and-email.md, sections 1, 2 and 5).
+//! Global user creation and the global settings listing (specs/users-and-email.md, sections 1
+//! and 5; specs/single-organisation.md §1: accounts have no password).
 
 use serde_json::json;
 use sqlx::{Pool, Postgres};
@@ -14,28 +14,22 @@ fn bearer(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuil
     builder.header("Authorization", format!("Bearer {token}"))
 }
 
-async fn login(base: &str, email: &str, password: &str) -> anyhow::Result<reqwest::StatusCode> {
-    Ok(client()
-        .post(format!("{base}/auth/login"))
-        .json(&json!({ "email": email, "password": password }))
-        .send()
-        .await?
-        .status())
-}
-
 #[sqlx::test(migrations = "../migrations", fixtures("base"))]
-async fn test_create_user_then_change_password(db: Pool<Postgres>) -> anyhow::Result<()> {
+async fn test_create_user_ahead_of_sign_in(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
     let server = ApiServer::start(db.clone()).await?;
     let base = format!("http://localhost:{}/api", server.addr.port());
+    let create = |token: &'static str, body: serde_json::Value| {
+        bearer(client().post(format!("{base}/users/create")), token)
+            .json(&body)
+            .send()
+    };
 
     // Only a superadmin creates users.
-    let resp = bearer(
-        client().post(format!("{base}/users/create")),
+    let resp = create(
         "SECRET_TOKEN_2",
+        json!({ "email": "new@example.com", "super_admin": false }),
     )
-    .json(&json!({ "email": "new@example.com", "password": "pw-1", "super_admin": false }))
-    .send()
     .await?;
     assert_eq!(
         resp.status(),
@@ -44,55 +38,48 @@ async fn test_create_user_then_change_password(db: Pool<Postgres>) -> anyhow::Re
         resp.text().await?
     );
 
-    // A password account needs a password.
-    let resp = bearer(
-        client().post(format!("{base}/users/create")),
-        "SECRET_TOKEN",
-    )
-    .json(&json!({ "email": "new@example.com", "super_admin": false }))
-    .send()
-    .await?;
-    assert_eq!(
-        resp.status(),
-        400,
-        "create without password: {}",
-        resp.text().await?
-    );
+    // Passwords and login types are refused, not ignored.
+    for extra in [
+        json!({ "password": "pw-1" }),
+        json!({ "login_type": "password" }),
+    ] {
+        let mut body = json!({ "email": "new@example.com", "super_admin": false });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let resp = create("SECRET_TOKEN", body).await?;
+        assert!(
+            resp.status().is_client_error(),
+            "{}: {}",
+            resp.status(),
+            resp.text().await?
+        );
+    }
 
-    let resp = bearer(
-        client().post(format!("{base}/users/create")),
+    let resp = create(
         "SECRET_TOKEN",
+        json!({ "email": "  New@Example.com ", "super_admin": false, "name": "New User" }),
     )
-    .json(&json!({
-        "email": "  New@Example.com ",
-        "password": "pw-1",
-        "super_admin": false,
-        "name": "New User",
-        "skip_email": true,
-    }))
-    .send()
     .await?;
     assert_eq!(resp.status(), 201, "create: {}", resp.text().await?);
 
-    let (login_type, hash, verified, username): (String, String, bool, Option<String>) =
+    let (login_type, hash, verified, username): (String, Option<String>, bool, Option<String>) =
         sqlx::query_as(
             "SELECT login_type, password_hash, verified, username FROM password WHERE email = $1",
         )
         .bind("new@example.com")
         .fetch_one(&db)
         .await?;
-    assert_eq!(login_type, "password");
-    assert!(hash.starts_with("$argon2id$"), "{hash}");
+    assert_eq!(login_type, "pending_oauth", "the first sign-in sets it");
+    assert_eq!(hash, None);
     assert!(verified);
     assert_eq!(username.as_deref(), Some("new"));
 
     // The address is stored lowercased, so a second create is a conflict.
-    let resp = bearer(
-        client().post(format!("{base}/users/create")),
+    let resp = create(
         "SECRET_TOKEN",
+        json!({ "email": "new@example.com", "super_admin": false }),
     )
-    .json(&json!({ "email": "new@example.com", "password": "pw-2", "super_admin": false }))
-    .send()
     .await?;
     assert_eq!(
         resp.status(),
@@ -100,47 +87,6 @@ async fn test_create_user_then_change_password(db: Pool<Postgres>) -> anyhow::Re
         "duplicate create: {}",
         resp.text().await?
     );
-
-    assert_eq!(login(&base, "new@example.com", "pw-1").await?, 200);
-    assert_eq!(login(&base, "new@example.com", "wrong").await?, 400);
-
-    // A superadmin sets someone else's password.
-    let resp = bearer(
-        client().post(format!("{base}/users/set_password_of/new@example.com")),
-        "SECRET_TOKEN",
-    )
-    .json(&json!({ "password": "pw-2" }))
-    .send()
-    .await?;
-    assert_eq!(
-        resp.status(),
-        200,
-        "set_password_of: {}",
-        resp.text().await?
-    );
-    assert_eq!(login(&base, "new@example.com", "pw-1").await?, 400);
-    assert_eq!(login(&base, "new@example.com", "pw-2").await?, 200);
-
-    // An empty password is refused.
-    let resp = bearer(
-        client().post(format!("{base}/users/set_password_of/new@example.com")),
-        "SECRET_TOKEN",
-    )
-    .json(&json!({ "password": "" }))
-    .send()
-    .await?;
-    assert_eq!(resp.status(), 400, "empty password: {}", resp.text().await?);
-
-    // A user sets their own password.
-    let resp = bearer(
-        client().post(format!("{base}/users/setpassword")),
-        "SECRET_TOKEN_2",
-    )
-    .json(&json!({ "password": "own-pw" }))
-    .send()
-    .await?;
-    assert_eq!(resp.status(), 200, "setpassword: {}", resp.text().await?);
-    assert_eq!(login(&base, "test2@windmill.dev", "own-pw").await?, 200);
 
     Ok(())
 }
@@ -151,10 +97,10 @@ async fn test_create_user_adopts_reserved_username(db: Pool<Postgres>) -> anyhow
     let server = ApiServer::start(db.clone()).await?;
     let base = format!("http://localhost:{}/api", server.addr.port());
 
-    // Invited to a workspace before having an account: the username is reserved.
+    // Added to a workspace before having an account: the username is reserved.
     sqlx::query("INSERT INTO pending_user (email, username) VALUES ($1, $2)")
-        .bind("invited@example.com")
-        .bind("invited_reserved")
+        .bind("added@example.com")
+        .bind("added_reserved")
         .execute(&db)
         .await?;
 
@@ -162,49 +108,23 @@ async fn test_create_user_adopts_reserved_username(db: Pool<Postgres>) -> anyhow
         client().post(format!("{base}/users/create")),
         "SECRET_TOKEN",
     )
-    .json(&json!({
-        "email": "invited@example.com",
-        "login_type": "pending_oauth",
-        "super_admin": false,
-        "skip_email": true,
-    }))
+    .json(&json!({ "email": "added@example.com", "super_admin": false }))
     .send()
     .await?;
     assert_eq!(resp.status(), 201, "create: {}", resp.text().await?);
 
-    let (login_type, hash, username): (String, Option<String>, Option<String>) =
-        sqlx::query_as("SELECT login_type, password_hash, username FROM password WHERE email = $1")
-            .bind("invited@example.com")
+    let username: Option<String> =
+        sqlx::query_scalar("SELECT username FROM password WHERE email = $1")
+            .bind("added@example.com")
             .fetch_one(&db)
             .await?;
-    assert_eq!(login_type, "pending_oauth");
-    assert_eq!(hash, None);
-    assert_eq!(username.as_deref(), Some("invited_reserved"));
+    assert_eq!(username.as_deref(), Some("added_reserved"));
 
     let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_user WHERE email = $1")
-        .bind("invited@example.com")
+        .bind("added@example.com")
         .fetch_one(&db)
         .await?;
     assert_eq!(pending, 0, "the reservation is consumed by the account");
-
-    // Setting a password turns the pending account into a password account.
-    let resp = bearer(
-        client().post(format!("{base}/users/set_password_of/invited@example.com")),
-        "SECRET_TOKEN",
-    )
-    .json(&json!({ "password": "now-a-password" }))
-    .send()
-    .await?;
-    assert_eq!(
-        resp.status(),
-        200,
-        "set_password_of: {}",
-        resp.text().await?
-    );
-    assert_eq!(
-        login(&base, "invited@example.com", "now-a-password").await?,
-        200
-    );
 
     Ok(())
 }

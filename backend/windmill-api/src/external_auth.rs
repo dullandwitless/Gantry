@@ -29,6 +29,7 @@ use windmill_common::{
     auth::safe_token_prefix,
     error::{Error, JsonResult, Result},
     oauth2::{InstanceEvent, REQUIRE_PREEXISTING_USER_FOR_OAUTH},
+    organisation::{is_listed_superadmin, join_the_workspace, Joined},
     users::{truncate_token, PENDING_OAUTH_LOGIN_TYPE},
     utils::HTTP_CLIENT,
     BASE_URL,
@@ -297,25 +298,51 @@ async fn sign_in(
     }
 
     let created = account.is_none();
+    let first_sign_in = account.as_ref().map_or(true, |(_, _, login_type)| {
+        login_type == PENDING_OAUTH_LOGIN_TYPE
+    });
+    let listed_superadmin = is_listed_superadmin(email);
     let super_admin = match account {
         Some((super_admin, _, login_type)) => {
-            if login_type == PENDING_OAUTH_LOGIN_TYPE {
-                sqlx::query("UPDATE password SET login_type = $1 WHERE email = $2")
-                    .bind(method)
-                    .bind(email)
-                    .execute(&mut *tx)
-                    .await?;
+            let promote = listed_superadmin && !super_admin;
+            if promote || login_type == PENDING_OAUTH_LOGIN_TYPE {
+                sqlx::query(
+                    "UPDATE password SET
+                        login_type = CASE WHEN login_type = $3 THEN $2 ELSE login_type END,
+                        super_admin = super_admin OR $4
+                     WHERE email = $1",
+                )
+                .bind(email)
+                .bind(method)
+                .bind(PENDING_OAUTH_LOGIN_TYPE)
+                .bind(promote)
+                .execute(&mut *tx)
+                .await?;
             }
-            super_admin
+            if promote {
+                audit_log(
+                    &mut *tx,
+                    &author(None),
+                    "users.update",
+                    ActionKind::Update,
+                    "global",
+                    Some(email),
+                    Some(HashMap::from([(
+                        "super_admin",
+                        "granted by GANTRY_SUPERADMINS",
+                    )])),
+                )
+                .await?;
+            }
+            super_admin || promote
         }
         None => {
             insert_account(
                 &mut tx,
                 &NewAccount {
                     email,
-                    password_hash: None,
                     login_type: method,
-                    super_admin: false,
+                    super_admin: listed_superadmin,
                     name: None,
                     company: None,
                 },
@@ -331,9 +358,27 @@ async fn sign_in(
                 details(),
             )
             .await?;
-            false
+            listed_superadmin
         }
     };
+
+    let joined = if first_sign_in {
+        join_the_workspace(&mut tx, email).await?
+    } else {
+        None
+    };
+    if let Some(joined) = &joined {
+        audit_log(
+            &mut *tx,
+            &AuditAuthor { username: joined.username.clone(), ..author(None) },
+            "users.add_to_workspace",
+            ActionKind::Create,
+            &joined.workspace_id,
+            Some(email),
+            details(),
+        )
+        .await?;
+    }
 
     let token = create_session_token(email, super_admin, None, false, &mut tx, cookies).await?;
     audit_log(
@@ -350,6 +395,12 @@ async fn sign_in(
 
     if created {
         webhook.send_instance_event(InstanceEvent::UserAdded { email: email.to_string() });
+    }
+    if let Some(Joined { workspace_id, .. }) = joined {
+        webhook.send_instance_event(InstanceEvent::UserAddedWorkspace {
+            workspace: workspace_id,
+            email: email.to_string(),
+        });
     }
     Ok(token)
 }

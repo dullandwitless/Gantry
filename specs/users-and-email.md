@@ -22,6 +22,12 @@ Sources:
 - Crate documentation of `argon2` 0.6 and `mail-send` 0.4 (both already dependencies)
 Attestation: I have not read Windmill's frontend source or proprietary code.
 
+> **Superseded in part** by [single-organisation.md](single-organisation.md) §1 (2026-11-03):
+> Gantry has no passwords, password reset or invites. `POST /users/create` takes no password,
+> login type or `skip_email`, creates a `pending_oauth` account and sends no email; section 2
+> and the password parts of the UI section no longer apply. Email (section 4) and the global
+> settings listing are unchanged.
+
 ---
 
 ## 1. Creating a user — `POST /users/create`

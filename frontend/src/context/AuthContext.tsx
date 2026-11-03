@@ -9,7 +9,6 @@ interface AuthContextType {
   signInOptions: SignInOptions;
   /** Why signing in through Identity-Aware Proxy failed, when it did. */
   iapError: string | null;
-  login: (email: string, pass: string) => Promise<void>;
   loginAsMockUser: (email: string) => Promise<void>;
   logout: () => Promise<void>;
 }
@@ -52,8 +51,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUser(profile);
   };
 
-  const login = (email: string, pass: string) => signIn(() => api.login(email, pass));
-
   const loginAsMockUser = (email: string) => signIn(() => api.mockLogin(email));
 
   const logout = async () => {
@@ -69,7 +66,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isLoading,
         signInOptions,
         iapError,
-        login,
         loginAsMockUser,
         logout,
       }}

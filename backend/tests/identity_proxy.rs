@@ -211,3 +211,82 @@ async fn mock_users_only_on_a_local_instance(db: Pool<Postgres>) {
 
     std::env::remove_var("GANTRY_MOCK_USERS");
 }
+
+async fn membership(db: &Pool<Postgres>, email: &str) -> Option<(String, bool)> {
+    sqlx::query_as(
+        "SELECT usr.workspace_role, EXISTS(
+             SELECT 1 FROM usr_to_group g
+             WHERE g.workspace_id = usr.workspace_id AND g.usr = usr.username AND g.group_ = 'all')
+         FROM usr WHERE workspace_id = 'test-workspace' AND email = $1",
+    )
+    .bind(email)
+    .fetch_optional(db)
+    .await
+    .unwrap()
+}
+
+async fn is_super_admin(db: &Pool<Postgres>, email: &str) -> bool {
+    sqlx::query_scalar("SELECT super_admin FROM password WHERE email = $1")
+        .bind(email)
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
+/// specs/single-organisation.md §1: members join on their first sign-in, and
+/// `GANTRY_SUPERADMINS` makes superadmins.
+#[sqlx::test(fixtures("base"))]
+#[serial_test::serial]
+async fn first_sign_in_joins_the_workspace(db: Pool<Postgres>) {
+    std::env::remove_var("IAP_AUDIENCE");
+    std::env::set_var(
+        "GANTRY_MOCK_USERS",
+        "dev@example.com,boss@example.com,ahead@example.com,test2@windmill.dev",
+    );
+    std::env::set_var("GANTRY_SUPERADMINS", "Boss@example.com, test2@windmill.dev");
+    let server = ApiServer::start(db.clone()).await.unwrap();
+    windmill_common::BASE_URL.store(std::sync::Arc::new("http://localhost:8000".to_string()));
+    let api = format!("http://localhost:{}/api", server.addr.port());
+
+    assert_eq!(mock_login(&api, "dev@example.com").await.0, 200);
+    assert_eq!(
+        membership(&db, "dev@example.com").await,
+        Some(("developer".to_string(), true))
+    );
+    assert!(!is_super_admin(&db, "dev@example.com").await);
+
+    // A member an admin removed stays removed.
+    sqlx::query("DELETE FROM usr WHERE email = 'dev@example.com'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(mock_login(&api, "dev@example.com").await.0, 200);
+    assert_eq!(membership(&db, "dev@example.com").await, None);
+
+    // Listed addresses become superadmins, new accounts and existing ones alike.
+    assert_eq!(mock_login(&api, "boss@example.com").await.0, 200);
+    assert!(is_super_admin(&db, "boss@example.com").await);
+    assert!(!is_super_admin(&db, "test2@windmill.dev").await);
+    assert_eq!(mock_login(&api, "test2@windmill.dev").await.0, 200);
+    assert!(is_super_admin(&db, "test2@windmill.dev").await);
+
+    // An account a superadmin created ahead joins on its first sign-in.
+    let res = reqwest::Client::new()
+        .post(format!("{api}/users/create"))
+        .bearer_auth("SECRET_TOKEN")
+        .json(&json!({ "email": "ahead@example.com", "super_admin": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    assert_eq!(membership(&db, "ahead@example.com").await, None);
+    assert_eq!(mock_login(&api, "ahead@example.com").await.0, 200);
+    assert_eq!(
+        login_type(&db, "ahead@example.com").await.as_deref(),
+        Some("mock")
+    );
+    assert!(membership(&db, "ahead@example.com").await.is_some());
+
+    std::env::remove_var("GANTRY_MOCK_USERS");
+    std::env::remove_var("GANTRY_SUPERADMINS");
+}

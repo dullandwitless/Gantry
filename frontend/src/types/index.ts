@@ -295,13 +295,11 @@ export interface GlobalUser {
   role_source: string;
 }
 
-/** Body of `POST /users/create`. */
+/** Body of `POST /users/create`: an account that signs in through IAP, without a password. */
 export interface NewUser {
   email: string;
-  password?: string;
   super_admin: boolean;
   name?: string;
-  skip_email?: boolean;
 }
 
 /** An entry of `GET /w/{workspace}/audit/list` (OpenAPI schema `AuditLog`). */

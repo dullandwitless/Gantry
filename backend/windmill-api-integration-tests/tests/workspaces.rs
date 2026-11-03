@@ -81,14 +81,6 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // --- allowed_domain_auto_invite ---
-    let resp = authed(client().get(format!("{global_base}/allowed_domain_auto_invite")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    resp.json::<bool>().await?;
-
     // --- create workspace ---
     let resp = authed(client().post(format!("{global_base}/create")))
         .json(&json!({
@@ -146,14 +138,6 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-
-    // --- list_pending_invites ---
-    let resp = authed(client().get(format!("{base}/list_pending_invites")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    resp.json::<Vec<serde_json::Value>>().await?;
 
     // --- encryption_key ---
     let resp = authed(client().get(format!("{base}/encryption_key")))
@@ -326,18 +310,6 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .unwrap();
     assert_eq!(resp.status(), 400);
     assert!(resp.text().await?.contains("ALLOW_PRIVATE_WEBHOOK_URLS"));
-
-    // --- edit_auto_invite ---
-    let resp = authed(client().post(format!("{base}/edit_auto_invite")))
-        .json(&json!({"operator": false, "invite_all": false, "auto_add": false}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status() == 200 || resp.status() == 500,
-        "edit_auto_invite: unexpected status {}",
-        resp.status()
-    );
 
     // --- edit_slack_command ---
     let resp = authed(client().post(format!("{base}/edit_slack_command")))
@@ -516,42 +488,6 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "add_user: {}", resp.text().await?);
-
-    // --- invite_user + list_pending_invites + delete_invite ---
-    let resp = authed(client().post(format!("{base}/invite_user")))
-        .json(&json!({
-            "email": "invited@example.com",
-            "is_admin": false,
-            "operator": false
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201, "invite_user: {}", resp.text().await?);
-
-    // verify invite shows in pending
-    let resp = authed(client().get(format!("{base}/list_pending_invites")))
-        .send()
-        .await
-        .unwrap();
-    let invites = resp.json::<Vec<serde_json::Value>>().await?;
-    assert!(
-        invites.iter().any(|i| i["email"] == "invited@example.com"),
-        "invite not found: {:?}",
-        invites
-    );
-
-    // delete invite
-    let resp = authed(client().post(format!("{base}/delete_invite")))
-        .json(&json!({
-            "email": "invited@example.com",
-            "is_admin": false,
-            "operator": false
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201, "delete_invite: {}", resp.text().await?);
 
     // ===== Critical alerts (may return 404) =====
 

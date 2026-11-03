@@ -883,8 +883,7 @@ fn scope_grants_access(
 /// only when it answers from the caller's own account, from the request body, or with
 /// content identical for every workspace (the Hub proxy, the documentation) — never
 /// naming another workspace, and never disclosing instance configuration. `usage` reads
-/// the caller's own row; `email` and `allowed_domain_auto_invite` are derived from the
-/// token itself and touch no table.
+/// the caller's own row; `email` is derived from the token itself and touches no table.
 ///
 /// Three instance settings are on the list. `get_global_setting` exempts a handful of keys
 /// from its own super-admin gate, these among them, so each is already readable by every
@@ -897,8 +896,7 @@ fn scope_grants_access(
 /// refuses every job token, so `hub_api_secret`, which that pull reads for a private Hub,
 /// stays out of a job's reach whatever this list says.
 ///
-/// Deliberately absent, as each crosses that line: `users/list_invites` (returns the
-/// workspace ids the identity was invited to), `users/tokens/list` (credential metadata
+/// Deliberately absent, as each crosses that line: `users/tokens/list` (credential metadata
 /// of the borrowed identity), `users/exists/{email}` (an oracle over arbitrary
 /// addresses, not the caller's own), and `workspaces/list` / `workspaces/users`.
 ///
@@ -911,7 +909,6 @@ fn is_global_read_open_to_job_token(route_path: &str) -> bool {
             | "/api/users/email"
             | "/api/users/usage"
             | "/api/users/tutorial_progress"
-            | "/api/workspaces/allowed_domain_auto_invite"
             | "/api/settings/global/automate_username_creation"
             | "/api/settings/global/uid"
             | "/api/settings/global/hub_base_url"

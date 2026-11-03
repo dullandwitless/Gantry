@@ -11,9 +11,10 @@ reason). It names features, not how upstream builds them.
 
 ## Implemented since this list was compiled
 
-- **Users and passwords**, **email** and the **global settings listing**:
+- **Users**, **email** and the **global settings listing**:
   [users-and-email.md](users-and-email.md). Email needs the `smtp` cargo feature;
-  a build without it says so instead of sending.
+  a build without it says so instead of sending. Passwords and invites were later removed:
+  [single-organisation.md](single-organisation.md).
 - **Audit logs**: writing and listing ([audit-logs.md](audit-logs.md)). Export to
   object storage and OpenTelemetry is not implemented.
 - **Concurrency limits**: [concurrency-limits.md](concurrency-limits.md).

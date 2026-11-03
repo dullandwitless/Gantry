@@ -81,16 +81,6 @@ class GantryApiClient {
     }
   }
 
-  // Authentication
-  async login(email: string, password: string): Promise<string> {
-    const token = await this.request<string>('/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    });
-    this.setToken(token);
-    return token;
-  }
-
   // Sign-in through Identity-Aware Proxy, or as a mock user in local development
   // (specs/identity-aware-proxy.md).
   async getSignInOptions(): Promise<SignInOptions> {
@@ -130,39 +120,6 @@ class GantryApiClient {
     }
   }
 
-  async isFirstTimeSetup(): Promise<boolean> {
-    try {
-      return await this.request<boolean>('/auth/is_first_time_setup');
-    } catch {
-      return false;
-    }
-  }
-
-  // Passwords (specs/users-and-email.md, section 6)
-  async setOwnPassword(password: string): Promise<void> {
-    await this.request('/users/setpassword', { method: 'POST', body: JSON.stringify({ password }) });
-  }
-
-  async isSmtpConfigured(): Promise<boolean> {
-    return (await this.request<boolean>('/auth/is_smtp_configured')) === true;
-  }
-
-  /** Returns the server's message, which is the same whether or not the account exists. */
-  async requestPasswordReset(email: string): Promise<string> {
-    const res = await this.request<{ message: string }>('/auth/request_password_reset', {
-      method: 'POST',
-      body: JSON.stringify({ email }),
-    });
-    return res.message;
-  }
-
-  async resetPassword(token: string, newPassword: string): Promise<void> {
-    await this.request('/auth/reset_password', {
-      method: 'POST',
-      body: JSON.stringify({ token, new_password: newPassword }),
-    });
-  }
-
   // Audit log (specs/audit-logs.md)
   async listAuditLogs(
     workspace: string,
@@ -187,13 +144,6 @@ class GantryApiClient {
 
   async createUser(user: NewUser): Promise<void> {
     await this.request('/users/create', { method: 'POST', body: JSON.stringify(user) });
-  }
-
-  async setPasswordOf(email: string, password: string): Promise<void> {
-    await this.request(`/users/set_password_of/${encodeURIComponent(email)}`, {
-      method: 'POST',
-      body: JSON.stringify({ password }),
-    });
   }
 
   // Workspaces

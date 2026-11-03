@@ -123,18 +123,6 @@ async fn test_wm_token_is_confined_to_its_workspace(db: Pool<Postgres>) -> anyho
         resp.text().await?
     );
 
-    // 4. Cannot reset its own (the superadmin's) password.
-    let resp = authed(client().post(format!("{base}/setpassword")), &sa_wm)
-        .json(&json!({ "password": "hunter2" }))
-        .send()
-        .await?;
-    assert_eq!(
-        resp.status(),
-        403,
-        "superadmin WM_TOKEN must not reset passwords: {}",
-        resp.text().await?
-    );
-
     // 4b. Cannot delete a user.
     let resp = authed(
         client().delete(format!("{base}/delete/test2@windmill.dev")),
@@ -146,21 +134,6 @@ async fn test_wm_token_is_confined_to_its_workspace(db: Pool<Postgres>) -> anyho
         resp.status(),
         403,
         "superadmin WM_TOKEN must not delete users: {}",
-        resp.text().await?
-    );
-
-    // 4c. Cannot change a user's login type.
-    let resp = authed(
-        client().post(format!("{base}/set_login_type/test2@windmill.dev")),
-        &sa_wm,
-    )
-    .json(&json!({ "login_type": "password" }))
-    .send()
-    .await?;
-    assert_eq!(
-        resp.status(),
-        403,
-        "superadmin WM_TOKEN must not change login type: {}",
         resp.text().await?
     );
 
@@ -303,12 +276,7 @@ async fn test_wm_token_is_confined_to_its_workspace(db: Pool<Postgres>) -> anyho
 
     // 10. The rest of the allowlist: routes that answer from the caller's own account or
     //     from the request body alone.
-    for route in [
-        "users/email",
-        "users/usage",
-        "users/tutorial_progress",
-        "workspaces/allowed_domain_auto_invite",
-    ] {
+    for route in ["users/email", "users/usage", "users/tutorial_progress"] {
         let resp = authed(client().get(format!("{api}/{route}")), &user_wm)
             .send()
             .await?;
@@ -385,7 +353,7 @@ async fn test_wm_token_is_confined_to_its_workspace(db: Pool<Postgres>) -> anyho
 
     // 11. ...and the caller-scoped reads deliberately left out of it, each because it
     //     names another workspace or the identity's credentials.
-    for route in ["users/list_invites", "users/tokens/list", "workspaces/list"] {
+    for route in ["users/tokens/list", "workspaces/list"] {
         let resp = authed(client().get(format!("{api}/{route}")), &user_wm)
             .send()
             .await?;
@@ -753,19 +721,6 @@ async fn test_wm_token_cannot_mint_a_provenance_free_credential(
         resp.status(),
         403,
         "devops WM_TOKEN must not mint a token: {}",
-        resp.text().await?
-    );
-
-    // 3. Choosing the password of the elevated account it runs as would let the
-    //    holder log in for a session that carries no job provenance at all.
-    let resp = authed(client().post(format!("{base}/setpassword")), &devops_wm)
-        .json(&json!({ "password": "hunter2" }))
-        .send()
-        .await?;
-    assert_eq!(
-        resp.status(),
-        403,
-        "devops WM_TOKEN must not set its account password: {}",
         resp.text().await?
     );
 

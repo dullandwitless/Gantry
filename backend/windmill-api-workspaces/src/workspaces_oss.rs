@@ -11,14 +11,16 @@ use windmill_common::{
     DB,
 };
 
+/// Gantry has no invites: members join on their first sign-in (specs/single-organisation.md
+/// §1). Reached only from the workspace settings document.
 pub async fn edit_auto_invite(
     _authed: ApiAuthed,
     _db: DB,
     _w_id: String,
     _ea: EditAutoInvite,
-) -> windmill_common::error::Result<String> {
-    Err(windmill_common::error::Error::internal_err(
-        "Not implemented on OSS".to_string(),
+) -> Result<String> {
+    Err(Error::BadRequest(
+        "Gantry has no auto-invite: members join the workspace when they first sign in".to_string(),
     ))
 }
 
