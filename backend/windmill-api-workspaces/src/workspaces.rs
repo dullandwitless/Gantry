@@ -7728,28 +7728,17 @@ async fn clone_variables(
 
         // With Secret Manager only marked secrets live there; the others are database
         // ciphertext that came with the rows (specs/gcp-secret-manager.md §4).
-        let secret_paths: Vec<String> = if backend.backend_name()
-            == windmill_common::secret_backend::gcp_secret_manager::BACKEND_NAME
-        {
-            sqlx::query_scalar(
-                "SELECT path FROM variable
-                 WHERE workspace_id = $1 AND is_secret AND starts_with(value, '$gcp_sm:')",
-            )
-            .bind(target_workspace_id)
-            .fetch_all(&mut **tx)
-            .await?
-        } else {
-            sqlx::query!(
-                "SELECT path FROM variable
-                 WHERE workspace_id = $1 AND is_secret = true AND value != ''",
-                target_workspace_id,
-            )
-            .fetch_all(&mut **tx)
-            .await?
-            .into_iter()
-            .map(|v| v.path)
-            .collect()
-        };
+        let only_marked = backend.backend_name()
+            == windmill_common::secret_backend::gcp_secret_manager::BACKEND_NAME;
+        let secret_paths: Vec<String> = sqlx::query_scalar(
+            "SELECT path FROM variable
+             WHERE workspace_id = $1 AND is_secret AND value != ''
+               AND (NOT $2 OR starts_with(value, '$gcp_sm:'))",
+        )
+        .bind(target_workspace_id)
+        .bind(only_marked)
+        .fetch_all(&mut **tx)
+        .await?;
 
         for path in secret_paths {
             match backend
