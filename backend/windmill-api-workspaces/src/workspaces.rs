@@ -626,7 +626,7 @@ pub struct NewWorkspaceUser {
 
 /// The role a new member or invite gets, `role` if given, else the one the legacy `operator` flag
 /// names, and the `usr.operator` value that goes with it: "cannot write code".
-async fn resolve_new_member_role(
+pub(crate) async fn resolve_new_member_role(
     db: &DB,
     w_id: &str,
     operator: bool,
@@ -650,7 +650,7 @@ async fn resolve_new_member_role(
 
 /// The role is one choice stored as two flags; both set would show as admin in the UI while the
 /// server refuses the user as an operator.
-fn reject_admin_and_operator(is_admin: bool, operator: bool) -> Result<()> {
+pub(crate) fn reject_admin_and_operator(is_admin: bool, operator: bool) -> Result<()> {
     if is_admin && operator {
         return Err(Error::BadRequest(
             "A user cannot be both admin and operator".to_string(),

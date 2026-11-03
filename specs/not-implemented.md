@@ -26,12 +26,14 @@ reason). It names features, not how upstream builds them.
   integration.
 - **Sign-in through Google Cloud Identity-Aware Proxy**, and mock users for local
   development: [identity-aware-proxy.md](identity-aware-proxy.md).
+- **Service accounts**: creation and impersonation
+  ([service-accounts.md](service-accounts.md)); no UI yet.
 
 ## Identity and access
 
 - SSO login with SAML or OAuth providers (Gantry signs in through Identity-Aware Proxy
   instead); SCIM provisioning.
-- Service accounts; custom workspace and instance roles; instance groups.
+- Custom workspace and instance roles; a UI for service accounts.
 - Workload identity through Gantry's OIDC provider (AWS roles, Azure, Anthropic).
 - Data table roles, ACLs, permissions and replay.
 

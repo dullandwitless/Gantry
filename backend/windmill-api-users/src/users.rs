@@ -3065,7 +3065,7 @@ pub async fn create_session_token<'c>(
     Ok(token)
 }
 
-fn set_session_cookie(cookies: &Cookies, token: &str, validity_seconds: i64) {
+pub(crate) fn set_session_cookie(cookies: &Cookies, token: &str, validity_seconds: i64) {
     let mut cookie = Cookie::new(COOKIE_NAME, token.to_string());
     cookie.set_secure(IS_SECURE.load(std::sync::atomic::Ordering::Relaxed));
     cookie.set_same_site(Some(tower_cookies::cookie::SameSite::Lax));
