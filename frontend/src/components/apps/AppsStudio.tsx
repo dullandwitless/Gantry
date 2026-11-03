@@ -8,7 +8,7 @@ import { AppWindow, Code2, Info } from 'lucide-react';
 const EXECUTION_MODES: Record<AppExecutionMode, string> = {
   viewer: 'Runnables run as the user viewing the app',
   publisher: 'Runnables run as the app’s publisher',
-  anonymous: 'Public: anyone with the link can use it',
+  anonymous: 'Saved as public; Gantry runs it as the publisher for signed-in members only',
 };
 
 /** Source files of a full-code app (`value.files`, path to content), if it has any. */

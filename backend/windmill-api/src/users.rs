@@ -187,6 +187,8 @@ async fn list_guests(
 }
 
 /// Shared while issuing an MCP OAuth grant, exclusive while revoking: no grant outlives a revoke.
+/// Gantry revoked grants only when a password changed, so issuing is the one taker left.
+#[cfg(feature = "mcp")]
 pub(crate) async fn lock_mcp_oauth_grants(
     conn: &mut sqlx::PgConnection,
     email: &str,

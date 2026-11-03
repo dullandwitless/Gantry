@@ -584,20 +584,6 @@ async fn test_wm_token_rejected_by_instance_admin_gates(db: Pool<Postgres>) -> a
     // superadmin: is_admin=true, but carrying a job_id.
     let sa_wm = wm_token("test@windmill.dev", true).await;
 
-    // 1. Arbitrary workspace unarchive (mutation on any workspace by id).
-    let resp = authed(
-        client().post(format!("{base}/workspaces/unarchive/test-workspace")),
-        &sa_wm,
-    )
-    .send()
-    .await?;
-    assert_eq!(
-        resp.status(),
-        403,
-        "superadmin WM_TOKEN must not unarchive an arbitrary workspace: {}",
-        resp.text().await?
-    );
-
     // 2. Global concurrency-group pruning.
     let resp = authed(
         client().delete(format!("{base}/concurrency_groups/prune/anykey")),
@@ -935,62 +921,6 @@ async fn test_wm_token_cannot_destroy_its_on_behalf_account(
             .fetch_one(&db)
             .await?;
     assert!(token_rows > 0, "the identity's tokens must survive");
-
-    Ok(())
-}
-
-/// `load_workspace_authed` grants an admin claim in a workspace the caller may have
-/// no relationship with, and carries `job_id` into the result — so deriving it from
-/// the on-behalf email would hand a WM_TOKEN admin over every workspace on the
-/// instance, and with it the cross-workspace diff (GHSA-hfh4-cx4h-3fcr).
-#[sqlx::test(fixtures("preserve_on_behalf_of"))]
-async fn test_wm_token_gets_no_admin_claim_in_a_foreign_workspace(
-    db: Pool<Postgres>,
-) -> anyhow::Result<()> {
-    initialize_tracing().await;
-    set_jwt_secret().await;
-
-    // A workspace the superadmin identity is not a member of.
-    sqlx::query(
-        "INSERT INTO workspace (id, name, owner) VALUES ('other-workspace', 'Other', 'test-user')",
-    )
-    .execute(&db)
-    .await?;
-
-    let server = ApiServer::start(db.clone()).await?;
-    let port = server.addr.port();
-    let base = format!("http://localhost:{port}/api");
-
-    let sa_wm = wm_token("test@windmill.dev", true).await;
-    let resp = authed(
-        client().get(format!(
-            "{base}/w/test-workspace/workspaces/compare/other-workspace"
-        )),
-        &sa_wm,
-    )
-    .send()
-    .await?;
-    assert_ne!(
-        resp.status(),
-        200,
-        "superadmin WM_TOKEN must not diff a workspace it does not belong to"
-    );
-
-    // No false positive: a real superadmin token still holds the claim.
-    let resp = authed(
-        client().get(format!(
-            "{base}/w/test-workspace/workspaces/compare/other-workspace"
-        )),
-        "SECRET_TOKEN",
-    )
-    .send()
-    .await?;
-    assert_eq!(
-        resp.status(),
-        200,
-        "a real superadmin token must still diff across workspaces: {}",
-        resp.text().await?
-    );
 
     Ok(())
 }

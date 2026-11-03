@@ -6762,8 +6762,9 @@ lazy_static::lazy_static! {
 
 }
 
+/// Always: only a superadmin sets up the instance's workspace (specs/single-organisation.md §2).
 async fn create_workspace_require_superadmin() -> String {
-    format!("{}", *CREATE_WORKSPACE_REQUIRE_SUPERADMIN)
+    "true".to_string()
 }
 
 async fn create_workspace(
@@ -6771,9 +6772,8 @@ async fn create_workspace(
     Extension(db): Extension<DB>,
     Json(nw): Json<CreateWorkspace>,
 ) -> Result<String> {
-    if *CREATE_WORKSPACE_REQUIRE_SUPERADMIN {
-        require_super_admin(&db, &authed).await?;
-    }
+    // One workspace per instance, set up by a superadmin (specs/single-organisation.md §2).
+    require_super_admin(&db, &authed).await?;
 
     if *CLOUD_HOSTED {
         let nb_workspaces = sqlx::query_scalar!(
@@ -6794,6 +6794,15 @@ async fn create_workspace(
 
     let mut tx: Transaction<'_, Postgres> = db.begin().await?;
 
+    // Serialises concurrent creations, so the check below holds until commit.
+    sqlx::query("LOCK TABLE workspace IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if let Some(existing) = windmill_common::organisation::the_workspace(&mut tx).await? {
+        return Err(Error::BadRequest(format!(
+            "this instance already has its workspace, {existing}"
+        )));
+    }
     check_w_id_conflict(&mut tx, &nw.id).await?;
     sqlx::query!(
         "INSERT INTO workspace
@@ -6914,6 +6923,30 @@ async fn create_workspace(
         None,
     )
     .await?;
+
+    // Whoever signed in before the workspace existed joins it now, as they would have then.
+    let accounts: Vec<String> =
+        sqlx::query_scalar("SELECT email FROM password WHERE NOT disabled ORDER BY email")
+            .fetch_all(&mut *tx)
+            .await?;
+    for email in accounts {
+        if windmill_common::organisation::join_the_workspace(&mut tx, &email)
+            .await?
+            .is_some()
+        {
+            audit_log(
+                &mut *tx,
+                &authed,
+                "users.add_to_workspace",
+                ActionKind::Create,
+                &nw.id,
+                Some(&email),
+                None,
+            )
+            .await?;
+        }
+    }
+
     tx.commit().await?;
     Ok(format!("Created workspace {}", &nw.id))
 }

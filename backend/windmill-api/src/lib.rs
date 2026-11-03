@@ -127,6 +127,7 @@ mod scim_oss;
 mod scripts;
 mod secret_backend_ext;
 mod service_logs;
+mod single_organisation;
 // Nothing reaches the Slack answering path: there are no Slack event handlers.
 #[allow(dead_code)]
 mod slack_agents;
@@ -922,9 +923,9 @@ pub async fn run_server(
                     "/w/{workspace_id}/jobs/teams_approval/{job_id}",
                     get(teams_approvals_oss::request_teams_approval),
                 )
-                .nest("/w/{workspace_id}/github_app", { Router::new() })
-                .nest("/github_app", { Router::new() })
-                .nest("/w/{workspace_id}/git_sync", { Router::new() })
+                .nest("/w/{workspace_id}/github_app", Router::new())
+                .nest("/github_app", Router::new())
+                .nest("/w/{workspace_id}/git_sync", Router::new())
                 .nest(
                     "/w/{workspace_id}/resources_u",
                     public_service().layer(cors.clone()),
@@ -1112,6 +1113,8 @@ pub async fn run_server(
     let app = app.layer(axum::middleware::from_fn(set_deploy_origin));
 
     let app = app.layer(axum::middleware::from_fn(set_request_client));
+
+    let app = app.layer(axum::middleware::from_fn(single_organisation::refuse_cut_routes));
 
     let app = app.layer(CatchPanicLayer::custom(|err| {
         tracing::error!("panic in handler, returning 500: {:?}", err);

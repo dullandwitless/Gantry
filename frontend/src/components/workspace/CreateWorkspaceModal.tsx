@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useWorkspace } from '../../context/WorkspaceContext';
 import { useToast } from '../../context/ToastContext';
-import { Layers, Plus, ArrowRight } from 'lucide-react';
+import { Layers, ArrowRight } from 'lucide-react';
 
 interface Props {
   isOpen: boolean;
@@ -37,9 +37,10 @@ export const CreateWorkspaceModal: React.FC<Props> = ({ isOpen }) => {
           <div className="w-12 h-12 rounded-2xl bg-brand-500/10 border border-brand-500/30 flex items-center justify-center mx-auto text-brand-500 mb-2">
             <Layers className="w-6 h-6" />
           </div>
-          <h2 className="text-lg font-bold text-slate-100">Create Your First Workspace</h2>
+          <h2 className="text-lg font-bold text-slate-100">Set Up the Workspace</h2>
           <p className="text-xs text-slate-400">
-            Workspaces organize scripts, flows, credentials, and background executions.
+            Gantry has one workspace for scripts, flows, credentials and runs. Everyone who has signed
+            in joins it.
           </p>
         </div>
 
@@ -52,7 +53,7 @@ export const CreateWorkspaceModal: React.FC<Props> = ({ isOpen }) => {
               pattern="^[a-z0-9_-]+$"
               value={id}
               onChange={(e) => setId(e.target.value)}
-              placeholder="e.g. main, dev, production"
+              placeholder="e.g. main"
               className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3 py-2 text-xs font-mono text-slate-100 placeholder-slate-500 focus:outline-none focus:border-brand-500"
             />
             <span className="text-[10px] text-slate-500 font-mono">Allowed: lowercase letters, numbers, dash, underscore</span>

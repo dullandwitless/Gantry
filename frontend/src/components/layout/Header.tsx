@@ -9,26 +9,16 @@ interface HeaderProps {
 }
 
 export const Header: React.FC<HeaderProps> = ({ onOpenSearch, activeTab }) => {
-  const { currentWorkspace, setWorkspace, workspaces } = useWorkspace();
+  const { workspaceName } = useWorkspace();
   const { user, logout } = useAuth();
 
   return (
     <header className="h-14 border-b border-slate-800 bg-slate-900/60 backdrop-blur px-4 flex items-center justify-between sticky top-0 z-20">
       <div className="flex items-center gap-4">
-        {/* Workspace Dropdown */}
-        <div className="flex items-center gap-2 bg-slate-800/80 hover:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700/60 text-sm transition-colors">
+        {/* The instance's one workspace */}
+        <div className="flex items-center gap-2 bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700/60 text-sm">
           <Layers className="w-4 h-4 text-brand-500" />
-          <select
-            value={currentWorkspace}
-            onChange={(e) => setWorkspace(e.target.value)}
-            className="bg-transparent text-slate-200 font-medium focus:outline-none cursor-pointer"
-          >
-            {Array.isArray(workspaces) && workspaces.map((w) => (
-              <option key={w.id} value={w.id} className="bg-slate-900 text-slate-100">
-                {w.name} ({w.id})
-              </option>
-            ))}
-          </select>
+          <span className="text-slate-200 font-medium">{workspaceName}</span>
         </div>
 
         {/* Breadcrumb Area */}

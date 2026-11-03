@@ -41,7 +41,7 @@ use tracing::Instrument;
 use windmill_audit::audit_oss::audit_log;
 use windmill_audit::ActionKind;
 use windmill_common::audit::AuditAuthor;
-use windmill_common::auth::{hash_token, TOKEN_PREFIX_LEN};
+use windmill_common::auth::TOKEN_PREFIX_LEN;
 use windmill_common::global_settings::{
     load_value_from_global_settings, parse_max_token_expiration_days,
     MAX_TOKEN_EXPIRATION_DAYS_SETTING,

@@ -81,25 +81,6 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // --- create workspace ---
-    let resp = authed(client().post(format!("{global_base}/create")))
-        .json(&json!({
-            "id": "new-test-ws",
-            "name": "New Test Workspace"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "create: {}", resp.text().await?);
-
-    // verify it exists
-    let resp = authed(client().post(format!("{global_base}/exists")))
-        .json(&json!({"id": "new-test-ws"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.json::<bool>().await?, true);
-
     // ===== Workspace-scoped endpoints (read) =====
 
     // --- get_settings ---
@@ -452,19 +433,6 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         resp.text().await?
     );
 
-    // --- edit_public_app_rate_limit ---
-    let resp = authed(client().post(format!("{base}/public_app_rate_limit")))
-        .json(&json!({"public_app_execution_limit_per_minute": null}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "edit_public_app_rate_limit: {}",
-        resp.text().await?
-    );
-
     // --- rebuild_dependency_map ---
     let resp = authed(client().post(format!("{base}/rebuild_dependency_map")))
         .send()
@@ -544,36 +512,6 @@ async fn test_workspace_endpoints(db: Pool<Postgres>) -> anyhow::Result<()> {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "tarball: {}", resp.status());
-
-    // --- archive workspace (on the newly created one, not our main test workspace) ---
-    let new_ws_base = format!("http://localhost:{port}/api/w/new-test-ws/workspaces");
-    let resp = authed(client().post(format!("{new_ws_base}/archive")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "archive: {}", resp.text().await?);
-
-    // --- unarchive workspace (global) ---
-    let resp = authed(client().post(format!("{global_base}/unarchive/new-test-ws")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "unarchive: {}", resp.text().await?);
-
-    // --- delete workspace (global) ---
-    let resp = authed(client().delete(format!("{global_base}/delete/new-test-ws")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "delete: {}", resp.text().await?);
-
-    // verify deleted
-    let resp = authed(client().post(format!("{global_base}/exists")))
-        .json(&json!({"id": "new-test-ws"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.json::<bool>().await?, false);
 
     // --- create_workspace_require_superadmin ---
     let resp = authed(client().get(format!("{global_base}/create_workspace_require_superadmin")))
@@ -949,15 +887,11 @@ async fn test_admin_and_operator_are_exclusive(db: Pool<Postgres>) -> anyhow::Re
     Ok(())
 }
 
+/// specs/single-organisation.md §2: a superadmin creates the instance's one workspace, which
+/// every account that exists by then joins.
 #[sqlx::test(migrations = "../migrations", fixtures("base"))]
-async fn test_create_workspace_validates_chosen_username(db: Pool<Postgres>) -> anyhow::Result<()> {
+async fn test_the_one_workspace(db: Pool<Postgres>) -> anyhow::Result<()> {
     initialize_tracing().await;
-    sqlx::query(
-        "INSERT INTO global_settings (name, value) VALUES ('automate_username_creation', 'false') \
-         ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
-    )
-    .execute(&db)
-    .await?;
     let server = ApiServer::start(db.clone()).await?;
     let create = format!(
         "http://localhost:{}/api/workspaces/create",
@@ -965,16 +899,58 @@ async fn test_create_workspace_validates_chosen_username(db: Pool<Postgres>) -> 
     );
 
     let resp = authed(client().post(&create))
-        .json(&json!({"id": "ws-hyphen", "name": "ws-hyphen", "username": "jean-luc"}))
+        .json(&json!({"id": "second", "name": "second"}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 400, "{}", resp.text().await?);
+
+    // With the fixture's workspace archived, the instance has none.
+    sqlx::query("UPDATE workspace SET deleted = true WHERE id = 'test-workspace'")
+        .execute(&db)
+        .await?;
+    sqlx::query(
+        "INSERT INTO global_settings (name, value) VALUES ('automate_username_creation', 'false') \
+         ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await?;
+
+    let resp = client()
+        .post(&create)
+        .bearer_auth("SECRET_TOKEN_2")
+        .json(&json!({"id": "main", "name": "main", "username": "jean_luc"}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        401,
+        "only a superadmin: {}",
+        resp.text().await?
+    );
+
+    let resp = authed(client().post(&create))
+        .json(&json!({"id": "main", "name": "main", "username": "jean-luc"}))
         .send()
         .await?;
     assert_eq!(resp.status(), 400, "{}", resp.text().await?);
 
     let resp = authed(client().post(&create))
-        .json(&json!({"id": "ws-ok", "name": "ws-ok", "username": "jean_luc"}))
+        .json(&json!({"id": "main", "name": "main", "username": "jean_luc"}))
         .send()
         .await?;
     assert_eq!(resp.status(), 200, "{}", resp.text().await?);
 
+    let members: Vec<String> =
+        sqlx::query_scalar("SELECT email FROM usr WHERE workspace_id = 'main' ORDER BY email")
+            .fetch_all(&db)
+            .await?;
+    assert_eq!(
+        members,
+        [
+            "test2@windmill.dev",
+            "test3@windmill.dev",
+            "test@windmill.dev"
+        ]
+    );
     Ok(())
 }

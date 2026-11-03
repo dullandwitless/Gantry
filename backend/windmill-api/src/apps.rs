@@ -354,33 +354,38 @@ fn refuse_unscopable_guest_app(path: &str, mode: ExecutionMode) -> Result<()> {
     Ok(())
 }
 
-/// Refuse *widening* an app into guests where the deployment has none
-/// (`instance_supports_guests`). Only the transition is refused, like the protection
-/// rule below it: an app already stored in the mode — deployed before the instance
-/// became a cloud one, or pushed by git-sync — keeps deploying, and keeps being inert,
-/// since every guest gate refuses it anyway. `deployed_mode` is what the app is stored
-/// as, `None` when it is being created.
-fn refuse_guest_mode_where_unavailable(
+/// Refuse *widening* an app past signed-in members where the deployment cannot open one:
+/// anonymous access never (Gantry has no public sharing, specs/single-organisation.md §3),
+/// guests where the deployment has none (`instance_supports_guests`). Only the transition is
+/// refused, like the protection rule below it: an app already stored in the mode keeps
+/// deploying, and keeps being inert, since the viewer gates refuse it anyway.
+/// `deployed_mode` is what the app is stored as, `None` when it is being created.
+fn refuse_mode_where_unavailable(
     path: &str,
     mode: ExecutionMode,
     deployed_mode: Option<ExecutionMode>,
 ) -> Result<()> {
-    if !matches!(mode, ExecutionMode::Guest)
-        || deployed_mode == Some(ExecutionMode::Guest)
-        || windmill_common::workspaces::instance_supports_guests()
-    {
+    if deployed_mode == Some(mode) {
         return Ok(());
     }
+    let unavailable = match mode {
+        ExecutionMode::Anonymous => "Gantry has no public apps",
+        ExecutionMode::Guest if !windmill_common::workspaces::instance_supports_guests() => {
+            windmill_common::workspaces::GUESTS_UNAVAILABLE_MESSAGE
+        }
+        _ => return Ok(()),
+    };
     Err(Error::BadRequest(format!(
-        "app {path} cannot be set to Guests: {}",
-        windmill_common::workspaces::GUESTS_UNAVAILABLE_MESSAGE
+        "app {path} cannot be set to {}: {unavailable}",
+        mode.as_str()
     )))
 }
 
 /// Gate a viewer on the app's `execution_mode`, as far as can be decided without an
-/// ACL probe. `Ok(true)` means already authorized — anonymous admits anyone, guest
-/// admits anyone signed in; `Ok(false)` means the caller is a member and still owes
-/// the read-access check its caller performs.
+/// ACL probe. `Ok(true)` means already authorized — guest admits anyone signed in;
+/// `Ok(false)` means the caller is a member and still owes the read-access check its
+/// caller performs. An anonymous app is held to members like a publisher one: Gantry has
+/// no public apps (specs/single-organisation.md §3).
 ///
 /// A guest is authorized by its token's scope and never by an ACL probe: it holds no
 /// `usr` row, so RLS finds nothing for it and every guest would read as having no
@@ -392,12 +397,9 @@ pub fn authorize_non_member_viewer(
     app_path: &str,
     opt_authed: &Option<ApiAuthed>,
 ) -> Result<bool> {
-    if matches!(mode, ExecutionMode::Anonymous) {
-        return Ok(true);
-    }
     let Some(authed) = opt_authed.as_ref() else {
         return Err(Error::NotAuthorized(
-            "App visibility does not allow public access and you are not logged in".to_string(),
+            "Gantry apps are for signed-in members and you are not logged in".to_string(),
         ));
     };
     let is_guest = windmill_api_auth::scopes::has_guest_sentinel(authed.scopes.as_deref());
@@ -2879,7 +2881,7 @@ async fn create_app_internal<'a>(
     // even when the caller did not.
     app.policy.set_execution_mode(app.policy.execution_mode());
     refuse_unscopable_guest_app(&app.path, app.policy.execution_mode())?;
-    refuse_guest_mode_where_unavailable(&app.path, app.policy.execution_mode(), None)?;
+    refuse_mode_where_unavailable(&app.path, app.policy.execution_mode(), None)?;
     if let Some(rule) = deployment_rule_for_mode(app.policy.execution_mode()) {
         if let RuleCheckResult::Blocked(msg) = check_user_against_rule(
             w_id,
@@ -4055,7 +4057,7 @@ async fn update_app_internal<'a>(
             )?;
             // An unreadable deployed policy reads as not already-in-mode, the strict
             // direction, as for the protection rule below.
-            refuse_guest_mode_where_unavailable(
+            refuse_mode_where_unavailable(
                 ns.path.as_deref().unwrap_or(path),
                 npolicy.execution_mode(),
                 deployed_policy.as_ref().map(|d| d.execution_mode()),

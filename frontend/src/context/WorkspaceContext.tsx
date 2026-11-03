@@ -3,10 +3,13 @@ import { WorkspaceInfo, Folder } from '../types';
 import { api } from '../api/client';
 import { useAuth } from './AuthContext';
 
+/** The instance's one workspace (specs/single-organisation.md §2), beside `admins`. */
+const ADMINS_WORKSPACE = 'admins';
+
 interface WorkspaceContextType {
   currentWorkspace: string;
-  setWorkspace: (ws: string) => void;
-  workspaces: WorkspaceInfo[];
+  /** The workspace's display name. */
+  workspaceName: string;
   folders: Folder[];
   isLoading: boolean;
   needsWorkspaceCreation: boolean;
@@ -18,32 +21,19 @@ const WorkspaceContext = createContext<WorkspaceContextType | undefined>(undefin
 
 export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { isAuthenticated } = useAuth();
-  const [currentWorkspace, setCurrentWorkspace] = useState<string>('');
-  const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
+  const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [needsWorkspaceCreation, setNeedsWorkspaceCreation] = useState<boolean>(false);
 
   const refreshWorkspaces = async () => {
     if (!isAuthenticated) return;
     setIsLoading(true);
     try {
       const list = await api.listWorkspaces();
-      if (Array.isArray(list) && list.length > 0) {
-        setWorkspaces(list);
-        setNeedsWorkspaceCreation(false);
-        if (!currentWorkspace || !list.some(w => w.id === currentWorkspace)) {
-          setCurrentWorkspace(list[0].id);
-        }
-      } else {
-        setWorkspaces([]);
-        setNeedsWorkspaceCreation(true);
-        setCurrentWorkspace('');
-      }
+      setWorkspace((Array.isArray(list) ? list : []).find((w) => w.id !== ADMINS_WORKSPACE) ?? null);
     } catch (e) {
       console.warn('[WorkspaceContext] Failed to load workspaces:', e);
-      setWorkspaces([]);
-      setNeedsWorkspaceCreation(true);
+      setWorkspace(null);
     } finally {
       setIsLoading(false);
     }
@@ -51,9 +41,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const createNewWorkspace = async (id: string, name: string) => {
     await api.createWorkspace(id, name);
-    setCurrentWorkspace(id);
     await refreshWorkspaces();
   };
+
+  const currentWorkspace = workspace?.id ?? '';
 
   useEffect(() => {
     if (isAuthenticated) {
@@ -77,11 +68,10 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     <WorkspaceContext.Provider
       value={{
         currentWorkspace,
-        setWorkspace: setCurrentWorkspace,
-        workspaces,
+        workspaceName: workspace?.name ?? '',
         folders,
         isLoading,
-        needsWorkspaceCreation,
+        needsWorkspaceCreation: !isLoading && workspace === null,
         refreshWorkspaces,
         createNewWorkspace,
       }}

@@ -913,16 +913,14 @@ pub struct GuestUsage {
 
 /// What a caller is told when it asks for guests on a deployment that cannot have them.
 pub const GUESTS_UNAVAILABLE_MESSAGE: &str =
-    "Guest access is not available on Windmill Cloud. It requires a self-hosted instance \
-     or a dedicated Windmill Cloud deployment.";
+    "Gantry has no guest access: apps are for members of the workspace.";
 
-/// Whether guests can exist on this deployment at all. They cannot on the shared cloud:
-/// a guest is an identity Windmill itself never vouched for, admitted on the say-so of
-/// whoever runs the instance, which is not a call a multi-tenant deployment can make for
-/// its tenants. Folded into every guest gate below, so an app policy left saying `guest`
-/// is inert rather than honored.
+/// Whether guests can exist on this deployment at all. Never in Gantry, which shares
+/// nothing past the members of its one workspace (specs/single-organisation.md §3). Folded
+/// into every guest gate below, so an app policy left saying `guest` is inert rather than
+/// honored.
 pub fn instance_supports_guests() -> bool {
-    !*crate::worker::CLOUD_HOSTED
+    false
 }
 
 /// [`instance_supports_guests`] as an error, for the writes that would otherwise store a

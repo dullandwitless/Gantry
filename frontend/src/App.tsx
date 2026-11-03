@@ -23,7 +23,7 @@ import { AdminView } from './components/admin/AdminView';
 import { WorkspaceSettingsView } from './components/workspace/WorkspaceSettingsView';
 
 export const AppContent: React.FC = () => {
-  const { isAuthenticated, isLoading: authLoading } = useAuth();
+  const { user, isAuthenticated, isLoading: authLoading } = useAuth();
   const { needsWorkspaceCreation, isLoading: wsLoading } = useWorkspace();
   const [activeTab, setActiveTab] = useState<string>('scripts');
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
@@ -40,8 +40,19 @@ export const AppContent: React.FC = () => {
     return <LoginView />;
   }
 
+  // A new instance: a superadmin sets up its one workspace (specs/single-organisation.md §2).
   if (needsWorkspaceCreation) {
-    return <CreateWorkspaceModal isOpen={true} />;
+    if (user?.super_admin) return <CreateWorkspaceModal isOpen={true} />;
+    return (
+      <div className="h-screen w-screen bg-slate-950 flex items-center justify-center p-4">
+        <div className="max-w-md text-center space-y-2">
+          <h2 className="text-sm font-semibold text-slate-100">Gantry is not set up yet</h2>
+          <p className="text-xs text-slate-400">
+            A superadmin creates the workspace; you join it then. Reload this page afterwards.
+          </p>
+        </div>
+      </div>
+    );
   }
 
   const renderActiveView = () => {
