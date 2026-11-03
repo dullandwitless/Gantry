@@ -947,7 +947,15 @@ async fn test_the_one_workspace(db: Pool<Postgres>) -> anyhow::Result<()> {
         sqlx::query_scalar("SELECT email FROM usr WHERE workspace_id = 'main' ORDER BY email")
             .fetch_all(&db)
             .await?;
-    // test3 has no instance username, so an admin adds it with a chosen one.
-    assert_eq!(members, ["test2@windmill.dev", "test@windmill.dev"]);
+    // admin@windmill.dev is the seeded superadmin. test3 has no instance username, so an
+    // admin adds it with a chosen one.
+    assert_eq!(
+        members,
+        [
+            "admin@windmill.dev",
+            "test2@windmill.dev",
+            "test@windmill.dev"
+        ]
+    );
     Ok(())
 }

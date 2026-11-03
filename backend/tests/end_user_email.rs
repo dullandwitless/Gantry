@@ -448,7 +448,7 @@ async fn test_app_flow_step_wm_end_user_email(db: Pool<Postgres>) -> anyhow::Res
             create_app_triggering_flow(port, app_path, flow_path).await?;
             // A member other than the publisher may open it.
             sqlx::query(
-                "UPDATE app SET extra_perms = '{\"g/all\": false}'
+                "UPDATE app SET extra_perms = '{\"u/test-user-2\": false}'
                  WHERE workspace_id = 'test-workspace' AND path = $1",
             )
             .bind(app_path)

@@ -60,6 +60,13 @@ async fn a_declared_ctx_input_ignores_the_value_the_viewer_sends(
         .send()
         .await?;
     assert!(resp.status().is_success(), "{}", resp.text().await?);
+    sqlx::query(
+        "UPDATE app SET extra_perms = '{\"u/test-user-2\": false}'
+         WHERE workspace_id = 'test-workspace' AND path = $1",
+    )
+    .bind(APP_PATH)
+    .execute(&db)
+    .await?;
 
     // Both spellings a viewer could send: a forged literal, and no argument at all.
     for args in [json!({ "who": "test-user" }), json!({})] {

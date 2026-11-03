@@ -33,6 +33,13 @@ reason). It names features, not how upstream builds them.
 - **Google Cloud Secret Manager** as the secret backend:
   [gcp-secret-manager.md](gcp-secret-manager.md).
 
+## Not planned: one organisation, one workspace
+
+Gantry serves a single organisation behind Identity-Aware Proxy
+([single-organisation.md](single-organisation.md)), so these are removed or cut rather than
+implemented: passwords, invites and auto-invite; several workspaces, forks, dev workspaces,
+workspace comparison and deployment requests; public apps, guests and embedding by secret.
+
 ## Identity and access
 
 - SSO login with SAML or OAuth providers (Gantry signs in through Identity-Aware Proxy
@@ -69,8 +76,7 @@ reason). It names features, not how upstream builds them.
 ## Deployment and git
 
 - Git sync (including automatic pull and multiple repositories).
-- Deployment requests and the deployment UI; deploying to another instance;
-  promotion mode; fork attribution and notes; a workspace default app.
+- The deployment UI; deploying to another instance; promotion mode; a workspace default app.
 
 ## Pipelines
 
