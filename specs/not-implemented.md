@@ -29,6 +29,8 @@ reason). It names features, not how upstream builds them.
 - **Service accounts**: creation and impersonation
   ([service-accounts.md](service-accounts.md)); no UI yet.
 - **Custom workspace and instance roles**: [custom-roles.md](custom-roles.md).
+- **Google Cloud Secret Manager** as the secret backend:
+  [gcp-secret-manager.md](gcp-secret-manager.md).
 
 ## Identity and access
 
@@ -60,8 +62,8 @@ reason). It names features, not how upstream builds them.
 
 ## Secrets
 
-- External secret backends: HashiCorp Vault, AWS Secrets Manager, Azure Key
-  Vault, HTTP secret store.
+- Other external secret backends (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault,
+  HTTP secret store): not planned. Gantry runs on Google Cloud only.
 
 ## Deployment and git
 

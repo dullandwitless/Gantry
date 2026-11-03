@@ -14,18 +14,22 @@
 //! the external ones are stubs.
 
 pub mod database;
-pub mod resolver;
 pub mod external_ref;
+pub mod resolver;
 
-pub use resolver::*;
 pub use external_ref::*;
+pub use resolver::*;
 
+pub mod gcp_secret_manager;
 pub mod http_store;
 pub mod vault_oss;
 
 #[cfg(test)]
 mod tests;
 
+pub use gcp_secret_manager::{
+    gcp_sm_marker, is_gcp_sm_stored_value, GcpSecretManagerBackend, GcpSecretManagerSettings,
+};
 pub use http_store::*;
 pub use vault_oss::*;
 
@@ -93,6 +97,8 @@ pub enum SecretBackendConfig {
     AwsSecretsManager(AwsSecretsManagerSettings),
     /// Read secrets from any HTTPS secret store (read-only; stub: falls back to the database backend)
     HttpStore(HttpStoreSettings),
+    /// Store secrets in Google Cloud Secret Manager (specs/gcp-secret-manager.md)
+    GcpSecretManager(GcpSecretManagerSettings),
 }
 
 impl Default for SecretBackendConfig {

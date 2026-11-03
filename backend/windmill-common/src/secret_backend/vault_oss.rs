@@ -55,16 +55,18 @@ impl SecretBackend for VaultBackend {
     }
 }
 
-/// Create the appropriate secret backend based on configuration
-///
-/// Always returns DatabaseBackend regardless of config.
-/// External backend configuration is ignored with a warning.
+/// Create the appropriate secret backend based on configuration: the database or Google Cloud
+/// Secret Manager. Other external backends are not supported and fall back to the database with
+/// a warning.
 pub async fn create_secret_backend(
     db: DB,
     config: &SecretBackendConfig,
 ) -> Result<Arc<dyn SecretBackend>> {
     match config {
         SecretBackendConfig::Database => Ok(Arc::new(DatabaseBackend::new(db))),
+        SecretBackendConfig::GcpSecretManager(settings) => Ok(Arc::new(
+            super::GcpSecretManagerBackend::new(settings.clone()),
+        )),
         SecretBackendConfig::HashiCorpVault(_) => {
             tracing::warn!(
                 "HashiCorp Vault is configured but is not supported in Gantry. \

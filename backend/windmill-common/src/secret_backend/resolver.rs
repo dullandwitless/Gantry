@@ -16,23 +16,52 @@
 //! ciphertext, so decrypting it directly fails — reads must go through the
 //! backend instead.
 //!
-//! Note: only the database backend is implemented; external backends are stubs.
+//! Note: the database and Google Cloud Secret Manager backends are implemented; the other
+//! external backends are stubs.
 
 use std::sync::Arc;
 
 use crate::{
     db::DB,
     error::{Error, Result},
-    secret_backend::{database::DatabaseBackend, SecretBackend},
+    global_settings::{load_value_from_global_settings, SECRET_BACKEND_SETTING},
+    secret_backend::{
+        create_secret_backend, gcp_secret_manager, GcpSecretManagerBackend, SecretBackend,
+        SecretBackendConfig,
+    },
     variables::{build_crypt, decrypt},
 };
 
-pub async fn get_secret_backend(db: &DB) -> Result<Arc<dyn SecretBackend>> {
-    Ok(Arc::new(DatabaseBackend::new(db.clone())))
+/// The `secret_backend` instance setting; the database when unset.
+pub async fn secret_backend_config(db: &DB) -> Result<SecretBackendConfig> {
+    match load_value_from_global_settings(db, SECRET_BACKEND_SETTING).await? {
+        None | Some(serde_json::Value::Null) => Ok(SecretBackendConfig::Database),
+        Some(v) => serde_json::from_value(v).map_err(|e| {
+            Error::internal_err(format!("invalid {SECRET_BACKEND_SETTING} setting: {e}"))
+        }),
+    }
 }
 
-pub async fn is_vault_backend_configured(_db: &DB) -> Result<bool> {
-    Ok(false)
+pub async fn get_secret_backend(db: &DB) -> Result<Arc<dyn SecretBackend>> {
+    create_secret_backend(db.clone(), &secret_backend_config(db).await?).await
+}
+
+/// Whether secrets are written somewhere other than the database.
+pub async fn is_vault_backend_configured(db: &DB) -> Result<bool> {
+    Ok(get_secret_backend(db).await?.backend_name() != "database")
+}
+
+/// The Secret Manager backend a `$gcp_sm:` value needs, which must be the configured one.
+async fn gcp_secret_manager_backend(db: &DB, path: &str) -> Result<GcpSecretManagerBackend> {
+    match secret_backend_config(db).await? {
+        SecretBackendConfig::GcpSecretManager(settings) => {
+            Ok(GcpSecretManagerBackend::new(settings))
+        }
+        _ => Err(Error::internal_err(format!(
+            "{path} is stored in Google Cloud Secret Manager, which is not the configured secret \
+             backend: configure it again, or restore the secret"
+        ))),
+    }
 }
 
 /// Get a secret value using the configured backend
@@ -48,6 +77,14 @@ pub async fn get_secret_value(
 ) -> Result<String> {
     if super::is_external_ref_value(encrypted_value) {
         return super::resolve_external_ref(db, workspace_id, path, encrypted_value).await;
+    }
+    // Wherever secrets are written now, a marked one lives in Secret Manager and any other is
+    // database ciphertext, so switching backends never strands a secret.
+    if gcp_secret_manager::is_gcp_sm_stored_value(encrypted_value) {
+        return gcp_secret_manager_backend(db, path)
+            .await?
+            .get_secret(workspace_id, path)
+            .await;
     }
     let backend = get_secret_backend(db).await?;
 
@@ -65,6 +102,13 @@ pub async fn get_secret_value(
         }
         "azure_key_vault" => backend.get_secret(workspace_id, path).await,
         "aws_secrets_manager" => backend.get_secret(workspace_id, path).await,
+        // Not marked, so saved before Secret Manager was configured and still in the database.
+        gcp_secret_manager::BACKEND_NAME => {
+            let mc = build_crypt(db, workspace_id).await?;
+            decrypt(&mc, encrypted_value.to_string()).map_err(|e| {
+                Error::internal_err(format!("Error decrypting variable {}: {}", path, e))
+            })
+        }
         // The store is read-only and has no migrate-to, so secrets that were encrypted in the
         // database before it was configured stay there and keep decrypting.
         "http_store" if is_http_store_stored_value(encrypted_value) => {
@@ -105,7 +149,8 @@ pub fn is_http_store_stored_value(value: &str) -> bool {
 
 /// Check if a value is stored in any external secret backend
 pub fn is_external_stored_value(value: &str) -> bool {
-    is_vault_stored_value(value)
+    gcp_secret_manager::is_gcp_sm_stored_value(value)
+        || is_vault_stored_value(value)
         || is_azure_kv_stored_value(value)
         || is_aws_sm_stored_value(value)
         || is_http_store_stored_value(value)
@@ -121,6 +166,7 @@ mod tests {
         assert!(is_external_stored_value("$azure_kv:u/admin/secret"));
         assert!(is_external_stored_value("$aws_sm:u/admin/secret"));
         assert!(is_external_stored_value("$http_store:u/admin/secret"));
+        assert!(is_external_stored_value("$gcp_sm:u/admin/secret"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod audit_logs_s3_backfill;
 #[cfg(feature = "parquet")]
 mod background_task;
 mod datatable_roles_oss;
+mod gcp_secret_manager;
 pub mod ee_oss;
 #[cfg(feature = "parquet")]
 mod log_cleanup;
@@ -134,6 +135,7 @@ async fn get_smtp_configured(Extension(db): Extension<DB>, _authed: ApiAuthed) -
 pub fn global_service() -> Router {
     #[warn(unused_mut)]
     let r = Router::new()
+        .merge(gcp_secret_manager::routes())
         // `/local` is the path in openapi.yaml, so every generated client (getLocal) calls it;
         // `/envs` stays for callers that found the route in the code.
         .route("/local", get(get_local_settings))

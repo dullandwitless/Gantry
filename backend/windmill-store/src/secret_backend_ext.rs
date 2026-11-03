@@ -22,10 +22,10 @@ use windmill_common::{
 };
 
 pub use windmill_common::secret_backend::{
-    check_external_ref, get_secret_backend, get_secret_value, is_aws_sm_stored_value,
-    is_azure_kv_stored_value, is_external_ref_value, is_external_stored_value,
-    is_http_store_stored_value, is_vault_backend_configured, is_vault_stored_value,
-    parse_external_ref, resolves_externally,
+    check_external_ref, gcp_sm_marker, get_secret_backend, get_secret_value,
+    is_aws_sm_stored_value, is_azure_kv_stored_value, is_external_ref_value,
+    is_external_stored_value, is_gcp_sm_stored_value, is_http_store_stored_value,
+    is_vault_backend_configured, is_vault_stored_value, parse_external_ref, resolves_externally,
 };
 
 /// The HTTP store's key is derived from the variable path, so moving a reference would point it
@@ -67,6 +67,10 @@ pub async fn store_secret_value(
         "aws_secrets_manager" => {
             backend.set_secret(workspace_id, path, plain_value).await?;
             Ok(format!("$aws_sm:{}", path))
+        }
+        windmill_common::secret_backend::gcp_secret_manager::BACKEND_NAME => {
+            backend.set_secret(workspace_id, path, plain_value).await?;
+            Ok(gcp_sm_marker(path))
         }
         // Read-only store: an empty value creates a reference to the key the path maps to, and
         // the value itself is managed in the store.
@@ -206,15 +210,54 @@ pub async fn delete_secret_from_backend(db: &DB, workspace_id: &str, path: &str)
     }
 }
 
+/// Whether a secret's value is a marker naming where an external backend keeps it, so that
+/// renaming the variable must move the stored secret too.
+pub fn is_movable_external_value(value: &str) -> bool {
+    is_gcp_sm_stored_value(value)
+        || is_vault_stored_value(value)
+        || is_azure_kv_stored_value(value)
+        || is_aws_sm_stored_value(value)
+}
+
+/// SQL condition, on a `variable` row, matching [`is_movable_external_value`].
+pub const MOVABLE_EXTERNAL_VALUE_SQL: &str = "(starts_with(value, '$gcp_sm:') \
+     OR starts_with(value, '$vault:') OR starts_with(value, '$azure_kv:') \
+     OR starts_with(value, '$aws_sm:'))";
+
+/// Moves a Secret Manager secret to the name of `new_path` (specs/gcp-secret-manager.md §4).
+async fn move_gcp_secret(
+    db: &DB,
+    workspace_id: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Result<String> {
+    let backend = get_secret_backend(db).await?;
+    if backend.backend_name() != windmill_common::secret_backend::gcp_secret_manager::BACKEND_NAME {
+        return Err(Error::BadRequest(format!(
+            "{old_path} is stored in Google Cloud Secret Manager, which is not the configured \
+             secret backend, so it cannot be renamed"
+        )));
+    }
+    let value = backend.get_secret(workspace_id, old_path).await?;
+    backend.set_secret(workspace_id, new_path, &value).await?;
+    backend.delete_secret(workspace_id, old_path).await?;
+    Ok(gcp_sm_marker(new_path))
+}
+
 pub async fn rename_vault_secret(
-    _db: &DB,
-    _workspace_id: &str,
+    db: &DB,
+    workspace_id: &str,
     old_path: &str,
     new_path: &str,
     current_value: &str,
 ) -> Result<Option<String>> {
     if is_http_store_stored_value(current_value) {
         return Err(http_store_rename_error(old_path));
+    }
+    if is_gcp_sm_stored_value(current_value) {
+        return move_gcp_secret(db, workspace_id, old_path, new_path)
+            .await
+            .map(Some);
     }
     if is_vault_stored_value(current_value) {
         tracing::warn!(
@@ -243,12 +286,26 @@ pub async fn rename_vault_secret(
     Ok(None)
 }
 
+/// Moves the externally stored secrets among `variables` (path, value) from under `old_prefix`
+/// to under `new_prefix`, and answers the new value of each one moved, by old path. Only Secret
+/// Manager secrets can move; the other backends are not supported.
 pub async fn rename_vault_secrets_with_prefix(
-    _db: &DB,
-    _workspace_id: &str,
-    _old_prefix: &str,
-    _new_prefix: &str,
-    _variables: Vec<(String, String)>,
+    db: &DB,
+    workspace_id: &str,
+    old_prefix: &str,
+    new_prefix: &str,
+    variables: Vec<(String, String)>,
 ) -> Result<Vec<(String, String)>> {
-    Ok(vec![])
+    let mut moved = vec![];
+    for (path, value) in variables {
+        let Some(rest) = path.strip_prefix(old_prefix) else {
+            continue;
+        };
+        if is_gcp_sm_stored_value(&value) {
+            let new_path = format!("{new_prefix}{rest}");
+            let new_value = move_gcp_secret(db, workspace_id, &path, &new_path).await?;
+            moved.push((path, new_value));
+        }
+    }
+    Ok(moved)
 }

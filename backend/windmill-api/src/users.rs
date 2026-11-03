@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::db::{ApiAuthed, OptJobAuthed};
 use crate::secret_backend_ext::{
     reject_http_store_refs_under_prefix, rename_vault_secrets_with_prefix,
+    MOVABLE_EXTERNAL_VALUE_SQL,
 };
 use argon2::Argon2;
 use axum::{
@@ -631,20 +632,15 @@ async fn update_username_in_workpsace<'c>(
     reject_http_store_refs_under_prefix(&mut **tx, w_id, &old_prefix).await?;
 
     // Fetch all externally-stored secret variables under this user's path
-    let vault_secrets: Vec<(String, String)> = sqlx::query!(
-        r#"SELECT path, value::text AS "value!" FROM variable
-           WHERE path LIKE ('u/' || $1 || '/%')
-           AND workspace_id = $2
-           AND is_secret = true
-           AND (value LIKE '$vault:%' OR value LIKE '$azure_kv:%')"#,
-        old_username,
-        w_id
-    )
+    let vault_secrets: Vec<(String, String)> = sqlx::query_as(&format!(
+        "SELECT path, value FROM variable
+         WHERE path LIKE ('u/' || $1 || '/%') AND workspace_id = $2 AND is_secret
+           AND {MOVABLE_EXTERNAL_VALUE_SQL}"
+    ))
+    .bind(&old_username)
+    .bind(w_id)
     .fetch_all(&mut **tx)
-    .await?
-    .into_iter()
-    .map(|r| (r.path, r.value))
-    .collect();
+    .await?;
 
     // Rename secrets in Vault and get the new values
     let vault_updates =

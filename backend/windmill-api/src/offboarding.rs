@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::db::{ApiAuthed, OptJobAuthed};
 use crate::secret_backend_ext::{
     reject_http_store_refs_under_prefix, rename_vault_secrets_with_prefix,
+    MOVABLE_EXTERNAL_VALUE_SQL,
 };
 use axum::{
     extract::{Extension, Path},
@@ -1077,20 +1078,15 @@ async fn offboard_user_from_workspace<'c>(
     let new_var_prefix = format!("{}/", reassign_to);
     reject_http_store_refs_under_prefix(&mut **tx, w_id, &old_var_prefix).await?;
 
-    let vault_secrets: Vec<(String, String)> = sqlx::query!(
-        r#"SELECT path, value::text AS "value!" FROM variable
-           WHERE path LIKE ('u/' || $1 || '/%')
-           AND workspace_id = $2
-           AND is_secret = true
-           AND (value LIKE '$vault:%' OR value LIKE '$azure_kv:%')"#,
-        username,
-        w_id
-    )
+    let vault_secrets: Vec<(String, String)> = sqlx::query_as(&format!(
+        "SELECT path, value FROM variable
+         WHERE path LIKE ('u/' || $1 || '/%') AND workspace_id = $2 AND is_secret
+           AND {MOVABLE_EXTERNAL_VALUE_SQL}"
+    ))
+    .bind(&username)
+    .bind(w_id)
     .fetch_all(&mut **tx)
-    .await?
-    .into_iter()
-    .map(|r| (r.path, r.value))
-    .collect();
+    .await?;
 
     let vault_updates =
         rename_vault_secrets_with_prefix(db, w_id, &old_var_prefix, &new_var_prefix, vault_secrets)

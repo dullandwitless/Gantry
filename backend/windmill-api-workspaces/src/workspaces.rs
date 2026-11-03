@@ -7726,27 +7726,44 @@ async fn clone_variables(
             return Ok(());
         }
 
-        let secret_variables = sqlx::query!(
-            "SELECT path FROM variable
-             WHERE workspace_id = $1 AND is_secret = true AND value != ''",
-            target_workspace_id,
-        )
-        .fetch_all(&mut **tx)
-        .await?;
+        // With Secret Manager only marked secrets live there; the others are database
+        // ciphertext that came with the rows (specs/gcp-secret-manager.md §4).
+        let secret_paths: Vec<String> = if backend.backend_name()
+            == windmill_common::secret_backend::gcp_secret_manager::BACKEND_NAME
+        {
+            sqlx::query_scalar(
+                "SELECT path FROM variable
+                 WHERE workspace_id = $1 AND is_secret AND starts_with(value, '$gcp_sm:')",
+            )
+            .bind(target_workspace_id)
+            .fetch_all(&mut **tx)
+            .await?
+        } else {
+            sqlx::query!(
+                "SELECT path FROM variable
+                 WHERE workspace_id = $1 AND is_secret = true AND value != ''",
+                target_workspace_id,
+            )
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .map(|v| v.path)
+            .collect()
+        };
 
-        for variable in secret_variables {
+        for path in secret_paths {
             match backend
-                .get_secret(source_workspace_id, &variable.path)
+                .get_secret(source_workspace_id, &path)
                 .await
             {
                 Ok(plain_value) => {
                     backend
-                        .set_secret(target_workspace_id, &variable.path, &plain_value)
+                        .set_secret(target_workspace_id, &path, &plain_value)
                         .await
                         .map_err(|e| {
                             Error::internal_err(format!(
                                 "Failed to replicate secret variable {} to the external secret backend for the forked workspace: {e}",
-                                variable.path
+                                path
                             ))
                         })?;
                 }
@@ -7756,7 +7773,7 @@ async fn clone_variables(
                 Err(e) => {
                     tracing::warn!(
                         workspace_id = %source_workspace_id,
-                        path = %variable.path,
+                        path = %path,
                         error = %e,
                         "Could not read secret variable from the external secret backend while forking; the forked variable will not resolve"
                     );

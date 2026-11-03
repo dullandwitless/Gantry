@@ -8,13 +8,11 @@
 
 //! Secret backend extension for the API layer
 //!
-//! Backend resolution and read helpers live in
-//! `windmill_common::secret_backend`; this module keeps the API-specific bulk
-//! rename helper used when renaming users.
-//!
-//! Note: only the database backend is implemented.
+//! Backend resolution and read helpers live in `windmill_common::secret_backend`, and moving
+//! externally stored secrets in `windmill_store::secret_backend_ext`; this module adds the checks
+//! bulk path moves (user renames, offboarding) need.
 
-use windmill_common::{db::DB, error::Result};
+use windmill_common::error::Result;
 
 /// Refuses a bulk path move (user rename, offboarding) that would carry HTTP secret store
 /// references along: their store key is derived from the path, so moved references would read
@@ -44,13 +42,6 @@ pub async fn reject_http_store_refs_under_prefix(
     )))
 }
 
-pub async fn rename_vault_secrets_with_prefix(
-    _db: &DB,
-    _workspace_id: &str,
-    _old_prefix: &str,
-    _new_prefix: &str,
-    _variables: Vec<(String, String)>,
-) -> Result<Vec<(String, String)>> {
-    // OSS: No Vault support, return empty
-    Ok(vec![])
-}
+pub use windmill_store::secret_backend_ext::{
+    rename_vault_secrets_with_prefix, MOVABLE_EXTERNAL_VALUE_SQL,
+};
